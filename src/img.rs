@@ -436,7 +436,7 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 	}
 }
 
-pub fn image_to_frame(image: &DynamicImage, timestamp: i32) -> Result<webp::AnimFrame, &'static str> {
+pub fn image_to_frame(image: &DynamicImage, timestamp: i32) -> Result<webp::AnimFrame<'_>, &'static str> {
 	match image {
 		DynamicImage::ImageLuma8(_) => Err("Unimplemented"),
 		DynamicImage::ImageLumaA8(_) => Err("Unimplemented"),
