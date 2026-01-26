@@ -3,6 +3,7 @@ use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 
 mod img;
@@ -166,7 +167,12 @@ fn main() {
 	}
 	fontdb.load_font_source(resvg::usvg::fontdb::Source::Binary(Arc::new(include_bytes!("../asset/font/Aileron-Light.otf"))));
 	let fontdb=Arc::new(fontdb);
-	let arg_tup=(client,config,dummy_png,fontdb);
+	// let arg_tup=(client,config,dummy_png,fontdb);
+
+	// 同時に処理する画像数を制限する
+	let max_concurrent_encode = num_cpus::get().max(2);
+	let encode_semaphore = Arc::new(Semaphore::new(max_concurrent_encode));
+	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore);
 	rt.block_on(async{
 		let http_addr:SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
 		let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
@@ -238,7 +244,7 @@ async fn check_url(config:&Arc<ConfigFile>,url:impl AsRef<str>)->Result<(),Strin
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,config,dummy_img,fontdb):(reqwest::Client,Arc<ConfigFile>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>),
+	(client,config,dummy_img,fontdb,encode_semaphore):(reqwest::Client,Arc<ConfigFile>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>),
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	println!("{}\t{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}\tfallback:{:?}",
@@ -342,6 +348,7 @@ async fn get_file(
 		codec:Err(None),
 		dummy_img,
 		fontdb,
+		encode_semaphore,
 	}.encode(resp,is_img).await
 }
 struct RequestContext{
@@ -353,6 +360,7 @@ struct RequestContext{
 	codec:Result<image::ImageFormat,Option<image::ImageError>>,
 	dummy_img:Arc<Vec<u8>>,
 	fontdb:Arc<resvg::usvg::fontdb::Database>,
+	encode_semaphore: Arc<Semaphore>,
 }
 impl RequestContext{
 	pub fn disposition_ext(headers:&mut HeaderMap,ext:&str){
@@ -457,6 +465,12 @@ impl RequestContext{
 			let dummy_img=self.dummy_img.clone();
 			let is_fallback=self.parms.fallback.is_some();
 			let mut header=self.headers.clone();
+			// セマフォで同時実行数を制限
+			let semaphore = self.encode_semaphore.clone();
+			let _permit = semaphore.acquire().await.map_err(|_| {
+                header.append("X-Proxy-Error", "SemaphoreError".parse().unwrap());
+                (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
+            })?;
 			let mut handle=self;
 			let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move ||{
 				let resp=handle.encode_img();
