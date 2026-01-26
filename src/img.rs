@@ -4,6 +4,27 @@ use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
 
 use crate::RequestContext;
 
+struct Timer {
+	name: &'static str,
+	start: std::time::Instant,
+}
+
+impl Timer {
+	fn new(name: &'static str) -> Self {
+		Self {
+			name,
+			start: std::time::Instant::now(),
+		}
+	}
+}
+
+impl Drop for Timer {
+	fn drop(&mut self) {
+		let duration = self.start.elapsed();
+		println!("Timer [{}] elapsed: {:?}", self.name, duration);
+	}
+}
+
 impl RequestContext{
 	pub(crate) fn image_size_hint(&self)->(u32,u32){
 		if self.parms.badge.is_some(){
@@ -294,6 +315,7 @@ impl RequestContext{
 		self.response_img(img)
 	}
 	pub(crate) fn response_img(&mut self,img:DynamicImage)->axum::response::Response{
+		let _timer = Timer::new("response_img");
 		let img=match self.codec{
 			Ok(image::ImageFormat::Jpeg)|Ok(image::ImageFormat::Tiff)=>{
 				self.exif_rotate(img)
