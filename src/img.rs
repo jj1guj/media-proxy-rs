@@ -338,22 +338,45 @@ impl RequestContext{
 				Self::disposition_ext(&mut self.headers,".avif");
 				image::ImageFormat::Avif
 			}else{
-				let rgba=img.into_rgba8();
-				let quality=self.config.webp_quality as i32;
-				return match turbojpeg::compress_image(&rgba, quality, turbojpeg::Subsamp::Sub2x2){
-					Ok(mem) => {
-						buf.extend_from_slice(&mem);
-						self.headers.append("Content-Type","image/jpeg".parse().unwrap());
-						self.headers.remove("Cache-Control");
-						self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
-						Self::disposition_ext(&mut self.headers,".jpeg");
-						(axum::http::StatusCode::OK,self.headers.clone(),buf).into_response()
-					},
-					Err(e) => {
-						self.headers.append("X-Proxy-Error",format!("EncodeError_{:?}",e).parse().unwrap());
-						(axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response()
-					},
-				};
+				let rgba = img.into_rgba8();
+				let has_transparency = rgba.pixels().any(|p| p.0[3] < 255);
+				if has_transparency {
+					let width=rgba.width();
+                    let height=rgba.height();
+                    let encoder=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
+                    let mut config=webp::WebPConfig::new().unwrap();
+                    config.quality=self.config.webp_quality;
+                    return match encoder.encode_advanced(&config){
+                        Ok(mem) => {
+                            buf.extend_from_slice(&mem);
+                            self.headers.append("Content-Type","image/webp".parse().unwrap());
+                            self.headers.remove("Cache-Control");
+                            self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
+                            Self::disposition_ext(&mut self.headers,".webp");
+                            (axum::http::StatusCode::OK,self.headers.clone(),buf).into_response()
+                        },
+                        Err(e) => {
+                            self.headers.append("X-Proxy-Error",format!("EncodeError_{:?}",e).parse().unwrap());
+                            (axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response()
+                        },
+                    };
+				} else {
+					let quality=self.config.webp_quality as i32;
+					return match turbojpeg::compress_image(&rgba, quality, turbojpeg::Subsamp::Sub2x2){
+						Ok(mem) => {
+							buf.extend_from_slice(&mem);
+							self.headers.append("Content-Type","image/jpeg".parse().unwrap());
+							self.headers.remove("Cache-Control");
+							self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
+							Self::disposition_ext(&mut self.headers,".jpeg");
+							(axum::http::StatusCode::OK,self.headers.clone(),buf).into_response()
+						},
+						Err(e) => {
+							self.headers.append("X-Proxy-Error",format!("EncodeError_{:?}",e).parse().unwrap());
+							(axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response()
+						},
+					};
+				}
 			}
 		};
 		match img.write_to(&mut std::io::Cursor::new(&mut buf),format){
