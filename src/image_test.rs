@@ -30,8 +30,8 @@ fn encode_decode_webp(){
 	let dummy=include_bytes!("../asset/dummy.png");
 	let img=image::load_from_memory(dummy).expect("load dummy.png");
 	let img=img.into_rgba8();
-	let encoer=webp::Encoder::from_rgba(img.as_raw(),img.width(),img.height());
+	let encoder=webp::Encoder::from_rgba(img.as_raw(),img.width(),img.height());
 	let mut buf=vec![];
-	buf.extend_from_slice(&encoer.encode(75f32));
+	buf.extend_from_slice(&encoder.encode(75f32));
 	webp::Decoder::new(&buf).decode().unwrap();
 }

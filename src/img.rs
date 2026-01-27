@@ -341,10 +341,10 @@ impl RequestContext{
 				let width=img.width();
 				let height=img.height();
 				let rgba=img.into_rgba8();
-				let encoer=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
+				let encoder=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
 				let mut config=webp::WebPConfig::new().unwrap();
 				config.quality=self.config.webp_quality;
-				return match encoer.encode_advanced(&config){
+				return match encoder.encode_advanced(&config){
 					Ok(mem) => {
 						buf.extend_from_slice(&mem);
 						self.headers.append("Content-Type","image/webp".parse().unwrap());
