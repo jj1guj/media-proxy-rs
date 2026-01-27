@@ -35,6 +35,7 @@ mailparse = "0.16.1"
 iprange = "0.6.7"
 ipnet = "*"
 num_cpus = "1.17.0"
+turbojpeg = { version = "1.4", features = ["image"] }
 
 [profile.release]
 strip = true

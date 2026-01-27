@@ -338,19 +338,15 @@ impl RequestContext{
 				Self::disposition_ext(&mut self.headers,".avif");
 				image::ImageFormat::Avif
 			}else{
-				let width=img.width();
-				let height=img.height();
 				let rgba=img.into_rgba8();
-				let encoder=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
-				let mut config=webp::WebPConfig::new().unwrap();
-				config.quality=self.config.webp_quality;
-				return match encoder.encode_advanced(&config){
+				let quality=self.config.webp_quality as i32;
+				return match turbojpeg::compress_image(&rgba, quality, turbojpeg::Subsamp::Sub2x2){
 					Ok(mem) => {
 						buf.extend_from_slice(&mem);
-						self.headers.append("Content-Type","image/webp".parse().unwrap());
+						self.headers.append("Content-Type","image/jpeg".parse().unwrap());
 						self.headers.remove("Cache-Control");
 						self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
-						Self::disposition_ext(&mut self.headers,".webp");
+						Self::disposition_ext(&mut self.headers,".jpeg");
 						(axum::http::StatusCode::OK,self.headers.clone(),buf).into_response()
 					},
 					Err(e) => {

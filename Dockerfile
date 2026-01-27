@@ -19,7 +19,7 @@ ARG BUILDARCH
 ARG TARGETARCH
 ARG TARGETVARIANT
 #RUN apk add --no-cache clang musl-dev curl pkgconfig nasm mold git
-RUN apt-get update && apt-get install -y clang musl-dev pkg-config nasm mold git
+RUN apt-get update && apt-get install -y clang musl-dev pkg-config nasm mold git libturbojpeg0-dev cmake
 ENV CARGO_HOME=/var/cache/cargo
 ENV SYSTEM_DEPS_LINK=static
 COPY crossfiles /app/crossfiles
