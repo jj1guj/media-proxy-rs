@@ -149,6 +149,13 @@ impl RequestContext{
 			},
 		};
 		match codec{
+			image::ImageFormat::Jpeg => {
+				let img: Result<image::RgbImage, _> = turbojpeg::decompress_image(&self.src_bytes);
+				match img {
+					Ok(img) => self.response_img(DynamicImage::ImageRgb8(img)),
+					Err(_) => self.encode_single(),
+				}
+			},
 			image::ImageFormat::Png => {
 				let a=match image::codecs::png::PngDecoder::new(std::io::Cursor::new(&self.src_bytes)){
 					Ok(a)=>a,
