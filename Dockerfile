@@ -1,35 +1,33 @@
-FROM public.ecr.aws/docker/library/alpine:latest AS c_build_env
-RUN apk add --no-cache make clang musl-dev meson ninja pkgconfig nasm git
-
-FROM c_build_env AS dav1d
-RUN git clone --branch 1.4.3 --depth 1 https://github.com/videolan/dav1d.git /dav1d_src
-RUN cd /dav1d_src && meson build -Dprefix=/dav1d -Denable_tools=false -Denable_examples=false -Ddefault_library=static --buildtype release
-RUN cd /dav1d_src && ninja -C build
-RUN cd /dav1d_src && ninja -C build install
-
-FROM c_build_env AS lcms2
-RUN git clone -b lcms2.16 --depth 1 https://github.com/mm2/Little-CMS.git /lcms2_src
-ENV CONFIGURE_FLAGS="--enable-static --prefix=/lcms2"
-RUN cd /lcms2_src && ./configure
-RUN cd /lcms2_src && make
-RUN cd /lcms2_src && make DESTDIR=/lcms2 install
-
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/rust:latest AS build_app
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/rust:latest AS cross_build
 ARG BUILDARCH
 ARG TARGETARCH
 ARG TARGETVARIANT
-#RUN apk add --no-cache clang musl-dev curl pkgconfig nasm mold git
-RUN apt-get update && apt-get install -y clang musl-dev pkg-config nasm mold git libturbojpeg0-dev cmake
-ENV CARGO_HOME=/var/cache/cargo
-ENV SYSTEM_DEPS_LINK=static
+RUN apt-get update && apt-get install -y clang musl-dev pkg-config nasm mold git meson ninja-build xz-utils libturbojpeg0-dev cmake
 COPY crossfiles /app/crossfiles
 RUN bash /app/crossfiles/deps.sh
+
+FROM --platform=$BUILDPLATFORM cross_build AS dav1d
+RUN git clone --branch 1.4.3 --depth 1 https://github.com/videolan/dav1d.git /dav1d_src
+RUN cd /dav1d_src && bash -c "source /app/crossfiles/meson.sh && meson build -Dprefix=/dav1d -Denable_tools=false -Denable_examples=false -Ddefault_library=static --buildtype release --cross-file /app/crossfiles/cross.txt"
+RUN cd /dav1d_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build"
+RUN cd /dav1d_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build install"
+
+FROM --platform=$BUILDPLATFORM cross_build AS lcms2
+RUN git clone -b lcms2.16 --depth 1 https://github.com/mm2/Little-CMS.git /lcms2_src
+RUN mkdir /lcms2
+RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && meson build --prefix=/lcms2 -Ddefault_library=static -Dfastfloat=true -Dthreaded=true --buildtype release --cross-file /app/crossfiles/cross.txt"
+RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build"
+RUN cd /lcms2/ && cp /lcms2_src/build/src/liblcms2.a . && cp /lcms2_src/build/plugins/threaded/src/liblcms2_threaded.a . && cp /lcms2_src/build/plugins/fast_float/src/liblcms2_fast_float.a .
+
+FROM --platform=$BUILDPLATFORM cross_build AS build_app
+ENV CARGO_HOME=/var/cache/cargo
+ENV SYSTEM_DEPS_LINK=static
 WORKDIR /app
 COPY avif-decoder_dep ./avif-decoder_dep
 COPY .gitmodules ./.gitmodules
 COPY --from=dav1d /dav1d /dav1d
 COPY --from=lcms2 /lcms2 /lcms2
-RUN cp -r /lcms2/usr/local/lib/* /dav1d/lib
+RUN cp -r /lcms2/* /dav1d/lib
 ENV PKG_CONFIG_PATH=/dav1d/lib/pkgconfig
 ENV LD_LIBRARY_PATH=/dav1d/lib
 COPY src ./src

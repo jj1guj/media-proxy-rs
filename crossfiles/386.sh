@@ -1,4 +1,4 @@
-export MUSL_NAME="i686-linux-musl-cross"
+export MUSL_NAME="i686-linux-musl"
 export PATH="/musl/${MUSL_NAME}/bin:${PATH}"
 export CC=i686-linux-musl-gcc
 export CXX=i686-linux-musl-g++
@@ -12,3 +12,6 @@ export RUSTFLAGS="-C target-feature=+sse -C target-feature=+sse2 -C linker=${CC}
 export PKG_CONFIG_SYSROOT_DIR="/musl/${MUSL_NAME}/"
 export RUST_TARGET="i686-unknown-linux-musl"
 export BINDGEN_EXTRA_CLANG_ARGS="--sysroot ${PKG_CONFIG_SYSROOT_DIR}/i686-linux-musl"
+export CPU_FAMILY="x86"
+export CPU="i686"
+export ENDIAN="little"

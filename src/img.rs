@@ -427,7 +427,7 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*3;
 					let r=buffer[offset];
-					buffer[y as usize*stride+x as usize*4]=buffer[offset+2];
+					buffer[offset]=buffer[offset+2];
 					buffer[offset+2]=r;
 				}
 			}
@@ -437,12 +437,13 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
 		},
 		jpegxr::PixelFormat::PixelFormat32bppBGR => {
-			let mut raw_img=Vec::with_capacity(height as usize*3);
+			let mut raw_img=Vec::with_capacity(width as usize*height as usize*3);
 			for y in 0..height{
 				for x in 0..width{
-					raw_img.push(buffer[y as usize*stride+x as usize*4+2]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+1]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+0]);
+					let offset=y as usize*stride+x as usize*4;
+					raw_img.push(buffer[offset+2]);
+					raw_img.push(buffer[offset+1]);
+					raw_img.push(buffer[offset+0]);
 				}
 			}
 			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
@@ -453,7 +454,7 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*4;
 					let r=buffer[offset];
-					buffer[y as usize*stride+x as usize*4]=buffer[offset+2];
+					buffer[offset]=buffer[offset+2];
 					buffer[offset+2]=r;
 				}
 			}
@@ -463,9 +464,10 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 			let mut raw_img=Vec::with_capacity(height as usize*3);
 			for y in 0..height{
 				for x in 0..width{
-					raw_img.push(buffer[y as usize*stride+x as usize*4+0]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+1]);
-					raw_img.push(buffer[y as usize*stride+x as usize*4+2]);
+					let offset=y as usize*stride+x as usize*4;
+					raw_img.push(buffer[offset+0]);
+					raw_img.push(buffer[offset+1]);
+					raw_img.push(buffer[offset+2]);
 				}
 			}
 			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
