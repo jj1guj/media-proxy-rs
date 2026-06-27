@@ -2,7 +2,7 @@ FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/rust:latest AS cros
 ARG BUILDARCH
 ARG TARGETARCH
 ARG TARGETVARIANT
-RUN apt-get update && apt-get install -y clang musl-dev pkg-config nasm mold git meson ninja-build xz-utils libturbojpeg0-dev cmake
+RUN apt-get update && apt-get install -y clang musl-dev pkg-config nasm mold git meson ninja-build xz-utils cmake
 COPY crossfiles /app/crossfiles
 RUN bash /app/crossfiles/deps.sh
 
@@ -14,22 +14,23 @@ RUN cd /dav1d_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build 
 
 FROM --platform=$BUILDPLATFORM cross_build AS lcms2
 RUN git clone -b lcms2.16 --depth 1 https://github.com/mm2/Little-CMS.git /lcms2_src
-RUN mkdir /lcms2
 RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && meson build --prefix=/lcms2 -Ddefault_library=static -Dfastfloat=true -Dthreaded=true --buildtype release --cross-file /app/crossfiles/cross.txt"
 RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build"
-RUN cd /lcms2/ && cp /lcms2_src/build/src/liblcms2.a . && cp /lcms2_src/build/plugins/threaded/src/liblcms2_threaded.a . && cp /lcms2_src/build/plugins/fast_float/src/liblcms2_fast_float.a .
+RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build install"
 
 FROM --platform=$BUILDPLATFORM cross_build AS build_app
 ENV CARGO_HOME=/var/cache/cargo
 ENV SYSTEM_DEPS_LINK=static
+ENV TURBOJPEG_SOURCE=vendor
+ENV PKG_CONFIG_ALLOW_CROSS=1
+ENV PKG_CONFIG_LIBDIR=/dav1d/lib/pkgconfig:/lcms2/lib/pkgconfig
+ENV PKG_CONFIG_PATH=/dav1d/lib/pkgconfig:/lcms2/lib/pkgconfig
 WORKDIR /app
 COPY avif-decoder_dep ./avif-decoder_dep
 COPY .gitmodules ./.gitmodules
 COPY --from=dav1d /dav1d /dav1d
 COPY --from=lcms2 /lcms2 /lcms2
-RUN cp -r /lcms2/* /dav1d/lib
-ENV PKG_CONFIG_PATH=/dav1d/lib/pkgconfig
-ENV LD_LIBRARY_PATH=/dav1d/lib
+ENV LD_LIBRARY_PATH=/dav1d/lib:/lcms2/lib
 COPY src ./src
 COPY Cargo.toml ./Cargo.toml
 COPY asset ./asset
