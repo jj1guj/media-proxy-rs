@@ -1,0 +1,15 @@
+# cargo test 用のネイティブビルド環境。
+# apt 依存を焼き込み、以降のテスト実行では cargo の増分ビルドのみになるようにする。
+#
+# 使い方:
+#   docker build -f Dockerfile.test -t media-proxy-test .
+#   docker run --rm -it \
+#     -v "$PWD":/app -w /app \
+#     -v mp_cargo:/usr/local/cargo/registry \
+#     -v mp_target:/app/target \
+#     media-proxy-test cargo test
+FROM rust:latest
+RUN apt-get update && apt-get install -y \
+      clang pkg-config nasm cmake git meson ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
