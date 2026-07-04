@@ -1,9 +1,14 @@
 use core::str;
 use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
+use iprange::IpRange;
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_stream::StreamExt;
 
 mod img;
@@ -151,6 +156,16 @@ fn main() {
 	}
 	let dummy_png=Arc::new(include_bytes!("../asset/dummy.png").to_vec());
 	let config=Arc::new(config);
+	// allowed_networks / blocked_networks / blocked_hosts のパースは起動時に1回だけ行う。
+	// 不正な設定値はここで明確なエラーメッセージ付きに失敗させる。
+	let network_policy=match NetworkPolicy::from_config(&config){
+		Ok(p)=>Arc::new(p),
+		Err(e)=>{
+			eprintln!("設定エラー(network): {}",e);
+			std::process::exit(1);
+		}
+	};
+	let dns_cache=Arc::new(DnsCache::new(DNS_CACHE_TTL,DNS_CACHE_MAX_ENTRIES));
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 	let client=reqwest::ClientBuilder::new();
 	let client=match &config.proxy{
@@ -172,7 +187,7 @@ fn main() {
 	// 同時に処理する画像数を制限する
 	let max_concurrent_encode = num_cpus::get().max(2);
 	let encode_semaphore = Arc::new(Semaphore::new(max_concurrent_encode));
-	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore);
+	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache);
 	rt.block_on(async{
 		let http_addr:SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
 		let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
@@ -183,57 +198,139 @@ fn main() {
 		axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
 	});
 }
-async fn check_url(config:&Arc<ConfigFile>,url:impl AsRef<str>)->Result<(),String>{
+/// DNS解決のタイムアウト。リゾルバのリトライ由来の張り付き(本番で約2秒/4秒)を防ぐ。
+const DNS_TIMEOUT: Duration = Duration::from_millis(1500);
+/// DNSキャッシュのTTL。
+const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+/// DNSキャッシュの最大エントリ数(無制限成長の防止)。
+const DNS_CACHE_MAX_ENTRIES: usize = 1024;
+
+/// 起動時に1度だけパースするネットワークポリシー。
+/// check_url には Arc の参照として渡す(リクエストごとの再パースをしない)。
+pub struct NetworkPolicy{
+	/// RFC1918 プライベートレンジ(allowedが無ければ遮断)。
+	ipv4_private_range: IpRange<Ipv4Net>,
+	allowed_networks: Option<IpRange<Ipv4Net>>,
+	blocked_networks: Option<IpRange<Ipv4Net>>,
+	/// 小文字化済みの遮断ホスト集合。
+	blocked_hosts: HashSet<String>,
+}
+impl NetworkPolicy{
+	fn parse_ranges(list:&[String],label:&str)->Result<IpRange<Ipv4Net>,String>{
+		let mut range=IpRange::new();
+		for s in list{
+			let net:Ipv4Net=s.parse().map_err(|e|format!("{} の不正な値 {:?}: {}",label,s,e))?;
+			range.add(net);
+		}
+		range.simplify();
+		Ok(range)
+	}
+	pub fn from_config(config:&ConfigFile)->Result<Self,String>{
+		let ipv4_private_range=Self::parse_ranges(
+			&["10.0.0.0/8".to_owned(),"172.16.0.0/12".to_owned(),"192.168.0.0/16".to_owned()],
+			"builtin private range",
+		)?;
+		let allowed_networks=match &config.allowed_networks{
+			Some(list)=>Some(Self::parse_ranges(list,"allowed_networks")?),
+			None=>None,
+		};
+		let blocked_networks=match &config.blocked_networks{
+			Some(list)=>Some(Self::parse_ranges(list,"blocked_networks")?),
+			None=>None,
+		};
+		let blocked_hosts=config.blocked_hosts.as_ref()
+			.map(|hosts|hosts.iter().map(|h|h.to_lowercase()).collect())
+			.unwrap_or_default();
+		Ok(Self{ipv4_private_range,allowed_networks,blocked_networks,blocked_hosts})
+	}
+	/// IPv4アドレスの遮断判定。allowed_networks は遮断より優先。
+	fn check_ipv4(&self,ip:&std::net::Ipv4Addr)->Result<(),String>{
+		if let Some(block)=&self.blocked_networks{
+			if block.contains(ip){
+				return Err("Blocked address".to_owned());
+			}
+		}
+		if self.ipv4_private_range.contains(ip){
+			let allow=self.allowed_networks.as_ref().map_or(false,|a|a.contains(ip));
+			if !allow{
+				return Err("Blocked address".to_owned());
+			}
+		}
+		Ok(())
+	}
+}
+
+struct DnsCacheEntry{
+	resolved_at: Instant,
+	ips: Vec<IpAddr>,
+}
+/// host -> 解決済みIPの簡易キャッシュ(TTL付き・上限付き)。
+pub struct DnsCache{
+	inner: RwLock<HashMap<String,DnsCacheEntry>>,
+	ttl: Duration,
+	max_entries: usize,
+}
+impl DnsCache{
+	pub fn new(ttl:Duration,max_entries:usize)->Self{
+		Self{inner:RwLock::new(HashMap::new()),ttl,max_entries}
+	}
+	/// hostを非同期解決する。TTL内はキャッシュを返す。
+	/// ポートは解決結果に影響しないためキーはhostのみ。
+	pub async fn resolve(&self,host:&str,port:u16)->Result<Vec<IpAddr>,String>{
+		{
+			let map=self.inner.read().await;
+			if let Some(entry)=map.get(host){
+				if entry.resolved_at.elapsed()<self.ttl{
+					return Ok(entry.ips.clone());
+				}
+			}
+		}
+		let host_port=format!("{}:{}",host,port);
+		let addrs=match tokio::time::timeout(DNS_TIMEOUT,tokio::net::lookup_host(host_port)).await{
+			Ok(Ok(iter))=>iter.map(|sa|sa.ip()).collect::<Vec<_>>(),
+			Ok(Err(e))=>return Err(format!("dns lookup error: {}",e)),
+			Err(_)=>return Err("dns lookup timeout".to_owned()),
+		};
+		if addrs.is_empty(){
+			return Err("dns lookup: no address".to_owned());
+		}
+		{
+			let mut map=self.inner.write().await;
+			if map.len()>=self.max_entries && !map.contains_key(host){
+				// まず期限切れを掃除し、それでも溢れる場合は1件退避する。
+				map.retain(|_,e|e.resolved_at.elapsed()<self.ttl);
+				if map.len()>=self.max_entries{
+					if let Some(k)=map.keys().next().cloned(){
+						map.remove(&k);
+					}
+				}
+			}
+			map.insert(host.to_owned(),DnsCacheEntry{resolved_at:Instant::now(),ips:addrs.clone()});
+		}
+		Ok(addrs)
+	}
+}
+
+async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>)->Result<(),String>{
 	let u=reqwest::Url::from_str(url.as_ref()).map_err(|e|format!("{:?}",e))?;
 	match u.scheme().to_lowercase().as_str(){
 		"http"|"https"=>{},
 		scheme=>return Err(format!("scheme: {}",scheme))
 	}
 	let host=u.host_str().ok_or_else(||"no host".to_owned())?;
-	if let Some(blocked_hosts)=&config.blocked_hosts{
-		if blocked_hosts.contains(&host.to_lowercase()){
-			return Err("Blocked address".to_owned());
-		}
+	if policy.blocked_hosts.contains(&host.to_lowercase()){
+		return Err("Blocked address".to_owned());
 	}
-	use std::net::{SocketAddr, ToSocketAddrs};
-	use iprange::IpRange;
-	use ipnet::Ipv4Net;
-	let ips=format!("{}:{}",host,u.port_or_known_default().unwrap()).to_socket_addrs().map_err(|e|format!("{:?} {}",e,host))?;
-	let ipv4_private_range: IpRange<Ipv4Net> = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
-		.iter()
-		.map(|s| s.parse().unwrap())
-		.collect();
-	let allow_ips=config.allowed_networks.as_ref().map(|ips|{
-		ips.iter()
-		.map(|s| s.parse().unwrap())
-		.collect::<IpRange<Ipv4Net>>()
-	});
-	let block_ips=config.blocked_networks.as_ref().map(|ips|{
-		ips.iter()
-		.map(|s| s.parse().unwrap())
-		.collect::<IpRange<Ipv4Net>>()
-	});
+	let port=u.port_or_known_default().ok_or_else(||"no port".to_owned())?;
+	// 同期DNS(to_socket_addrs)を廃止し、非同期解決+独自タイムアウトに置き換え。
+	let ips=dns_cache.resolve(host,port).await?;
 	for ip in ips{
 		match ip{
-			SocketAddr::V4(v4) => {
-				if let Some(block_ips)=&block_ips{
-					if block_ips.contains(v4.ip()){
-						return Err("Blocked address".to_owned());
-					}
-				}
-				if ipv4_private_range.contains(v4.ip()){
-					let allow=if let Some(allow_ips)=&allow_ips{
-						allow_ips.contains(v4.ip())
-					}else{
-						false
-					};
-					if !allow{
-						return Err("Blocked address".to_owned());
-					}
-				}
+			IpAddr::V4(v4)=>{
+				policy.check_ipv4(&v4)?;
 			},
-			SocketAddr::V6(v6) => {
-				if v6.ip().is_multicast()||v6.ip().is_unicast_link_local(){
+			IpAddr::V6(v6)=>{
+				if v6.is_multicast()||v6.is_unicast_link_local(){
 					return Err("Blocked address".to_owned());
 				}
 			},
@@ -244,7 +341,7 @@ async fn check_url(config:&Arc<ConfigFile>,url:impl AsRef<str>)->Result<(),Strin
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,config,dummy_img,fontdb,encode_semaphore):(reqwest::Client,Arc<ConfigFile>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>),
+	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache):(reqwest::Client,Arc<ConfigFile>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>),
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	println!("{}\t{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}\tfallback:{:?}",
@@ -265,7 +362,7 @@ async fn get_file(
 		headers.append("Vary","Accept,Range".parse().unwrap());
 	}
 	let time=chrono::Utc::now();
-	if let Err(s)=check_url(&config,&q.url).await{
+	if let Err(s)=check_url(&network_policy,&dns_cache,&q.url).await{
 		if let Ok(v)=s.parse(){
 			headers.append("X-Proxy-Error",v);
 		}
@@ -589,5 +686,58 @@ impl futures::stream::Stream for PreDataStream{
 			return std::task::Poll::Ready(Some(d));
 		}
 		r.last.as_mut().poll_next(cx)
+	}
+}
+
+#[cfg(test)]
+mod network_policy_tests{
+	use super::*;
+	fn base_config()->ConfigFile{
+		ConfigFile{
+			bind_addr:"0.0.0.0:12766".to_owned(),
+			timeout:10000,
+			user_agent:"test".to_owned(),
+			max_size:1024,
+			proxy:None,
+			filter_type:FilterType::Triangle,
+			max_pixels:2048,
+			append_headers:vec![],
+			load_system_fonts:false,
+			webp_quality:75.0,
+			encode_avif:false,
+			allowed_networks:None,
+			blocked_networks:None,
+			blocked_hosts:None,
+		}
+	}
+	#[test]
+	fn parse_valid_config(){
+		let mut c=base_config();
+		c.allowed_networks=Some(vec!["127.0.0.1/32".to_owned()]);
+		c.blocked_networks=Some(vec!["10.0.0.0/8".to_owned()]);
+		c.blocked_hosts=Some(vec!["Example.COM".to_owned()]);
+		let policy=NetworkPolicy::from_config(&c).expect("valid config should parse");
+		assert!(policy.blocked_hosts.contains("example.com"));
+	}
+	#[test]
+	fn parse_invalid_network_fails(){
+		let mut c=base_config();
+		c.blocked_networks=Some(vec!["not-a-cidr".to_owned()]);
+		assert!(NetworkPolicy::from_config(&c).is_err());
+	}
+	#[test]
+	fn private_ipv4_blocked_without_allow(){
+		let c=base_config();
+		let policy=NetworkPolicy::from_config(&c).unwrap();
+		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(10,0,0,1)).is_err());
+		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(8,8,8,8)).is_ok());
+	}
+	#[test]
+	fn allowed_overrides_private(){
+		let mut c=base_config();
+		c.allowed_networks=Some(vec!["10.1.2.3/32".to_owned()]);
+		let policy=NetworkPolicy::from_config(&c).unwrap();
+		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(10,1,2,3)).is_ok());
+		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(10,1,2,4)).is_err());
 	}
 }
