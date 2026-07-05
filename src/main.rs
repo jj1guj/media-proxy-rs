@@ -711,7 +711,7 @@ impl reqwest::dns::Resolve for SharedDnsResolver{
 	}
 }
 
-async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>)->Result<DnsHitStatus,String>{
+async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>)->Result<(DnsHitStatus,u16,u16),String>{
 	let u=reqwest::Url::from_str(url.as_ref()).map_err(|e|format!("{:?}",e))?;
 	match u.scheme().to_lowercase().as_str(){
 		"http"|"https"=>{},
@@ -724,6 +724,14 @@ async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>
 	let port=u.port_or_known_default().ok_or_else(||"no port".to_owned())?;
 	// 同期DNS(to_socket_addrs)を廃止し、非同期解決+独自タイムアウトに置き換え。
 	let (ips,dns_cache_hit)=dns_cache.resolve(host,port).await?;
+	let mut v4_count:u16=0;
+	let mut v6_count:u16=0;
+	for ip in &ips{
+		match ip{
+			IpAddr::V4(_)=>{ v4_count+=1; },
+			IpAddr::V6(_)=>{ v6_count+=1; },
+		}
+	}
 	for ip in ips{
 		match ip{
 			IpAddr::V4(v4)=>{
@@ -736,7 +744,7 @@ async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>
 			},
 		}
 	}
-	Ok(dns_cache_hit)
+	Ok((dns_cache_hit,v4_count,v6_count))
 }
 /// 1リクエストの各フェーズ所要時間と付随情報。Arc<Mutex<>> で get_file と
 /// RequestContext(spawn_blocking 内も含む)で共有する。
@@ -760,6 +768,10 @@ struct PhaseTimings{
 	anim_out_bytes:usize,
 	/// fetchエラーの分類+詳細(正常時はNone)。
 	fetch_err:Option<String>,
+	/// DNS解決結果のIPv4アドレス数。
+	dns_v4:u16,
+	/// DNS解決結果のIPv6アドレス数。
+	dns_v6:u16,
 }
 /// 計測対象フェーズ(decode/encode は複数の return を持つ関数が多いため Drop で計測する)。
 pub(crate) enum Phase{
@@ -893,6 +905,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		tracing::debug!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,fetch_err=%fetch_err_str,
+			dns_v4=t.dns_v4,dns_v6=t.dns_v6,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -903,6 +916,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		tracing::info!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,fetch_err=%fetch_err_str,
+			dns_v4=t.dns_v4,dns_v6=t.dns_v6,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -1052,10 +1066,12 @@ async fn get_file(
 	}
 	let check_start=Instant::now();
 	match check_url(&network_policy,&dns_cache,&q.url).await{
-		Ok(hit)=>{
+		Ok((hit,v4_count,v6_count))=>{
 			if let Ok(mut t)=timings.lock(){
 				t.check=check_start.elapsed();
 				t.dns_hit=Some(hit);
+				t.dns_v4=v4_count;
+				t.dns_v6=v6_count;
 			}
 		},
 		Err(s)=>{
