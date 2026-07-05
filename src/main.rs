@@ -53,12 +53,18 @@ pub struct ConfigFile{
 	/// キャッシュTTL(秒、既定3600)。
 	#[serde(default = "default_cache_ttl_secs")]
 	cache_ttl_secs:u64,
+	/// パススルー対象の最大バイトサイズ(既定1MB)。
+	/// webp/png/jpeg/gif かつ badge/static 未指定かつ寸法が目標以下かつこのサイズ以下なら
+	/// デコード・再エンコードせず元バイト列を返す。
+	#[serde(default = "default_passthrough_max_bytes")]
+	passthrough_max_bytes:u64,
 }
 fn default_slow_log_ms()->u64{50}
 fn default_true()->bool{true}
 fn default_cache_max_bytes()->u64{128*1024*1024}
 fn default_cache_entry_max_bytes()->u64{5*1024*1024}
 fn default_cache_ttl_secs()->u64{3600}
+fn default_passthrough_max_bytes()->u64{1024*1024}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -165,6 +171,7 @@ fn main() {
 			cache_max_bytes:default_cache_max_bytes(),
 			cache_entry_max_bytes:default_cache_entry_max_bytes(),
 			cache_ttl_secs:default_cache_ttl_secs(),
+			passthrough_max_bytes:default_passthrough_max_bytes(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -390,6 +397,7 @@ async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>
 struct PhaseTimings{
 	dns_cache_hit:bool,
 	cache_result:Option<CacheResult>,
+	passthrough:bool,
 	check:Duration,
 	/// download の計測開始時刻(送信直前にセット)。
 	download_start:Option<Instant>,
@@ -466,6 +474,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	if fast{
 		tracing::debug!(
 			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,cache=%cache_str,
+			passthrough=t.passthrough,
 			check_ms,download_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -475,6 +484,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	}else{
 		tracing::info!(
 			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,cache=%cache_str,
+			passthrough=t.passthrough,
 			check_ms,download_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -903,6 +913,46 @@ impl RequestContext{
                 (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
             })?;
 			self.load_all(resp).await?;
+			// --- パススルー判定 ---
+			// webp/png/jpeg/gif かつ badge/static 無 かつ寸法が目標以下かつサイズが閾値以下なら
+			// デコード・再エンコードせず元バイト列をそのまま返す。
+			if self.parms.badge.is_none() && self.parms.r#static.is_none() {
+				if let Ok(codec)=&self.codec{
+					let is_passthrough_format=matches!(codec,
+						image::ImageFormat::WebP|image::ImageFormat::Png|
+						image::ImageFormat::Jpeg|image::ImageFormat::Gif
+					);
+					if is_passthrough_format && self.src_bytes.len() <= self.config.passthrough_max_bytes as usize {
+						// ヘッダ読みで寸法を取得(全デコードしない)
+						let reader=image::ImageReader::new(std::io::Cursor::new(&self.src_bytes))
+							.with_guessed_format();
+						let dims=reader.ok().and_then(|r|r.into_dimensions().ok());
+						if let Some((w,h))=dims{
+							let (max_w,max_h)=self.image_size_hint();
+							if w<=max_w && h<=max_h{
+								// パススルー: 元バイト列をそのまま返す
+								if let Ok(mut t)=self.timings.lock(){
+									t.passthrough=true;
+								}
+								self.headers.remove("Cache-Control");
+								self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
+								// Content-Disposition の拡張子を元フォーマットに合わせる
+								let ext=match codec{
+									image::ImageFormat::WebP=>".webp",
+									image::ImageFormat::Png=>".png",
+									image::ImageFormat::Jpeg=>".jpeg",
+									image::ImageFormat::Gif=>".gif",
+									_=>".bin",
+								};
+								Self::disposition_ext(&mut self.headers,ext);
+								let body=std::mem::take(&mut self.src_bytes);
+								self.cache_response(200,&self.headers,&body);
+								return Err((axum::http::StatusCode::OK,self.headers.clone(),body).into_response());
+							}
+						}
+					}
+				}
+			}
 			let mut handle=self;
 			let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move ||{
 				handle.encode_img()
@@ -1052,6 +1102,7 @@ mod network_policy_tests{
 			cache_max_bytes:default_cache_max_bytes(),
 			cache_entry_max_bytes:default_cache_entry_max_bytes(),
 			cache_ttl_secs:default_cache_ttl_secs(),
+			passthrough_max_bytes:default_passthrough_max_bytes(),
 		}
 	}
 	#[test]
