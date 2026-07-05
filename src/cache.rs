@@ -200,6 +200,15 @@ impl ResponseCache {
 			inflight.remove(&guard.key);
 		}
 	}
+
+	/// キャッシュのエントリ数と合計バイト数を返す(統計ログ用)。
+	pub fn stats(&self) -> (usize, usize) {
+		if let Ok(inner) = self.entries.lock() {
+			(inner.map.len(), inner.total_bytes)
+		} else {
+			(0, 0)
+		}
+	}
 }
 
 /// singleflight の処理中ガード。Drop で inflight を掃除する(complete 忘れ/パニック対策)。

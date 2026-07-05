@@ -3,6 +3,7 @@ use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
@@ -20,7 +21,35 @@ mod cache;
 
 use cache::{CacheKey, CacheResult, ResponseCache};
 
-type AppState = (reqwest::Client, Arc<ConfigFile>, Arc<Vec<u8>>, Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>, Arc<ResponseCache>, Arc<Semaphore>, Arc<Semaphore>);
+/// 定期統計ログ用のグローバルカウンタ。
+/// emit_summary でインクリメントし、60秒ごとにリセット＋ログ出力する。
+struct GlobalStats {
+	requests: AtomicU64,
+	errors: AtomicU64,
+	cache_hits: AtomicU64,
+	cache_misses: AtomicU64,
+}
+impl GlobalStats {
+	fn new() -> Self {
+		Self {
+			requests: AtomicU64::new(0),
+			errors: AtomicU64::new(0),
+			cache_hits: AtomicU64::new(0),
+			cache_misses: AtomicU64::new(0),
+		}
+	}
+	/// カウンタをリセットし、リセット前の値を返す。
+	fn swap_reset(&self) -> (u64, u64, u64, u64) {
+		(
+			self.requests.swap(0, Ordering::Relaxed),
+			self.errors.swap(0, Ordering::Relaxed),
+			self.cache_hits.swap(0, Ordering::Relaxed),
+			self.cache_misses.swap(0, Ordering::Relaxed),
+		)
+	}
+}
+
+type AppState = (reqwest::Client, Arc<ConfigFile>, Arc<Vec<u8>>, Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>, Arc<ResponseCache>, Arc<Semaphore>, Arc<Semaphore>, Arc<GlobalStats>);
 
 #[derive(Debug,Serialize,Deserialize)]
 pub struct ConfigFile{
@@ -287,8 +316,50 @@ fn main() {
 		entry_max_bytes: config.cache_entry_max_bytes as usize,
 		ttl: Duration::from_secs(config.cache_ttl_secs),
 	}));
-	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache, response_cache, download_semaphore, buffer_budget);
+	let global_stats = Arc::new(GlobalStats::new());
+	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache, response_cache, download_semaphore, buffer_budget, global_stats);
 	rt.block_on(async{
+		// --- 60秒ごとの定期統計ログ ---
+		{
+			let stats = arg_tup.10.clone();
+			let encode_sem = arg_tup.4.clone();
+			let dl_sem = arg_tup.8.clone();
+			let buf_sem = arg_tup.9.clone();
+			let resp_cache = arg_tup.7.clone();
+			let dns = arg_tup.6.clone();
+			let max_encode = max_concurrent_encode;
+			let max_dl = arg_tup.1.max_concurrent_downloads;
+			let max_buf = arg_tup.1.inflight_buffer_budget_bytes as usize;
+			tokio::spawn(async move {
+				let mut interval = tokio::time::interval(Duration::from_secs(60));
+				interval.tick().await; // 最初の tick は即時発火するのでスキップ
+				loop {
+					interval.tick().await;
+					let (reqs, errs, hits, misses) = stats.swap_reset();
+					let dl_active = max_dl - dl_sem.available_permits();
+					let cpu_active = max_encode - encode_sem.available_permits();
+					let buf_used = max_buf - buf_sem.available_permits();
+					let (cache_entries, cache_bytes) = resp_cache.stats();
+					let dns_entries = dns.len();
+					tracing::info!(
+						requests = reqs,
+						errors = errs,
+						cache_hits = hits,
+						cache_misses = misses,
+						dl_active = dl_active as u64,
+						dl_max = max_dl as u64,
+						cpu_active = cpu_active as u64,
+						cpu_max = max_encode as u64,
+						buf_used_mb = (buf_used / (1024 * 1024)) as u64,
+						buf_max_mb = (max_buf / (1024 * 1024)) as u64,
+						cache_entries = cache_entries as u64,
+						cache_bytes = cache_bytes as u64,
+						dns_entries = dns_entries as u64,
+						"periodic_stats"
+					);
+				}
+			});
+		}
 		let http_addr:SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
 		let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
 		let app = Router::new();
@@ -421,6 +492,11 @@ impl DnsCache{
 	/// stale-while-error の上限判定。成功エントリが元TTLのDNS_STALE_FACTOR倍以内なら stale として使える。
 	fn is_stale_usable(&self,entry:&DnsCacheEntry)->bool{
 		entry.ips.is_ok() && entry.resolved_at.elapsed() < self.ttl * DNS_STALE_FACTOR
+	}
+
+	/// DNSキャッシュのエントリ数を返す(統計ログ用)。
+	pub fn len(&self) -> usize {
+		self.inner.try_read().map(|m| m.len()).unwrap_or(0)
 	}
 
 	/// hostを非同期解決する。TTL内はキャッシュを返す。singleflight付き。
@@ -685,7 +761,16 @@ impl ReqSummary{
 	}
 }
 /// 1リクエスト1行のサマリを出力する。正常かつ高速(slow_log_ms未満)なら DEBUG に落とす。
-fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_error:bool){
+fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_error:bool,stats:&GlobalStats){
+	stats.requests.fetch_add(1, Ordering::Relaxed);
+	if status >= 400 || has_error {
+		stats.errors.fetch_add(1, Ordering::Relaxed);
+	}
+	match t.cache_result {
+		Some(CacheResult::Hit | CacheResult::Joined) => { stats.cache_hits.fetch_add(1, Ordering::Relaxed); },
+		Some(CacheResult::Miss) => { stats.cache_misses.fetch_add(1, Ordering::Relaxed); },
+		_ => {},
+	}
 	let check_ms=t.check.as_millis() as u64;
 	let wait_ms=t.wait.as_millis() as u64;
 	let ttfb_ms=t.ttfb.as_millis() as u64;
@@ -728,7 +813,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache,response_cache,download_semaphore,buffer_budget):AppState,
+	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache,response_cache,download_semaphore,buffer_budget,global_stats):AppState,
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	let timings=Arc::new(Mutex::new(PhaseTimings::default()));
@@ -791,7 +876,7 @@ async fn get_file(
 				}
 			}
 			if let Ok(t)=timings.lock(){
-				emit_summary(&config,&summary,&t,cached.status,false);
+				emit_summary(&config,&summary,&t,cached.status,false,&global_stats);
 			}
 			let status=axum::http::StatusCode::from_u16(cached.status)
 				.unwrap_or(axum::http::StatusCode::OK);
@@ -831,7 +916,7 @@ async fn get_file(
 						}
 					}
 					if let Ok(t)=timings.lock(){
-						emit_summary(&config,&summary,&t,cached.status,false);
+						emit_summary(&config,&summary,&t,cached.status,false,&global_stats);
 					}
 					let status=axum::http::StatusCode::from_u16(cached.status)
 						.unwrap_or(axum::http::StatusCode::OK);
@@ -884,7 +969,7 @@ async fn get_file(
 			};
 			let is_fallback=q.fallback.is_some();
 			if let Ok(t)=timings.lock(){
-				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},has_error);
+				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},has_error,&global_stats);
 			}
 			if is_fallback{
 				headers.append("Content-Type","image/png".parse().unwrap());
@@ -923,7 +1008,7 @@ async fn get_file(
 		Err(e) => {
 			let is_fallback=q.fallback.is_some();
 			if let Ok(t)=timings.lock(){
-				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},false);
+				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},false,&global_stats);
 			}
 			if is_fallback{
 				headers.append("Content-Type","image/png".parse().unwrap());
@@ -993,7 +1078,7 @@ async fn get_file(
 		Err(r)=>(r.status().as_u16(),r.headers().contains_key("X-Proxy-Error")),
 	};
 	if let Ok(t)=timings.lock(){
-		emit_summary(&config,&summary,&t,status,has_error);
+		emit_summary(&config,&summary,&t,status,has_error,&global_stats);
 	}
 	result
 }
