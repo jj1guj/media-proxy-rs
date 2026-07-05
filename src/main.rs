@@ -62,6 +62,13 @@ pub struct ConfigFile{
 	/// 落ちているドメインへの連続リクエストが毎回1.5秒のDNSタイムアウトを踏むのを防ぐ。
 	#[serde(default = "default_dns_negative_ttl_secs")]
 	dns_negative_ttl_secs:u64,
+	/// JPEG出力用の品質(0-100、既定85)。webp_qualityの流用をやめる。
+	#[serde(default = "default_jpeg_quality")]
+	jpeg_quality:i32,
+	/// WebPエンコードのmethod(0-6、既定4)。
+	/// 値が小さいほどエンコードが速いが圧縮率が下がる。Pi等の低性能環境ではmethod=2を推奨。
+	#[serde(default = "default_webp_method")]
+	webp_method:i32,
 }
 fn default_slow_log_ms()->u64{50}
 fn default_true()->bool{true}
@@ -70,6 +77,8 @@ fn default_cache_entry_max_bytes()->u64{5*1024*1024}
 fn default_cache_ttl_secs()->u64{3600}
 fn default_passthrough_max_bytes()->u64{1024*1024}
 fn default_dns_negative_ttl_secs()->u64{10}
+fn default_jpeg_quality()->i32{85}
+fn default_webp_method()->i32{4}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -178,6 +187,8 @@ fn main() {
 			cache_ttl_secs:default_cache_ttl_secs(),
 			passthrough_max_bytes:default_passthrough_max_bytes(),
 			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
+			jpeg_quality:default_jpeg_quality(),
+			webp_method:default_webp_method(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -1150,6 +1161,8 @@ mod network_policy_tests{
 			cache_ttl_secs:default_cache_ttl_secs(),
 			passthrough_max_bytes:default_passthrough_max_bytes(),
 			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
+			jpeg_quality:default_jpeg_quality(),
+			webp_method:default_webp_method(),
 		}
 	}
 	#[test]

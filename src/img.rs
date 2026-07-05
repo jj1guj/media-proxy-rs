@@ -217,7 +217,9 @@ impl RequestContext{
 	}
 	fn encode_anim(&self,frames:image::Frames,loop_count:u32)->axum::response::Response{
 		let _g=self.phase_guard(Phase::Encode);
-		let conf=webp::WebPConfig::new().unwrap();
+		let mut conf=webp::WebPConfig::new().unwrap();
+		conf.quality=self.config.webp_quality;
+		conf.method=self.config.webp_method;
 		let mut size:Option<(u32, u32)>=None;
 		let mut encoder=None;
 		let mut available_frames:u32=0;
@@ -348,6 +350,7 @@ impl RequestContext{
                     let encoder=webp::Encoder::from_rgba(rgba.as_raw(),width,height);
                     let mut config=webp::WebPConfig::new().unwrap();
                     config.quality=self.config.webp_quality;
+                    config.method=self.config.webp_method;
                     return match encoder.encode_advanced(&config){
                         Ok(mem) => {
                             buf.extend_from_slice(&mem);
@@ -364,7 +367,7 @@ impl RequestContext{
                         },
                     };
 				} else {
-					let quality=self.config.webp_quality as i32;
+					let quality=self.config.jpeg_quality;
 					return match turbojpeg::compress_image(&rgba, quality, turbojpeg::Subsamp::Sub2x2){
 						Ok(mem) => {
 							buf.extend_from_slice(&mem);
