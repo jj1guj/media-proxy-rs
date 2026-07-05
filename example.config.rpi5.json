@@ -1,0 +1,25 @@
+{
+  "bind_addr": "0.0.0.0:12766",
+  "timeout": 10000,
+  "user_agent": "https://github.com/yojo-art/media-proxy-rs",
+  "max_size": 33554432,
+  "proxy": null,
+  "filter_type": "Triangle",
+  "max_pixels": 2048,
+  "append_headers": [
+    "Content-Security-Policy:default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'",
+    "Access-Control-Allow-Origin:*"
+  ],
+  "load_system_fonts": true,
+  "webp_quality": 70.0,
+  "encode_avif": false,
+  "slow_log_ms": 100,
+  "enable_cache": true,
+  "cache_max_bytes": 134217728,
+  "cache_entry_max_bytes": 3145728,
+  "cache_ttl_secs": 3600,
+  "passthrough_max_bytes": 1048576,
+  "dns_negative_ttl_secs": 10,
+  "jpeg_quality": 80,
+  "webp_method": 2
+}

@@ -84,3 +84,88 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 - JPEG XL(jxl-oxide)
 - JPEG 2000(openjp2)
 - JPEG XR(jxrlib)
+
+## 設定項目一覧
+
+| 項目 | 型 | 既定値 | 説明 |
+|------|------|--------|------|
+| `bind_addr` | string | `"0.0.0.0:12766"` | バインドアドレス |
+| `timeout` | u64 | `10000` | 外部リクエストのタイムアウト(ms) |
+| `user_agent` | string | | User-Agent ヘッダ |
+| `max_size` | u64 | `33554432` (32MB) | ダウンロードの最大バイト数。**既定値が256MBから32MBに変更されました** |
+| `proxy` | string? | `null` | HTTPプロキシURL |
+| `filter_type` | string | `"Triangle"` | リサイズフィルタ |
+| `max_pixels` | u32 | `2048` | 最大ピクセル寸法 |
+| `webp_quality` | f32 | `75.0` | WebPエンコード品質(0-100) |
+| `encode_avif` | bool | `false` | AVIFエンコードを有効にする |
+| `jpeg_quality` | i32 | `85` | JPEG出力品質(0-100)。従来は`webp_quality`を流用していた |
+| `webp_method` | i32 | `4` | WebPエンコードのmethod(0-6)。小さいほど高速だが圧縮率が下がる |
+| `slow_log_ms` | u64 | `50` | この時間(ms)未満かつ正常完了のリクエストはログをDEBUGに降格 |
+| `enable_cache` | bool | `true` | レスポンスキャッシュの有効/無効 |
+| `cache_max_bytes` | u64 | `134217728` (128MB) | キャッシュ合計バイト数上限 |
+| `cache_entry_max_bytes` | u64 | `5242880` (5MB) | 1エントリの最大バイト数 |
+| `cache_ttl_secs` | u64 | `3600` | キャッシュTTL(秒) |
+| `passthrough_max_bytes` | u64 | `1048576` (1MB) | パススルー対象の最大バイトサイズ |
+| `dns_negative_ttl_secs` | u64 | `10` | DNS解決失敗のネガティブキャッシュTTL(秒) |
+| `allowed_networks` | string[]? | `null` | 許可するCIDR。ヘルスチェック等でloopbackを使う場合は`["127.0.0.1/32"]`を追加 |
+| `blocked_networks` | string[]? | `null` | 遮断するCIDR |
+| `blocked_hosts` | string[]? | `null` | 遮断するホスト名 |
+
+すべての追加項目は `#[serde(default)]` 付きのため、既存の config.json をそのまま使えます。
+
+## Raspberry Pi 5 向けチューニング
+
+`example.config.rpi5.json` にRaspberry Pi 5 (aarch64, 4コア, RAM 4GB) 向けの推奨設定を用意しています。主な変更点:
+
+- **`webp_method`: 2** — method=4(既定)比で2〜3倍高速。サイズは5〜15%増だが、Pi上ではエンコード時間の短縮効果が大きい
+- **`cache_entry_max_bytes`: 3MB** — 大きなアニメGIF等のキャッシュを抑制
+- **`webp_quality`: 70** / **`jpeg_quality`: 80** — やや品質を下げてエンコード時間を短縮
+- **`slow_log_ms`: 100** — Pi上では処理が遅いため、ログ降格閾値を緩める
+
+使い方:
+```bash
+cp example.config.rpi5.json config.json
+```
+
+## CHANGELOG
+
+### Step 1: check_urlのDNS解決を非同期化
+- `to_socket_addrs()`(同期DNS)を`tokio::net::lookup_host`+タイムアウト(1.5秒)に置換
+- ネットワークポリシー(allowed/blocked_networks, blocked_hosts)の起動時パースをArc化
+- DNSキャッシュ(TTL 60秒、上限1024件)を導入
+
+### Step 2: フェーズ別計測とtracingへの移行
+- `println!`ベースのログを`tracing`+`tracing-subscriber`(env-filter)に移行
+- 1リクエスト1行のサマリログ(check/download/decode/encode各所要時間、cache状態、passthrough)
+- encode_animにフレーム数・入出力バイト数のログを追加
+- Timer構造体を削除
+
+### Step 3: セマフォ取得順序の変更とメモリ保護
+- セマフォ取得をload_all(ダウンロード)の前に移動(メモリを抱えたままセマフォ待ちを解消)
+- 許可数をnum_cpus+1に(ヘルスチェック等の軽量リクエスト用に1枠確保)
+- with_capacityの初期確保をmin(len_hint, 8MB)に制限
+- max_size既定値を256MB→32MBに変更
+
+### Step 4: レスポンスキャッシュと重複リクエストの合流
+- エンコード済みレスポンスのLRUキャッシュ(バイト数上限管理、TTL付き)
+- singleflight(同一キーの同時リクエストを1つの処理に合流)
+- キャッシュヒット時はセマフォ・ダウンロード・エンコードをすべてスキップ
+
+### Step 5: 不要な再エンコードの回避(パススルー)
+- webp/png/jpeg/gifかつbadge/static無かつ寸法が目標以下かつサイズが閾値以下なら元バイト列をそのまま返却
+- デコード・リサイズ・再エンコードを丸ごとスキップ(画質劣化なし)
+
+### Step 6: DNS解決の一本化とネガティブキャッシュ
+- reqwest::dns::Resolveを実装し、check_urlと実フェッチのDNS解決を同一キャッシュで一本化
+- 解決失敗のネガティブキャッシュ(既定10秒)で、落ちているドメインへの連続タイムアウトを防止
+
+### Step 7: エンコード設定のチューニングと整合
+- encode_animのWebPConfigにquality/methodを反映(従来は既定値で設定を無視)
+- jpeg_quality(既定85)を新設し、webp_qualityの流用を廃止
+- webp_method(既定4)を新設し、静止画・アニメ両方に反映
+
+### 本番ログでの効果確認の観点
+- **キャッシュヒット率**: `cache=hit` の割合。重複率72%の環境で50%超が目標
+- **パススルー率**: `passthrough=true` の割合。絵文字リクエスト(55%)の大半が該当する見込み
+- **encode_animの所要時間**: `anim=true` のリクエストの `encode_ms` 分布
+- **1秒超スタック件数**: `check_ms` + `download_ms` が1000を超えるリクエスト数(DNS一本化+ネガティブキャッシュで激減する見込み)
