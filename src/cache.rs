@@ -55,6 +55,8 @@ pub struct CacheConfig {
 	pub max_bytes: usize,
 	pub entry_max_bytes: usize,
 	pub ttl: Duration,
+	/// stale-if-error の保持上限。TTL切れ後もこの期間はstaleとして保持する。0で無効。
+	pub stale_max: Duration,
 }
 
 /// キャッシュヒット/ミス/合流の区分(ログ用)。
@@ -65,6 +67,8 @@ pub enum CacheResult {
 	Joined,
 	/// キャッシュ無効、または Range リクエスト等でキャッシュ対象外。
 	Bypass,
+	/// TTL切れのstaleエントリをフェッチ失敗時に返した。
+	Stale,
 }
 impl std::fmt::Display for CacheResult {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,6 +77,7 @@ impl std::fmt::Display for CacheResult {
 			CacheResult::Miss => write!(f, "miss"),
 			CacheResult::Joined => write!(f, "joined"),
 			CacheResult::Bypass => write!(f, "bypass"),
+			CacheResult::Stale => write!(f, "stale"),
 		}
 	}
 }
@@ -104,12 +109,12 @@ impl ResponseCache {
 	}
 
 	/// キャッシュからエントリを取得する(ヒット時は LRU 位置を更新)。
+	/// TTL切れエントリは返さない(stale保持期間内でもここでは返さない)。
 	pub fn get(&self, key: &CacheKey) -> Option<CacheEntry> {
 		if !self.config.enabled {
 			return None;
 		}
 		let mut inner = self.entries.lock().ok()?;
-		// TTL チェック付きで取得
 		if let Some(entry) = inner.map.get(key) {
 			if entry.created_at.elapsed() < self.config.ttl {
 				let entry = entry.clone();
@@ -118,12 +123,30 @@ impl ResponseCache {
 				let to = inner.map.len() - 1;
 				inner.map.move_index(from, to);
 				return Some(entry);
-			} else {
-				// TTL 切れ → 削除
+			}
+			// TTL切れ: stale_max > 0 なら保持(削除しない)、0なら即削除
+			if self.config.stale_max.is_zero() {
 				let removed = inner.map.shift_remove(key);
 				if let Some(r) = removed {
 					inner.total_bytes = inner.total_bytes.saturating_sub(r.size);
 				}
+			}
+		}
+		None
+	}
+
+	/// TTL切れだがstale保持期間内のエントリを取得する(フェッチ失敗時のフォールバック用)。
+	/// stale_max が 0 の場合は常に None を返す。
+	pub fn get_stale(&self, key: &CacheKey) -> Option<CacheEntry> {
+		if !self.config.enabled || self.config.stale_max.is_zero() {
+			return None;
+		}
+		let inner = self.entries.lock().ok()?;
+		if let Some(entry) = inner.map.get(key) {
+			let age = entry.created_at.elapsed();
+			// TTL切れ かつ stale保持期間内
+			if age >= self.config.ttl && age < self.config.ttl + self.config.stale_max {
+				return Some(entry.clone());
 			}
 		}
 		None
@@ -146,6 +169,17 @@ impl ResponseCache {
 		// 既存エントリがあれば削除してサイズ回収
 		if let Some(old) = inner.map.shift_remove(&key) {
 			inner.total_bytes = inner.total_bytes.saturating_sub(old.size);
+		}
+		// stale保持期間を超えた先頭エントリを掃除
+		let max_age = self.config.ttl + self.config.stale_max;
+		while let Some((_, oldest)) = inner.map.first() {
+			if oldest.created_at.elapsed() > max_age {
+				if let Some((_, evicted)) = inner.map.shift_remove_index(0) {
+					inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
+				}
+			} else {
+				break;
+			}
 		}
 		// 容量に収まるまで先頭(最古)から追い出し
 		while inner.total_bytes + entry.size > self.config.max_bytes && !inner.map.is_empty() {

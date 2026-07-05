@@ -27,5 +27,6 @@
   "max_concurrent_downloads": 64,
   "inflight_buffer_budget_bytes": 134217728,
   "connect_timeout_ms": 3000,
-  "fetch_retry_delay_ms": 500
+  "fetch_retry_delay_ms": 500,
+  "cache_stale_max_secs": 86400
 }

@@ -39,6 +39,7 @@ struct GlobalStats {
 	retry_saved: AtomicU64,
 	http1_responses: AtomicU64,
 	http2_responses: AtomicU64,
+	cache_stale_served: AtomicU64,
 }
 impl GlobalStats {
 	fn new() -> Self {
@@ -57,6 +58,7 @@ impl GlobalStats {
 			retry_saved: AtomicU64::new(0),
 			http1_responses: AtomicU64::new(0),
 			http2_responses: AtomicU64::new(0),
+			cache_stale_served: AtomicU64::new(0),
 		}
 	}
 	/// カウンタをリセットし、リセット前の値を返す。
@@ -174,6 +176,10 @@ pub struct ConfigFile{
 	/// 接続段階失敗時のリトライ前待機(ms、既定500)。SYN再送で瞬断窓を跨ぐ効果を狙う。
 	#[serde(default = "default_fetch_retry_delay_ms")]
 	fetch_retry_delay_ms:u64,
+	/// stale-if-error の保持上限(秒、既定86400=24時間)。
+	/// TTL切れ後もこの期間はstaleとして保持し、フェッチ失敗時に返す。0で無効。
+	#[serde(default = "default_cache_stale_max_secs")]
+	cache_stale_max_secs:u64,
 }
 fn default_slow_log_ms()->u64{50}
 fn default_true()->bool{true}
@@ -190,6 +196,7 @@ fn default_max_concurrent_downloads()->usize{24}
 fn default_inflight_buffer_budget()->u64{256*1024*1024}
 fn default_connect_timeout_ms()->u64{3000}
 fn default_fetch_retry_delay_ms()->u64{500}
+fn default_cache_stale_max_secs()->u64{86400}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -306,6 +313,7 @@ fn main() {
 			inflight_buffer_budget_bytes:default_inflight_buffer_budget(),
 			connect_timeout_ms:default_connect_timeout_ms(),
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
+			cache_stale_max_secs:default_cache_stale_max_secs(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -390,6 +398,7 @@ fn main() {
 		max_bytes: config.cache_max_bytes as usize,
 		entry_max_bytes: config.cache_entry_max_bytes as usize,
 		ttl: Duration::from_secs(config.cache_ttl_secs),
+		stale_max: Duration::from_secs(config.cache_stale_max_secs),
 	}));
 	let global_stats = Arc::new(GlobalStats::new());
 	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache, response_cache, download_semaphore, buffer_budget, global_stats);
@@ -414,6 +423,7 @@ fn main() {
 					let (fc, ft, fd, fr, fb, fo) = stats.swap_reset_ferr();
 					let (retry_att, retry_sav) = stats.swap_reset_retry();
 					let (http1, http2) = stats.swap_reset_http();
+					let stale_served = stats.cache_stale_served.swap(0, Ordering::Relaxed);
 					let dl_active = max_dl - dl_sem.available_permits();
 					let cpu_active = max_encode - encode_sem.available_permits();
 					let buf_used = max_buf - buf_sem.available_permits();
@@ -443,6 +453,7 @@ fn main() {
 						retry_saved = retry_sav,
 						http1_responses = http1,
 						http2_responses = http2,
+						cache_stale_served = stale_served,
 						"periodic_stats"
 					);
 				}
@@ -926,6 +937,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	match t.cache_result {
 		Some(CacheResult::Hit | CacheResult::Joined) => { stats.cache_hits.fetch_add(1, Ordering::Relaxed); },
 		Some(CacheResult::Miss) => { stats.cache_misses.fetch_add(1, Ordering::Relaxed); },
+		Some(CacheResult::Stale) => { stats.cache_stale_served.fetch_add(1, Ordering::Relaxed); },
 		_ => {},
 	}
 	// fetch_err カウンタ
@@ -979,6 +991,39 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 			"request"
 		);
 	}
+}
+/// staleキャッシュエントリからレスポンスを構築する。
+fn build_stale_response(
+	cached: &cache::CacheEntry,
+	config: &ConfigFile,
+	timings: &Arc<Mutex<PhaseTimings>>,
+) -> axum::response::Response {
+	if let Ok(mut t) = timings.lock() {
+		t.cache_result = Some(CacheResult::Stale);
+	}
+	let mut headers = HeaderMap::new();
+	if let Some(ct) = &cached.content_type {
+		if let Ok(v) = ct.parse() { headers.append("Content-Type", v); }
+	}
+	if let Some(cd) = &cached.content_disposition {
+		if let Ok(v) = cd.parse() { headers.append("Content-Disposition", v); }
+	}
+	headers.append("Cache-Control", "max-age=300".parse().unwrap());
+	headers.append("X-Proxy-Stale", "1".parse().unwrap());
+	if config.encode_avif {
+		headers.append("Vary", "Accept,Range".parse().unwrap());
+	}
+	for line in config.append_headers.iter() {
+		if let Some(idx) = line.find(':') {
+			if idx + 1 >= line.len() { continue; }
+			if let Ok(k) = axum::http::HeaderName::from_str(&line[0..idx]) {
+				if let Ok(v) = line[idx + 1..].parse() {
+					headers.append(k, v);
+				}
+			}
+		}
+	}
+	(axum::http::StatusCode::OK, headers, cached.body.clone()).into_response()
 }
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
@@ -1093,7 +1138,14 @@ async fn get_file(
 					return Err((status,headers,cached.body).into_response());
 				},
 				_=>{
-					// 元処理が失敗 → 自分でフォールスルーして処理する
+					// 元処理が失敗 → staleがあればそれを返す、なければフォールスルーして自分で処理
+					if let Some(stale) = response_cache.get_stale(&cache_key) {
+						let resp = build_stale_response(&stale, &config, &timings);
+						if let Ok(t)=timings.lock(){
+							emit_summary(&config,&summary,&t,200,false,&global_stats);
+						}
+						return Err(resp);
+					}
 				}
 			}
 		}
@@ -1143,6 +1195,17 @@ async fn get_file(
 			}else{
 				false
 			};
+			// stale-if-error: DNS失敗(ポリシー拒否以外)ならstaleを試みる
+			let is_dns_err = timings.lock().ok().map(|t| t.fetch_err.is_some()).unwrap_or(false);
+			if is_dns_err && !has_range {
+				if let Some(stale) = response_cache.get_stale(&cache_key) {
+					let resp = build_stale_response(&stale, &config, &timings);
+					if let Ok(t)=timings.lock(){
+						emit_summary(&config,&summary,&t,200,has_error,&global_stats);
+					}
+					return Err(resp);
+				}
+			}
 			let is_fallback=q.fallback.is_some();
 			if let Ok(t)=timings.lock(){
 				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},has_error,&global_stats);
@@ -1211,6 +1274,16 @@ async fn get_file(
 							t.retried=true;
 						}
 						headers.append("X-Proxy-Error",format!("Send:{}",fetch_err).parse().unwrap_or_else(|_|"Send:unknown".parse().unwrap()));
+						// stale-if-error
+						if !has_range {
+							if let Some(stale) = response_cache.get_stale(&cache_key) {
+								let resp = build_stale_response(&stale, &config, &timings);
+								if let Ok(t)=timings.lock(){
+									emit_summary(&config,&summary,&t,200,true,&global_stats);
+								}
+								return Err(resp);
+							}
+						}
 						if let Ok(t)=timings.lock(){
 							emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
 						}
@@ -1231,6 +1304,16 @@ async fn get_file(
 					t.fetch_err=Some(first_err.clone());
 				}
 				headers.append("X-Proxy-Error",format!("Send:{}",first_err).parse().unwrap_or_else(|_|"Send:unknown".parse().unwrap()));
+				// stale-if-error
+				if !has_range {
+					if let Some(stale) = response_cache.get_stale(&cache_key) {
+						let resp = build_stale_response(&stale, &config, &timings);
+						if let Ok(t)=timings.lock(){
+							emit_summary(&config,&summary,&t,200,true,&global_stats);
+						}
+						return Err(resp);
+					}
+				}
 				if let Ok(t)=timings.lock(){
 					emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
 				}
@@ -1309,6 +1392,22 @@ async fn get_file(
 		let entry=response_cache.get(&cache_key);
 		response_cache.complete_flight(guard,entry);
 	}
+
+	// --- stale-if-error: フェッチ失敗時にstaleエントリで救済 ---
+	let result = if result.is_err() {
+		let has_fetch_err = timings.lock().ok().map(|t| t.fetch_err.is_some()).unwrap_or(false);
+		if has_fetch_err {
+			if let Some(stale) = response_cache.get_stale(&cache_key) {
+				Err(build_stale_response(&stale, &config, &timings))
+			} else {
+				result
+			}
+		} else {
+			result
+		}
+	} else {
+		result
+	};
 
 	let (status,has_error)=match &result{
 		Ok((sc,h,_))=>(sc.as_u16(),h.contains_key("X-Proxy-Error")),
@@ -1710,6 +1809,7 @@ mod network_policy_tests{
 			inflight_buffer_budget_bytes:default_inflight_buffer_budget(),
 			connect_timeout_ms:default_connect_timeout_ms(),
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
+			cache_stale_max_secs:default_cache_stale_max_secs(),
 		}
 	}
 	#[test]
@@ -1756,6 +1856,7 @@ mod cache_tests{
 			max_bytes:1024*1024,
 			entry_max_bytes:512*1024,
 			ttl:Duration::from_secs(60),
+			stale_max:Duration::from_secs(86400),
 		}))
 	}
 	fn test_key()->CacheKey{
@@ -1781,6 +1882,7 @@ mod cache_tests{
 			max_bytes:1024*1024,
 			entry_max_bytes:512*1024,
 			ttl:Duration::from_secs(60),
+			stale_max:Duration::from_secs(86400),
 		}));
 		let key=test_key();
 		let entry=CacheEntry::new(200,Some("image/png".to_owned()),None,None,vec![1,2,3]);
@@ -1802,6 +1904,7 @@ mod cache_tests{
 			max_bytes:1024,
 			entry_max_bytes:600,
 			ttl:Duration::from_secs(60),
+			stale_max:Duration::from_secs(86400),
 		}));
 		let key1=CacheKey{url:"a".to_owned(),is_static:false,emoji:false,avatar:false,preview:false,badge:false,accept_avif:false};
 		let key2=CacheKey{url:"b".to_owned(),is_static:false,emoji:false,avatar:false,preview:false,badge:false,accept_avif:false};
@@ -1819,6 +1922,7 @@ mod cache_tests{
 			max_bytes:1024*1024,
 			entry_max_bytes:100,
 			ttl:Duration::from_secs(60),
+			stale_max:Duration::from_secs(86400),
 		}));
 		let key=test_key();
 		// body=200 + overhead=256 → size=456 > entry_max_bytes=100
