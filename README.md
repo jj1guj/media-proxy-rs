@@ -107,6 +107,10 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `cache_ttl_secs` | u64 | `3600` | キャッシュTTL(秒) |
 | `passthrough_max_bytes` | u64 | `1048576` (1MB) | パススルー対象の最大バイトサイズ |
 | `dns_negative_ttl_secs` | u64 | `10` | DNS解決失敗のネガティブキャッシュTTL(秒) |
+| `dns_timeout_ms` | u64 | `4000` | DNS解決のタイムアウト(ms)。タイムアウト時は1回リトライ |
+| `dns_ttl_secs` | u64 | `300` | DNSキャッシュのTTL(秒) |
+| `max_concurrent_downloads` | usize | `24` | ダウンロードの最大同時接続数 |
+| `inflight_buffer_budget_bytes` | u64 | `268435456` (256MB) | 同時ダウンロードの合計バイト予算 |
 | `allowed_networks` | string[]? | `null` | 許可するCIDR。ヘルスチェック等でloopbackを使う場合は`["127.0.0.1/32"]`を追加 |
 | `blocked_networks` | string[]? | `null` | 遮断するCIDR |
 | `blocked_hosts` | string[]? | `null` | 遮断するホスト名 |
@@ -121,6 +125,8 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 - **`cache_entry_max_bytes`: 3MB** — 大きなアニメGIF等のキャッシュを抑制
 - **`webp_quality`: 70** / **`jpeg_quality`: 80** — やや品質を下げてエンコード時間を短縮
 - **`slow_log_ms`: 100** — Pi上では処理が遅いため、ログ降格閾値を緩める
+- **`max_concurrent_downloads`: 16** — メモリ4GBに合わせて制限
+- **`inflight_buffer_budget_bytes`: 128MB** — メモリ4GBに合わせて半減
 
 使い方:
 ```bash
@@ -168,4 +174,32 @@ cp example.config.rpi5.json config.json
 - **キャッシュヒット率**: `cache=hit` の割合。重複率72%の環境で50%超が目標
 - **パススルー率**: `passthrough=true` の割合。絵文字リクエスト(55%)の大半が該当する見込み
 - **encode_animの所要時間**: `anim=true` のリクエストの `encode_ms` 分布
-- **1秒超スタック件数**: `check_ms` + `download_ms` が1000を超えるリクエスト数(DNS一本化+ネガティブキャッシュで激減する見込み)
+- **1秒超スタック件数**: `check_ms` + `wait_ms` + `ttfb_ms` + `body_ms` が1000を超えるリクエスト数(DNS一本化+ネガティブキャッシュで激減する見込み)
+- **定期統計ログ**: 60秒ごとの `periodic_stats` で `dl_active`, `cpu_active`, `buf_used_mb` の推移を確認
+
+### Step 8: DNSキャッシュの安定性強化
+- configurable TTL(dns_ttl_secs既定300秒)・タイムアウト(dns_timeout_ms既定4000ms、1回リトライ)
+- タイムアウト由来のネガティブキャッシュTTLを短く(2秒)、確定的失敗は既定10秒
+- stale-while-error(元TTLの10倍まで古い成功エントリを再利用)
+- singleflightをbroadcast方式に変更(Mutex/awaitの排他回避)
+
+### Step 9: フェーズ計測の細分化(download → wait/ttfb/body)
+- download_ms を wait_ms(セマフォ待ち)・ttfb_ms(req.send→最初のレスポンス)・body_ms(ボディ全受信)に3分割
+- ネットワーク遅延とリソース待ちの切り分けが容易に
+
+### Step 10: セマフォの責務分離(ダウンロード直列化の解消)
+- ダウンロードpermit(max_concurrent_downloads既定24): req.send前〜load_all完了まで保持
+- バイト予算(inflight_buffer_budget_bytes既定256MB): load_all前に予約、エンコード完了後に解放
+- CPUセマフォ(num_cpus): spawn_blocking直前〜完了まで保持
+- 従来の単一セマフォ(DL+CPU共用)による head-of-line blocking を解消
+
+### Step 11: 定期統計ログ(60秒間隔)
+- 60秒ごとに `periodic_stats` をINFOログ出力
+- requests/errors/cache_hits/cache_misses(期間カウンタ、リセット型)
+- dl_active/cpu_active/buf_used_mb(瞬時値)
+- cache_entries/cache_bytes/dns_entries(瞬時値)
+
+### Step 12: clippy修正・README更新
+- type_complexity警告をDnsResult型エイリアスで解消
+- len_without_is_empty警告をpub(crate)で回避
+- 設定項目一覧・CHANGELOGを最新化

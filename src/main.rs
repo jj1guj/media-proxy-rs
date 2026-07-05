@@ -458,6 +458,9 @@ impl std::fmt::Display for DnsHitStatus{
 	}
 }
 
+/// DNS singleflight の broadcast で送受信する型。
+type DnsResult = Result<Vec<IpAddr>,String>;
+
 /// host -> 解決済みIPの簡易キャッシュ(TTL付き・上限付き・singleflight・stale-while-error)。
 pub struct DnsCache{
 	inner: RwLock<HashMap<String,DnsCacheEntry>>,
@@ -466,7 +469,7 @@ pub struct DnsCache{
 	dns_timeout: Duration,
 	max_entries: usize,
 	/// singleflight: 進行中のDNS解決。同一ホストへの並列lookup_hostを1本に束ねる。
-	inflight: Mutex<HashMap<String,tokio::sync::broadcast::Sender<Result<Vec<IpAddr>,String>>>>,
+	inflight: Mutex<HashMap<String,tokio::sync::broadcast::Sender<DnsResult>>>,
 }
 impl DnsCache{
 	pub fn new(ttl:Duration,negative_ttl:Duration,dns_timeout:Duration,max_entries:usize)->Self{
@@ -495,7 +498,7 @@ impl DnsCache{
 	}
 
 	/// DNSキャッシュのエントリ数を返す(統計ログ用)。
-	pub fn len(&self) -> usize {
+	pub(crate) fn len(&self) -> usize {
 		self.inner.try_read().map(|m| m.len()).unwrap_or(0)
 	}
 
@@ -607,12 +610,12 @@ impl DnsCache{
 	}
 
 	/// singleflight: 進行中の解決があればsubscribeする(同期・MutexGuardがawaitをまたがない)。
-	fn try_subscribe(&self,host:&str)->Option<tokio::sync::broadcast::Receiver<Result<Vec<IpAddr>,String>>>{
+	fn try_subscribe(&self,host:&str)->Option<tokio::sync::broadcast::Receiver<DnsResult>>{
 		let inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
 		inflight.get(host).map(|tx|tx.subscribe())
 	}
 	/// singleflight: 自分が処理開始を登録する。既に別タスクが登録済みならそのrxを返す。
-	fn register_or_subscribe(&self,host:&str)->Result<tokio::sync::broadcast::Sender<Result<Vec<IpAddr>,String>>,tokio::sync::broadcast::Receiver<Result<Vec<IpAddr>,String>>>{
+	fn register_or_subscribe(&self,host:&str)->Result<tokio::sync::broadcast::Sender<DnsResult>,tokio::sync::broadcast::Receiver<DnsResult>>{
 		let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
 		if let Some(tx)=inflight.get(host){
 			Err(tx.subscribe())
@@ -623,7 +626,7 @@ impl DnsCache{
 		}
 	}
 	/// singleflight: 強制的にtxを登録する(raceで合流が全て失敗した場合のフォールバック)。
-	fn force_register(&self,host:&str)->tokio::sync::broadcast::Sender<Result<Vec<IpAddr>,String>>{
+	fn force_register(&self,host:&str)->tokio::sync::broadcast::Sender<DnsResult>{
 		let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
 		let (tx,_)=tokio::sync::broadcast::channel(1);
 		inflight.insert(host.to_owned(),tx.clone());
