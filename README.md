@@ -30,6 +30,11 @@ media-proxy-rs_linux-riscv64.gz
 デフォルト値は`$(pwd)/config.json`です  
 十分に強力なマシンでは`encode_avif`を`true`に変更することでAVIFエンコードを利用する事ができます
 
+### max_size の既定値変更
+`max_size` の既定値が 256MB (268435456) から **32MB (33554432)** に変更されました。  
+既存の `config.json` を使用している環境では設定値がそのまま使われるため影響はありません。  
+運用中の環境でも、実際に必要な上限に合わせて `max_size` の見直しを推奨します。
+
 ## target support
 - [x] x86_64-unknown-linux-musl
 - [x] aarch64-unknown-linux-musl

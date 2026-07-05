@@ -128,7 +128,7 @@ fn main() {
 			bind_addr: "0.0.0.0:12766".to_owned(),
 			timeout:10000,
 			user_agent: "https://github.com/yojo-art/media-proxy-rs".to_owned(),
-			max_size:256*1024*1024,
+			max_size:32*1024*1024,
 			proxy:None,
 			filter_type:FilterType::Triangle,
 			max_pixels:2048,
@@ -200,7 +200,9 @@ fn main() {
 	// let arg_tup=(client,config,dummy_png,fontdb);
 
 	// 同時に処理する画像数を制限する
-	let max_concurrent_encode = num_cpus::get().max(2);
+	// num_cpus + 1: 全枠が重いエンコードで埋まっていても軽量リクエスト(ヘルスチェック等)が
+	// 1枠に滑り込めるようにする。Step 4 でキャッシュが入ればヘルスチェックはセマフォ自体を通らなくなる。
+	let max_concurrent_encode = num_cpus::get().max(2) + 1;
 	let encode_semaphore = Arc::new(Semaphore::new(max_concurrent_encode));
 	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache);
 	rt.block_on(async{
@@ -705,6 +707,14 @@ impl RequestContext{
 			}
 		}
 		if is_svg{
+			// セマフォをダウンロードの前に取得する。
+			// 「バッファ済みデータを抱えたままセマフォ待ち」を防ぐ。
+			let semaphore = self.encode_semaphore.clone();
+			let mut header=self.headers.clone();
+			let _permit = semaphore.acquire().await.map_err(|_| {
+				header.append("X-Proxy-Error", "SemaphoreError".parse().unwrap());
+				(axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
+			})?;
 			self.load_all(resp).await?;
 			if let Ok(img)=self.encode_svg(self.fontdb.clone()){
 				self.headers.remove("Content-Length");
@@ -720,16 +730,17 @@ impl RequestContext{
 			self.headers.remove("Content-Length");
 			self.headers.remove("Content-Range");
 			self.headers.remove("Accept-Ranges");
-			self.load_all(resp).await?;
 			let dummy_img=self.dummy_img.clone();
 			let is_fallback=self.parms.fallback.is_some();
 			let mut header=self.headers.clone();
-			// セマフォで同時実行数を制限
+			// セマフォをダウンロードの前に取得する。
+			// 「バッファ済みデータを抱えたままセマフォ待ち」を防ぐ。
 			let semaphore = self.encode_semaphore.clone();
 			let _permit = semaphore.acquire().await.map_err(|_| {
                 header.append("X-Proxy-Error", "SemaphoreError".parse().unwrap());
                 (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
             })?;
+			self.load_all(resp).await?;
 			let mut handle=self;
 			let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move ||{
 				handle.encode_img()
@@ -802,7 +813,10 @@ impl RequestContext{
 			self.headers.append("X-Proxy-Error",format!("lengthHint:{}>{}",len_hint,self.config.max_size).parse().unwrap());
 			return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
 		}
-		let mut response_bytes=Vec::with_capacity(len_hint as usize);
+		// with_capacity の初期確保を min(len_hint, 8MB) に抑える。
+		// 虚偽の巨大 Content-Length による即時巨大アロケーションを防ぐ。
+		const INITIAL_CAP_LIMIT: usize = 8 * 1024 * 1024;
+		let mut response_bytes=Vec::with_capacity((len_hint as usize).min(INITIAL_CAP_LIMIT));
 		while let Some(x) = resp.next().await{
 			match x{
 				Ok(b)=>{
