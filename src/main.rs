@@ -62,6 +62,12 @@ pub struct ConfigFile{
 	/// 落ちているドメインへの連続リクエストが毎回1.5秒のDNSタイムアウトを踏むのを防ぐ。
 	#[serde(default = "default_dns_negative_ttl_secs")]
 	dns_negative_ttl_secs:u64,
+	/// DNS解決のタイムアウト(ms、既定4000)。タイムアウト時は1回リトライする(合計最大約8秒)。
+	#[serde(default = "default_dns_timeout_ms")]
+	dns_timeout_ms:u64,
+	/// DNSキャッシュのTTL(秒、既定300)。
+	#[serde(default = "default_dns_ttl_secs")]
+	dns_ttl_secs:u64,
 	/// JPEG出力用の品質(0-100、既定85)。webp_qualityの流用をやめる。
 	#[serde(default = "default_jpeg_quality")]
 	jpeg_quality:i32,
@@ -77,6 +83,8 @@ fn default_cache_entry_max_bytes()->u64{5*1024*1024}
 fn default_cache_ttl_secs()->u64{3600}
 fn default_passthrough_max_bytes()->u64{1024*1024}
 fn default_dns_negative_ttl_secs()->u64{10}
+fn default_dns_timeout_ms()->u64{4000}
+fn default_dns_ttl_secs()->u64{300}
 fn default_jpeg_quality()->i32{85}
 fn default_webp_method()->i32{4}
 #[derive(Debug, Deserialize)]
@@ -187,6 +195,8 @@ fn main() {
 			cache_ttl_secs:default_cache_ttl_secs(),
 			passthrough_max_bytes:default_passthrough_max_bytes(),
 			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
+			dns_timeout_ms:default_dns_timeout_ms(),
+			dns_ttl_secs:default_dns_ttl_secs(),
 			jpeg_quality:default_jpeg_quality(),
 			webp_method:default_webp_method(),
 		};
@@ -226,7 +236,12 @@ fn main() {
 			std::process::exit(1);
 		}
 	};
-	let dns_cache=Arc::new(DnsCache::new(DNS_CACHE_TTL,Duration::from_secs(config.dns_negative_ttl_secs),DNS_CACHE_MAX_ENTRIES));
+	let dns_cache=Arc::new(DnsCache::new(
+		Duration::from_secs(config.dns_ttl_secs),
+		Duration::from_secs(config.dns_negative_ttl_secs),
+		Duration::from_millis(config.dns_timeout_ms),
+		DNS_CACHE_MAX_ENTRIES,
+	));
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 	let client=reqwest::ClientBuilder::new();
 	let client=match &config.proxy{
@@ -270,12 +285,12 @@ fn main() {
 		axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
 	});
 }
-/// DNS解決のタイムアウト。リゾルバのリトライ由来の張り付き(本番で約2秒/4秒)を防ぐ。
-const DNS_TIMEOUT: Duration = Duration::from_millis(1500);
-/// DNSキャッシュのTTL。
-const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
 /// DNSキャッシュの最大エントリ数(無制限成長の防止)。
 const DNS_CACHE_MAX_ENTRIES: usize = 1024;
+/// タイムアウト由来のネガティブキャッシュの短いTTL。
+const DNS_TIMEOUT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
+/// stale-while-error の上限倍率(元TTLのこの倍までstaleエントリを使う)。
+const DNS_STALE_FACTOR: u32 = 10;
 
 /// 起動時に1度だけパースするネットワークポリシー。
 /// check_url には Arc の参照として渡す(リクエストごとの再パースをしない)。
@@ -335,36 +350,160 @@ impl NetworkPolicy{
 struct DnsCacheEntry{
 	resolved_at: Instant,
 	ips: Result<Vec<IpAddr>,String>,
+	/// タイムアウト由来の失敗かどうか(ネガティブキャッシュTTLの選別に使う)。
+	is_timeout: bool,
 }
-/// host -> 解決済みIPの簡易キャッシュ(TTL付き・上限付き)。
+
+/// DNS解決結果のキャッシュ状態(ログ用)。
+#[derive(Clone,Copy)]
+pub enum DnsHitStatus{
+	/// キャッシュヒット(TTL内)。
+	Hit,
+	/// TTL切れだが再解決失敗のため期限切れの値を使用。
+	Stale,
+	/// キャッシュミス(新規解決)。
+	Miss,
+}
+impl std::fmt::Display for DnsHitStatus{
+	fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{
+		match self{
+			DnsHitStatus::Hit=>write!(f,"hit"),
+			DnsHitStatus::Stale=>write!(f,"stale"),
+			DnsHitStatus::Miss=>write!(f,"miss"),
+		}
+	}
+}
+
+/// host -> 解決済みIPの簡易キャッシュ(TTL付き・上限付き・singleflight・stale-while-error)。
 pub struct DnsCache{
 	inner: RwLock<HashMap<String,DnsCacheEntry>>,
 	ttl: Duration,
 	negative_ttl: Duration,
+	dns_timeout: Duration,
 	max_entries: usize,
+	/// singleflight: 進行中のDNS解決。同一ホストへの並列lookup_hostを1本に束ねる。
+	inflight: Mutex<HashMap<String,tokio::sync::broadcast::Sender<Result<Vec<IpAddr>,String>>>>,
 }
 impl DnsCache{
-	pub fn new(ttl:Duration,negative_ttl:Duration,max_entries:usize)->Self{
-		Self{inner:RwLock::new(HashMap::new()),ttl,negative_ttl,max_entries}
+	pub fn new(ttl:Duration,negative_ttl:Duration,dns_timeout:Duration,max_entries:usize)->Self{
+		Self{
+			inner:RwLock::new(HashMap::new()),
+			ttl,negative_ttl,dns_timeout,max_entries,
+			inflight:Mutex::new(HashMap::new()),
+		}
 	}
-	/// hostを非同期解決する。TTL内はキャッシュを返す。
-	/// ポートは解決結果に影響しないためキーはhostのみ。
-	/// 戻り値の bool はキャッシュヒットかどうか(true=ヒット)。
-	pub async fn resolve(&self,host:&str,port:u16)->Result<(Vec<IpAddr>,bool),String>{
+	/// エントリのTTLを返す。タイムアウト由来の失敗は短いTTL(2秒)、確定的失敗はnegative_ttl。
+	fn entry_ttl(&self,entry:&DnsCacheEntry)->Duration{
+		match &entry.ips{
+			Ok(_)=>self.ttl,
+			Err(_)=>{
+				if entry.is_timeout{
+					DNS_TIMEOUT_NEGATIVE_TTL
+				}else{
+					self.negative_ttl
+				}
+			}
+		}
+	}
+	/// stale-while-error の上限判定。成功エントリが元TTLのDNS_STALE_FACTOR倍以内なら stale として使える。
+	fn is_stale_usable(&self,entry:&DnsCacheEntry)->bool{
+		entry.ips.is_ok() && entry.resolved_at.elapsed() < self.ttl * DNS_STALE_FACTOR
+	}
+
+	/// hostを非同期解決する。TTL内はキャッシュを返す。singleflight付き。
+	/// タイムアウト時は1回リトライする。
+	pub async fn resolve(&self,host:&str,port:u16)->Result<(Vec<IpAddr>,DnsHitStatus),String>{
+		// --- キャッシュヒット判定 ---
 		{
 			let map=self.inner.read().await;
 			if let Some(entry)=map.get(host){
-				let ttl=if entry.ips.is_ok(){self.ttl}else{self.negative_ttl};
+				let ttl=self.entry_ttl(entry);
 				if entry.resolved_at.elapsed()<ttl{
 					match &entry.ips{
-						Ok(ips)=>return Ok((ips.clone(),true)),
+						Ok(ips)=>return Ok((ips.clone(),DnsHitStatus::Hit)),
 						Err(e)=>return Err(e.clone()),
 					}
 				}
 			}
 		}
+		// --- singleflight: 既に進行中なら合流、そうでなければ自分が処理開始 ---
+		let rx_opt=self.try_subscribe(host);
+		if let Some(mut rx)=rx_opt{
+			if let Ok(result)=rx.recv().await{
+				match result{
+					Ok(ips)=>return Ok((ips,DnsHitStatus::Miss)),
+					Err(e)=>return self.try_stale_or_err(host,e).await,
+				}
+			}
+			// broadcast側がdropされた→自分で解決にフォールスルー
+		}
+		// --- singleflight: 処理開始を登録(race check込み) ---
+		let tx=match self.register_or_subscribe(host){
+			Err(mut rx)=>{
+				// 別タスクが先に登録した→合流
+				if let Ok(result)=rx.recv().await{
+					match result{
+						Ok(ips)=>return Ok((ips,DnsHitStatus::Miss)),
+						Err(e)=>return self.try_stale_or_err(host,e).await,
+					}
+				}
+				// broadcast側がdropされた→自分で解決にフォールスルー(txを登録)
+				self.force_register(host)
+			},
+			Ok(tx)=>tx,
+		};
+		// --- 実際のDNS解決(リトライ1回付き) ---
+		let result=self.do_lookup(host,port).await;
+		let result=match &result{
+			Err(e) if e.contains("timeout")=>{
+				// タイムアウト→1回リトライ
+				self.do_lookup(host,port).await
+			},
+			_=>result,
+		};
+		let is_timeout=matches!(&result,Err(e) if e.contains("timeout"));
+		// --- キャッシュ格納 ---
+		{
+			let mut map=self.inner.write().await;
+			if map.len()>=self.max_entries && !map.contains_key(host){
+				map.retain(|_,e|{
+					let ttl=self.entry_ttl(e);
+					// stale-while-error用に成功エントリは長めに保持
+					if e.ips.is_ok(){
+						e.resolved_at.elapsed() < self.ttl * DNS_STALE_FACTOR
+					}else{
+						e.resolved_at.elapsed() < ttl
+					}
+				});
+				if map.len()>=self.max_entries{
+					if let Some(k)=map.keys().next().cloned(){
+						map.remove(&k);
+					}
+				}
+			}
+			map.insert(host.to_owned(),DnsCacheEntry{
+				resolved_at:Instant::now(),
+				ips:result.clone(),
+				is_timeout,
+			});
+		}
+		// --- singleflight: 結果を通知して inflight から削除 ---
+		let _ = tx.send(result.clone());
+		{
+			let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
+			inflight.remove(host);
+		}
+		// --- 結果を返す(失敗時はstaleを試す) ---
+		match result{
+			Ok(addrs)=>Ok((addrs,DnsHitStatus::Miss)),
+			Err(e)=>self.try_stale_or_err(host,e).await,
+		}
+	}
+
+	/// 1回のlookup_host実行(タイムアウト付き)。
+	async fn do_lookup(&self,host:&str,port:u16)->Result<Vec<IpAddr>,String>{
 		let host_port=format!("{}:{}",host,port);
-		let result=match tokio::time::timeout(DNS_TIMEOUT,tokio::net::lookup_host(host_port)).await{
+		match tokio::time::timeout(self.dns_timeout,tokio::net::lookup_host(host_port)).await{
 			Ok(Ok(iter))=>{
 				let addrs:Vec<_>=iter.map(|sa|sa.ip()).collect();
 				if addrs.is_empty(){
@@ -375,26 +514,44 @@ impl DnsCache{
 			},
 			Ok(Err(e))=>Err(format!("dns lookup error: {}",e)),
 			Err(_)=>Err("dns lookup timeout".to_owned()),
-		};
-		{
-			let mut map=self.inner.write().await;
-			if map.len()>=self.max_entries && !map.contains_key(host){
-				map.retain(|_,e|{
-					let ttl=if e.ips.is_ok(){self.ttl}else{self.negative_ttl};
-					e.resolved_at.elapsed()<ttl
-				});
-				if map.len()>=self.max_entries{
-					if let Some(k)=map.keys().next().cloned(){
-						map.remove(&k);
-					}
+		}
+	}
+
+	/// singleflight: 進行中の解決があればsubscribeする(同期・MutexGuardがawaitをまたがない)。
+	fn try_subscribe(&self,host:&str)->Option<tokio::sync::broadcast::Receiver<Result<Vec<IpAddr>,String>>>{
+		let inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
+		inflight.get(host).map(|tx|tx.subscribe())
+	}
+	/// singleflight: 自分が処理開始を登録する。既に別タスクが登録済みならそのrxを返す。
+	fn register_or_subscribe(&self,host:&str)->Result<tokio::sync::broadcast::Sender<Result<Vec<IpAddr>,String>>,tokio::sync::broadcast::Receiver<Result<Vec<IpAddr>,String>>>{
+		let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
+		if let Some(tx)=inflight.get(host){
+			Err(tx.subscribe())
+		}else{
+			let (tx,_)=tokio::sync::broadcast::channel(1);
+			inflight.insert(host.to_owned(),tx.clone());
+			Ok(tx)
+		}
+	}
+	/// singleflight: 強制的にtxを登録する(raceで合流が全て失敗した場合のフォールバック)。
+	fn force_register(&self,host:&str)->tokio::sync::broadcast::Sender<Result<Vec<IpAddr>,String>>{
+		let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
+		let (tx,_)=tokio::sync::broadcast::channel(1);
+		inflight.insert(host.to_owned(),tx.clone());
+		tx
+	}
+
+	/// 解決失敗時にstaleエントリがあればそれを返す。なければエラー。
+	async fn try_stale_or_err(&self,host:&str,err:String)->Result<(Vec<IpAddr>,DnsHitStatus),String>{
+		let map=self.inner.read().await;
+		if let Some(entry)=map.get(host){
+			if self.is_stale_usable(entry){
+				if let Ok(ips)=&entry.ips{
+					return Ok((ips.clone(),DnsHitStatus::Stale));
 				}
 			}
-			map.insert(host.to_owned(),DnsCacheEntry{resolved_at:Instant::now(),ips:result.clone()});
 		}
-		match result{
-			Ok(addrs)=>Ok((addrs,false)),
-			Err(e)=>Err(e),
-		}
+		Err(err)
 	}
 }
 /// reqwest::dns::Resolve の実装ラッパー。Arc<DnsCache> を保持し、
@@ -405,7 +562,6 @@ impl reqwest::dns::Resolve for SharedDnsResolver{
 		let cache=self.0.clone();
 		let host=name.as_str().to_owned();
 		Box::pin(async move{
-			// ポート0で解決(reqwest がポートを上書きする)
 			let result=cache.resolve(&host,0).await;
 			match result{
 				Ok((ips,_hit))=>{
@@ -421,7 +577,7 @@ impl reqwest::dns::Resolve for SharedDnsResolver{
 	}
 }
 
-async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>)->Result<bool,String>{
+async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>)->Result<DnsHitStatus,String>{
 	let u=reqwest::Url::from_str(url.as_ref()).map_err(|e|format!("{:?}",e))?;
 	match u.scheme().to_lowercase().as_str(){
 		"http"|"https"=>{},
@@ -452,7 +608,7 @@ async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>
 /// RequestContext(spawn_blocking 内も含む)で共有する。
 #[derive(Default)]
 struct PhaseTimings{
-	dns_cache_hit:bool,
+	dns_hit:Option<DnsHitStatus>,
 	cache_result:Option<CacheResult>,
 	passthrough:bool,
 	check:Duration,
@@ -526,11 +682,12 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	if s.preview{params.push_str("preview,");}
 	if s.badge{params.push_str("badge,");}
 	if s.fallback{params.push_str("fallback,");}
+	let dns_str=t.dns_hit.map(|d|d.to_string()).unwrap_or_else(||"-".to_owned());
 	let cache_str=t.cache_result.map(|c|c.to_string()).unwrap_or_else(||"-".to_owned());
 	let fast=status<400 && !has_error && total_ms<cfg.slow_log_ms;
 	if fast{
 		tracing::debug!(
-			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,cache=%cache_str,
+			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,
 			check_ms,download_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
@@ -540,7 +697,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		);
 	}else{
 		tracing::info!(
-			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,cache=%cache_str,
+			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,
 			check_ms,download_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
@@ -694,7 +851,7 @@ async fn get_file(
 		Ok(hit)=>{
 			if let Ok(mut t)=timings.lock(){
 				t.check=check_start.elapsed();
-				t.dns_cache_hit=hit;
+				t.dns_hit=Some(hit);
 			}
 		},
 		Err(s)=>{
@@ -1161,6 +1318,8 @@ mod network_policy_tests{
 			cache_ttl_secs:default_cache_ttl_secs(),
 			passthrough_max_bytes:default_passthrough_max_bytes(),
 			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
+			dns_timeout_ms:default_dns_timeout_ms(),
+			dns_ttl_secs:default_dns_ttl_secs(),
 			jpeg_quality:default_jpeg_quality(),
 			webp_method:default_webp_method(),
 		}

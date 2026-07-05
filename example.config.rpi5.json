@@ -20,6 +20,8 @@
   "cache_ttl_secs": 3600,
   "passthrough_max_bytes": 1048576,
   "dns_negative_ttl_secs": 10,
+  "dns_timeout_ms": 4000,
+  "dns_ttl_secs": 300,
   "jpeg_quality": 80,
   "webp_method": 2
 }
