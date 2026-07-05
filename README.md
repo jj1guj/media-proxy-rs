@@ -220,3 +220,40 @@ cp example.config.rpi5.json config.json
 - Rangeリクエスト・ボディ受信中エラー・4xx/5xxはリトライしない
 - 2回目のsendには残り時間ベースのタイムアウトを適用(全体 `timeout` を超えない)
 - サマリログに `retried=true/false`、periodic_stats に `retry_attempts`/`retry_saved` を追加
+
+### Step 15: HTTP/2有効化とHTTPバージョン計測
+- reqwestの `http2` featureを有効化(rustls + ALPNによる自動h2ネゴシエーション)
+- サマリログに `http=2/1.1/1.0` フィールド追加
+- periodic_stats に `http1_responses`/`http2_responses` カウンタ追加
+- HTTP/2により同一ホストへのTCP接続が1本に多重化され、CGNセッション消費を抑制
+
+### Step 16: 仕上げ
+- README更新: DS-Lite環境ガイダンス・切り分け表・効果確認観点を追記
+
+## DS-Lite / CGN 環境での既知の問題
+
+DS-Lite方式(IPv4 over IPv6)でCGN(Carrier-Grade NAT)を経由する環境では、CGNのNATセッション枯渇により**新規TCP接続(SYN)だけが間欠的に失敗**する現象が発生することがあります。既存接続は影響を受けません。
+
+本プロキシでは以下の設定で緩和できます:
+
+| 設定 | 効果 |
+|------|------|
+| `connect_timeout_ms: 3000` | 接続タイムアウトを短くし、リトライの余地を確保 |
+| `fetch_retry_delay_ms: 500` | 瞬断窓を跨ぐための待機後に1回リトライ |
+| HTTP/2 (自動) | 同一ホストへの接続を多重化し、新規TCP接続数を削減 |
+
+### エラー切り分け表
+
+| periodic_stats の指標 | 疑うべき原因 |
+|----------------------|-------------|
+| `ferr_timeout` が多い | CGN瞬断。`retry_saved` で救済されていれば緩和は機能中 |
+| `ferr_connect` + `NetworkUnreachable` | IPv6到達不能(コンテナにv6疎通がない場合) |
+| `ferr_reset` が多い | 接続プール内の死んだ接続の再利用 |
+| `retry_saved / retry_attempts` が低い | 瞬断が長い(3秒超)。`connect_timeout_ms` の引き上げを検討 |
+| `http2_responses` が0 | HTTP/2ネゴシエーション失敗。TLS設定を確認 |
+
+### 本番ログでの効果確認の観点
+- `ferr_timeout` のうち `retry_saved` で救済された比率(目標: 瞬断起因の失敗の大半が救済)
+- エラー率が大幅に低下すること(目標: 3%以下)
+- 失敗時の所要時間が10秒張り付きから最大約7秒(3秒+0.5秒+残り)に短縮
+- HTTP/2比率(`http2_responses / (http1_responses + http2_responses)`)と新規接続数の減少傾向
