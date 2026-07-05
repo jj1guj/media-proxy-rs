@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use std::error::Error as StdError;
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use iprange::IpRange;
@@ -28,6 +29,12 @@ struct GlobalStats {
 	errors: AtomicU64,
 	cache_hits: AtomicU64,
 	cache_misses: AtomicU64,
+	ferr_connect: AtomicU64,
+	ferr_timeout: AtomicU64,
+	ferr_dns: AtomicU64,
+	ferr_reset: AtomicU64,
+	ferr_body: AtomicU64,
+	ferr_other: AtomicU64,
 }
 impl GlobalStats {
 	fn new() -> Self {
@@ -36,6 +43,12 @@ impl GlobalStats {
 			errors: AtomicU64::new(0),
 			cache_hits: AtomicU64::new(0),
 			cache_misses: AtomicU64::new(0),
+			ferr_connect: AtomicU64::new(0),
+			ferr_timeout: AtomicU64::new(0),
+			ferr_dns: AtomicU64::new(0),
+			ferr_reset: AtomicU64::new(0),
+			ferr_body: AtomicU64::new(0),
+			ferr_other: AtomicU64::new(0),
 		}
 	}
 	/// カウンタをリセットし、リセット前の値を返す。
@@ -46,6 +59,28 @@ impl GlobalStats {
 			self.cache_hits.swap(0, Ordering::Relaxed),
 			self.cache_misses.swap(0, Ordering::Relaxed),
 		)
+	}
+	/// fetch_err カウンタをリセットし値を返す。
+	fn swap_reset_ferr(&self) -> (u64, u64, u64, u64, u64, u64) {
+		(
+			self.ferr_connect.swap(0, Ordering::Relaxed),
+			self.ferr_timeout.swap(0, Ordering::Relaxed),
+			self.ferr_dns.swap(0, Ordering::Relaxed),
+			self.ferr_reset.swap(0, Ordering::Relaxed),
+			self.ferr_body.swap(0, Ordering::Relaxed),
+			self.ferr_other.swap(0, Ordering::Relaxed),
+		)
+	}
+	/// fetch_err 分類に応じたカウンタをインクリメントする。
+	fn inc_ferr(&self, cat: &str) {
+		match cat {
+			"connect" => { self.ferr_connect.fetch_add(1, Ordering::Relaxed); },
+			"timeout" => { self.ferr_timeout.fetch_add(1, Ordering::Relaxed); },
+			"dns" => { self.ferr_dns.fetch_add(1, Ordering::Relaxed); },
+			"reset" => { self.ferr_reset.fetch_add(1, Ordering::Relaxed); },
+			"body" => { self.ferr_body.fetch_add(1, Ordering::Relaxed); },
+			_ => { self.ferr_other.fetch_add(1, Ordering::Relaxed); },
+		}
 	}
 }
 
@@ -336,6 +371,7 @@ fn main() {
 				loop {
 					interval.tick().await;
 					let (reqs, errs, hits, misses) = stats.swap_reset();
+					let (fc, ft, fd, fr, fb, fo) = stats.swap_reset_ferr();
 					let dl_active = max_dl - dl_sem.available_permits();
 					let cpu_active = max_encode - encode_sem.available_permits();
 					let buf_used = max_buf - buf_sem.available_permits();
@@ -355,6 +391,12 @@ fn main() {
 						cache_entries = cache_entries as u64,
 						cache_bytes = cache_bytes as u64,
 						dns_entries = dns_entries as u64,
+						ferr_connect = fc,
+						ferr_timeout = ft,
+						ferr_dns = fd,
+						ferr_reset = fr,
+						ferr_body = fb,
+						ferr_other = fo,
 						"periodic_stats"
 					);
 				}
@@ -716,6 +758,8 @@ struct PhaseTimings{
 	anim_frames:u32,
 	anim_in_bytes:usize,
 	anim_out_bytes:usize,
+	/// fetchエラーの分類+詳細(正常時はNone)。
+	fetch_err:Option<String>,
 }
 /// 計測対象フェーズ(decode/encode は複数の return を持つ関数が多いため Drop で計測する)。
 pub(crate) enum Phase{
@@ -763,6 +807,54 @@ impl ReqSummary{
 		}
 	}
 }
+/// reqwest::Error を分類し、`"category:detail"` 形式の文字列を返す。
+/// カテゴリ: connect / timeout / dns / reset / body / other
+fn classify_reqwest_error(e: &reqwest::Error) -> String {
+	// io::Error を source チェーンから探す
+	let io_kind = {
+		let mut source: Option<&(dyn std::error::Error + 'static)> = e.source();
+		let mut found = None;
+		while let Some(s) = source {
+			if let Some(io) = s.downcast_ref::<std::io::Error>() {
+				found = Some(io.kind());
+				break;
+			}
+			source = s.source();
+		}
+		found
+	};
+	let detail = io_kind.map(|k| format!("{:?}", k)).unwrap_or_default();
+
+	let category = if e.is_timeout() {
+		"timeout"
+	} else if e.is_connect() {
+		match io_kind {
+			Some(std::io::ErrorKind::ConnectionReset) => "reset",
+			_ => "connect",
+		}
+	} else if e.is_body() {
+		match io_kind {
+			Some(std::io::ErrorKind::ConnectionReset) => "reset",
+			_ => "body",
+		}
+	} else {
+		// DNS解決失敗は reqwest では is_connect() に分類されることが多いが
+		// source文字列で判別する
+		let msg = format!("{}", e);
+		if msg.contains("dns error") || msg.contains("resolve") || msg.contains("lookup") {
+			"dns"
+		} else {
+			"other"
+		}
+	};
+
+	if detail.is_empty() {
+		category.to_owned()
+	} else {
+		format!("{}:{}", category, detail)
+	}
+}
+
 /// 1リクエスト1行のサマリを出力する。正常かつ高速(slow_log_ms未満)なら DEBUG に落とす。
 fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_error:bool,stats:&GlobalStats){
 	stats.requests.fetch_add(1, Ordering::Relaxed);
@@ -773,6 +865,11 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		Some(CacheResult::Hit | CacheResult::Joined) => { stats.cache_hits.fetch_add(1, Ordering::Relaxed); },
 		Some(CacheResult::Miss) => { stats.cache_misses.fetch_add(1, Ordering::Relaxed); },
 		_ => {},
+	}
+	// fetch_err カウンタ
+	if let Some(ref fe) = t.fetch_err {
+		let cat = fe.split(':').next().unwrap_or("other");
+		stats.inc_ferr(cat);
 	}
 	let check_ms=t.check.as_millis() as u64;
 	let wait_ms=t.wait.as_millis() as u64;
@@ -790,11 +887,12 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	if s.fallback{params.push_str("fallback,");}
 	let dns_str=t.dns_hit.map(|d|d.to_string()).unwrap_or_else(||"-".to_owned());
 	let cache_str=t.cache_result.map(|c|c.to_string()).unwrap_or_else(||"-".to_owned());
+	let fetch_err_str=t.fetch_err.as_deref().unwrap_or("-");
 	let fast=status<400 && !has_error && total_ms<cfg.slow_log_ms;
 	if fast{
 		tracing::debug!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
-			passthrough=t.passthrough,
+			passthrough=t.passthrough,fetch_err=%fetch_err_str,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -804,7 +902,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	}else{
 		tracing::info!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
-			passthrough=t.passthrough,
+			passthrough=t.passthrough,fetch_err=%fetch_err_str,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -963,6 +1061,10 @@ async fn get_file(
 		Err(s)=>{
 			if let Ok(mut t)=timings.lock(){
 				t.check=check_start.elapsed();
+				// DNS解決失敗の場合のみ fetch_err に記録(ポリシー拒否は除外)
+				if !s.contains("Blocked") && !s.contains("Private") && !s.contains("Loopback") {
+					t.fetch_err=Some(format!("dns:{}",s.chars().take(60).collect::<String>()));
+				}
 			}
 			let has_error=if let Ok(v)=s.parse(){
 				headers.append("X-Proxy-Error",v);
@@ -1009,15 +1111,21 @@ async fn get_file(
 			resp
 		},
 		Err(e) => {
+			let fetch_err = classify_reqwest_error(&e);
 			let is_fallback=q.fallback.is_some();
+			if let Ok(mut t)=timings.lock(){
+				t.ttfb=send_start.elapsed();
+				t.fetch_err=Some(fetch_err.clone());
+			}
+			headers.append("X-Proxy-Error",format!("Send:{}",fetch_err).parse().unwrap_or_else(|_|"Send:unknown".parse().unwrap()));
 			if let Ok(t)=timings.lock(){
-				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},false,&global_stats);
+				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
 			}
 			if is_fallback{
 				headers.append("Content-Type","image/png".parse().unwrap());
 				return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
 			}
-			return Err((axum::http::StatusCode::BAD_REQUEST,headers,format!("{:?}",e)).into_response())
+			return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 		}
 	};
 	fn add_remote_header(key:&'static str,headers:&mut HeaderMap,remote_headers:&reqwest::header::HeaderMap){
@@ -1399,8 +1507,12 @@ impl RequestContext{
 					response_bytes.extend_from_slice(&b);
 				},
 				Err(e)=>{
-					self.headers.append("X-Proxy-Error",format!("LoadAll:{:?}",e).parse().unwrap());
-					return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone(),format!("{:?}",e)).into_response())
+					let fetch_err = classify_reqwest_error(&e);
+					if let Ok(mut t)=self.timings.lock(){
+						t.fetch_err=Some(fetch_err.clone());
+					}
+					self.headers.append("X-Proxy-Error",format!("Body:{}",fetch_err).parse().unwrap_or_else(|_|"Body:unknown".parse().unwrap()));
+					return Err((axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response())
 				}
 			}
 		}
