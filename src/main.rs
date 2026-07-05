@@ -16,8 +16,11 @@ mod img;
 mod svg;
 mod browsersafe;
 mod image_test;
+mod cache;
 
-type AppState = (reqwest::Client, Arc<ConfigFile>, Arc<Vec<u8>>, Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>);
+use cache::{CacheKey, CacheResult, ResponseCache};
+
+type AppState = (reqwest::Client, Arc<ConfigFile>, Arc<Vec<u8>>, Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>, Arc<ResponseCache>);
 
 #[derive(Debug,Serialize,Deserialize)]
 pub struct ConfigFile{
@@ -39,8 +42,23 @@ pub struct ConfigFile{
 	/// アクセスログを INFO ではなく DEBUG に落とす(ヘルスチェック等でログが埋まるのを防ぐ)。
 	#[serde(default = "default_slow_log_ms")]
 	slow_log_ms:u64,
+	#[serde(default = "default_true")]
+	enable_cache:bool,
+	/// キャッシュ合計バイト数上限(既定128MB)。
+	#[serde(default = "default_cache_max_bytes")]
+	cache_max_bytes:u64,
+	/// 1エントリのバイト数上限(既定5MB)。超過するレスポンスはキャッシュしない。
+	#[serde(default = "default_cache_entry_max_bytes")]
+	cache_entry_max_bytes:u64,
+	/// キャッシュTTL(秒、既定3600)。
+	#[serde(default = "default_cache_ttl_secs")]
+	cache_ttl_secs:u64,
 }
 fn default_slow_log_ms()->u64{50}
+fn default_true()->bool{true}
+fn default_cache_max_bytes()->u64{128*1024*1024}
+fn default_cache_entry_max_bytes()->u64{5*1024*1024}
+fn default_cache_ttl_secs()->u64{3600}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -143,6 +161,10 @@ fn main() {
 			blocked_networks:None,
 			blocked_hosts:None,
 			slow_log_ms:default_slow_log_ms(),
+			enable_cache:default_true(),
+			cache_max_bytes:default_cache_max_bytes(),
+			cache_entry_max_bytes:default_cache_entry_max_bytes(),
+			cache_ttl_secs:default_cache_ttl_secs(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -204,7 +226,13 @@ fn main() {
 	// 1枠に滑り込めるようにする。Step 4 でキャッシュが入ればヘルスチェックはセマフォ自体を通らなくなる。
 	let max_concurrent_encode = num_cpus::get().max(2) + 1;
 	let encode_semaphore = Arc::new(Semaphore::new(max_concurrent_encode));
-	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache);
+	let response_cache = Arc::new(ResponseCache::new(cache::CacheConfig {
+		enabled: config.enable_cache,
+		max_bytes: config.cache_max_bytes as usize,
+		entry_max_bytes: config.cache_entry_max_bytes as usize,
+		ttl: Duration::from_secs(config.cache_ttl_secs),
+	}));
+	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache, response_cache);
 	rt.block_on(async{
 		let http_addr:SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
 		let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
@@ -361,6 +389,7 @@ async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>
 #[derive(Default)]
 struct PhaseTimings{
 	dns_cache_hit:bool,
+	cache_result:Option<CacheResult>,
 	check:Duration,
 	/// download の計測開始時刻(送信直前にセット)。
 	download_start:Option<Instant>,
@@ -432,10 +461,11 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	if s.preview{params.push_str("preview,");}
 	if s.badge{params.push_str("badge,");}
 	if s.fallback{params.push_str("fallback,");}
+	let cache_str=t.cache_result.map(|c|c.to_string()).unwrap_or_else(||"-".to_owned());
 	let fast=status<400 && !has_error && total_ms<cfg.slow_log_ms;
 	if fast{
 		tracing::debug!(
-			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,
+			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,cache=%cache_str,
 			check_ms,download_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -444,7 +474,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		);
 	}else{
 		tracing::info!(
-			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,
+			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,cache=%cache_str,
 			check_ms,download_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -456,11 +486,135 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache):AppState,
+	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache,response_cache):AppState,
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	let timings=Arc::new(Mutex::new(PhaseTimings::default()));
 	let summary=ReqSummary::new(&q);
+
+	// Range リクエストはキャッシュ対象外
+	let has_range=client_headers.contains_key("Range");
+
+	// avif 判定(キャッシュキー生成にも使う)
+	let mut is_accept_avif=false;
+	if config.encode_avif{
+		if let Some(accept)=client_headers.get("Accept"){
+			if let Ok(accept)=std::str::from_utf8(accept.as_bytes()){
+				for e in accept.split(","){
+					if e.trim()=="image/avif"{
+						is_accept_avif=true;
+					}
+				}
+			}
+		}
+	}
+
+	let cache_key=CacheKey{
+		url:q.url.clone(),
+		is_static:q.r#static.is_some(),
+		emoji:q.emoji.is_some(),
+		avatar:q.avatar.is_some(),
+		preview:q.preview.is_some(),
+		badge:q.badge.is_some(),
+		accept_avif:is_accept_avif,
+	};
+
+	// --- キャッシュヒット ---
+	if !has_range {
+		if let Some(cached)=response_cache.get(&cache_key){
+			if let Ok(mut t)=timings.lock(){
+				t.cache_result=Some(CacheResult::Hit);
+			}
+			let mut headers=HeaderMap::new();
+			if let Some(ct)=&cached.content_type{
+				if let Ok(v)=ct.parse(){ headers.append("Content-Type",v); }
+			}
+			if let Some(cd)=&cached.content_disposition{
+				if let Ok(v)=cd.parse(){ headers.append("Content-Disposition",v); }
+			}
+			if let Some(cc)=&cached.cache_control{
+				if let Ok(v)=cc.parse(){ headers.append("Cache-Control",v); }
+			}
+			if config.encode_avif{
+				headers.append("Vary","Accept,Range".parse().unwrap());
+			}
+			for line in config.append_headers.iter(){
+				if let Some(idx)=line.find(":"){
+					if idx+1>=line.len(){ continue; }
+					if let Ok(k)=axum::http::HeaderName::from_str(&line[0..idx]){
+						if let Ok(v)=line[idx+1..].parse(){
+							headers.append(k,v);
+						}
+					}
+				}
+			}
+			if let Ok(t)=timings.lock(){
+				emit_summary(&config,&summary,&t,cached.status,false);
+			}
+			let status=axum::http::StatusCode::from_u16(cached.status)
+				.unwrap_or(axum::http::StatusCode::OK);
+			return Err((status,headers,cached.body).into_response());
+		}
+	}
+
+	// --- singleflight: 合流 ---
+	if !has_range {
+		if let Some(mut rx)=response_cache.try_join(&cache_key){
+			if let Ok(mut t)=timings.lock(){
+				t.cache_result=Some(CacheResult::Joined);
+			}
+			match rx.recv().await{
+				Ok(Some(cached))=>{
+					let mut headers=HeaderMap::new();
+					if let Some(ct)=&cached.content_type{
+						if let Ok(v)=ct.parse(){ headers.append("Content-Type",v); }
+					}
+					if let Some(cd)=&cached.content_disposition{
+						if let Ok(v)=cd.parse(){ headers.append("Content-Disposition",v); }
+					}
+					if let Some(cc)=&cached.cache_control{
+						if let Ok(v)=cc.parse(){ headers.append("Cache-Control",v); }
+					}
+					if config.encode_avif{
+						headers.append("Vary","Accept,Range".parse().unwrap());
+					}
+					for line in config.append_headers.iter(){
+						if let Some(idx)=line.find(":"){
+							if idx+1>=line.len(){ continue; }
+							if let Ok(k)=axum::http::HeaderName::from_str(&line[0..idx]){
+								if let Ok(v)=line[idx+1..].parse(){
+									headers.append(k,v);
+								}
+							}
+						}
+					}
+					if let Ok(t)=timings.lock(){
+						emit_summary(&config,&summary,&t,cached.status,false);
+					}
+					let status=axum::http::StatusCode::from_u16(cached.status)
+						.unwrap_or(axum::http::StatusCode::OK);
+					return Err((status,headers,cached.body).into_response());
+				},
+				_=>{
+					// 元処理が失敗 → 自分でフォールスルーして処理する
+				}
+			}
+		}
+	}
+
+	// --- singleflight: 処理開始を登録 ---
+	let mut flight_guard=if !has_range{
+		response_cache.start_flight(cache_key.clone())
+	}else{
+		None
+	};
+
+	if let Ok(mut t)=timings.lock(){
+		if t.cache_result.is_none(){
+			t.cache_result=Some(if has_range{ CacheResult::Bypass }else{ CacheResult::Miss });
+		}
+	}
+
 	let mut headers=HeaderMap::new();
 	if let Ok(url)=q.url.parse(){
 		headers.append("X-Remote-Url",url);
@@ -542,18 +696,6 @@ async fn get_file(
 		add_remote_header("Content-Range",&mut headers,remote_headers);
 		add_remote_header("Accept-Ranges",&mut headers,remote_headers);
 	}
-	let mut is_accept_avif=false;
-	if !config.encode_avif{
-		//force no avif
-	}else if let Some(accept)=client_headers.get("Accept"){
-		if let Ok(accept)=std::str::from_utf8(accept.as_bytes()){
-			for e in accept.split(","){
-				if e=="image/avif"{
-					is_accept_avif=true;
-				}
-			}
-		}
-	}
 	headers.append("Cache-Control","max-age=300".parse().unwrap());
 	for line in config.append_headers.iter(){
 		if let Some(idx)=line.find(":"){
@@ -578,7 +720,17 @@ async fn get_file(
 		fontdb,
 		encode_semaphore,
 		timings:timings.clone(),
+		response_cache:response_cache.clone(),
+		cache_key:cache_key.clone(),
 	}.encode(resp,is_img).await;
+
+	// --- singleflight 完了通知 ---
+	if let Some(ref mut guard)=flight_guard{
+		// encode 結果が 200 ならキャッシュから取得してflight完了
+		let entry=response_cache.get(&cache_key);
+		response_cache.complete_flight(guard,entry);
+	}
+
 	let (status,has_error)=match &result{
 		Ok((sc,h,_))=>(sc.as_u16(),h.contains_key("X-Proxy-Error")),
 		Err(r)=>(r.status().as_u16(),r.headers().contains_key("X-Proxy-Error")),
@@ -599,6 +751,8 @@ struct RequestContext{
 	fontdb:Arc<resvg::usvg::fontdb::Database>,
 	encode_semaphore: Arc<Semaphore>,
 	timings: Arc<Mutex<PhaseTimings>>,
+	response_cache: Arc<ResponseCache>,
+	cache_key: CacheKey,
 }
 impl RequestContext{
 	/// フェーズ計測ガードを生成する(Arcを複製して保持するため self を借用し続けない)。
@@ -621,6 +775,14 @@ impl RequestContext{
 			t.anim_in_bytes=in_bytes;
 			t.anim_out_bytes=out_bytes;
 		}
+	}
+	/// 成功レスポンスをキャッシュに格納する。
+	pub(crate) fn cache_response(&self,status:u16,headers:&HeaderMap,body:&[u8]){
+		let ct=headers.get("Content-Type").and_then(|v|v.to_str().ok()).map(|s|s.to_owned());
+		let cd=headers.get("Content-Disposition").and_then(|v|v.to_str().ok()).map(|s|s.to_owned());
+		let cc=headers.get("Cache-Control").and_then(|v|v.to_str().ok()).map(|s|s.to_owned());
+		let entry=cache::CacheEntry::new(status,ct,cd,cc,body.to_vec());
+		self.response_cache.put(self.cache_key.clone(),entry);
 	}
 }
 impl RequestContext{
@@ -886,6 +1048,10 @@ mod network_policy_tests{
 			blocked_networks:None,
 			blocked_hosts:None,
 			slow_log_ms:default_slow_log_ms(),
+			enable_cache:false,
+			cache_max_bytes:default_cache_max_bytes(),
+			cache_entry_max_bytes:default_cache_entry_max_bytes(),
+			cache_ttl_secs:default_cache_ttl_secs(),
 		}
 	}
 	#[test]
@@ -917,5 +1083,88 @@ mod network_policy_tests{
 		let policy=NetworkPolicy::from_config(&c).unwrap();
 		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(10,1,2,3)).is_ok());
 		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(10,1,2,4)).is_err());
+	}
+}
+
+#[cfg(test)]
+mod cache_tests{
+	use super::cache::*;
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	fn test_cache()->Arc<ResponseCache>{
+		Arc::new(ResponseCache::new(CacheConfig{
+			enabled:true,
+			max_bytes:1024*1024,
+			entry_max_bytes:512*1024,
+			ttl:Duration::from_secs(60),
+		}))
+	}
+	fn test_key()->CacheKey{
+		CacheKey{
+			url:"https://example.com/test.png".to_owned(),
+			is_static:false,emoji:false,avatar:false,preview:false,badge:false,accept_avif:false,
+		}
+	}
+	#[test]
+	fn cache_hit_after_put(){
+		let cache=test_cache();
+		let key=test_key();
+		let entry=CacheEntry::new(200,Some("image/png".to_owned()),None,None,vec![1,2,3]);
+		cache.put(key.clone(),entry);
+		let hit=cache.get(&key);
+		assert!(hit.is_some());
+		assert_eq!(hit.unwrap().body,vec![1,2,3]);
+	}
+	#[test]
+	fn cache_miss_when_disabled(){
+		let cache=Arc::new(ResponseCache::new(CacheConfig{
+			enabled:false,
+			max_bytes:1024*1024,
+			entry_max_bytes:512*1024,
+			ttl:Duration::from_secs(60),
+		}));
+		let key=test_key();
+		let entry=CacheEntry::new(200,Some("image/png".to_owned()),None,None,vec![1,2,3]);
+		cache.put(key.clone(),entry);
+		assert!(cache.get(&key).is_none());
+	}
+	#[test]
+	fn cache_skip_non_200(){
+		let cache=test_cache();
+		let key=test_key();
+		let entry=CacheEntry::new(502,None,None,None,vec![1,2,3]);
+		cache.put(key.clone(),entry);
+		assert!(cache.get(&key).is_none());
+	}
+	#[test]
+	fn cache_evicts_on_capacity(){
+		let cache=Arc::new(ResponseCache::new(CacheConfig{
+			enabled:true,
+			max_bytes:1024,
+			entry_max_bytes:600,
+			ttl:Duration::from_secs(60),
+		}));
+		let key1=CacheKey{url:"a".to_owned(),is_static:false,emoji:false,avatar:false,preview:false,badge:false,accept_avif:false};
+		let key2=CacheKey{url:"b".to_owned(),is_static:false,emoji:false,avatar:false,preview:false,badge:false,accept_avif:false};
+		// 各エントリは body + 256 のオーバーヘッド。body=300 → size=556。2つで1112 > 1024
+		cache.put(key1.clone(),CacheEntry::new(200,None,None,None,vec![0;300]));
+		cache.put(key2.clone(),CacheEntry::new(200,None,None,None,vec![0;300]));
+		// key1 は追い出されているはず
+		assert!(cache.get(&key1).is_none());
+		assert!(cache.get(&key2).is_some());
+	}
+	#[test]
+	fn cache_skip_oversized_entry(){
+		let cache=Arc::new(ResponseCache::new(CacheConfig{
+			enabled:true,
+			max_bytes:1024*1024,
+			entry_max_bytes:100,
+			ttl:Duration::from_secs(60),
+		}));
+		let key=test_key();
+		// body=200 + overhead=256 → size=456 > entry_max_bytes=100
+		cache.put(key.clone(),CacheEntry::new(200,None,None,None,vec![0;200]));
+		assert!(cache.get(&key).is_none());
 	}
 }

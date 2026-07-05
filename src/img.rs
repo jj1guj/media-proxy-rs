@@ -291,7 +291,9 @@ impl RequestContext{
 			headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
 		}
 		Self::disposition_ext(&mut headers,".webp");
-		(axum::http::StatusCode::OK,headers,buf.to_vec()).into_response()
+		let body=buf.to_vec();
+		self.cache_response(200,&headers,&body);
+		(axum::http::StatusCode::OK,headers,body).into_response()
 	}
 	fn encode_single(&mut self)->axum::response::Response{
 		let img={
@@ -353,6 +355,7 @@ impl RequestContext{
                             self.headers.remove("Cache-Control");
                             self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
                             Self::disposition_ext(&mut self.headers,".webp");
+                            self.cache_response(200,&self.headers.clone(),&buf);
                             (axum::http::StatusCode::OK,self.headers.clone(),buf).into_response()
                         },
                         Err(e) => {
@@ -369,6 +372,7 @@ impl RequestContext{
 							self.headers.remove("Cache-Control");
 							self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
 							Self::disposition_ext(&mut self.headers,".jpeg");
+							self.cache_response(200,&self.headers.clone(),&buf);
 							(axum::http::StatusCode::OK,self.headers.clone(),buf).into_response()
 						},
 						Err(e) => {
@@ -383,6 +387,7 @@ impl RequestContext{
 			Ok(_)=>{
 				self.headers.remove("Cache-Control");
 				self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
+				self.cache_response(200,&self.headers.clone(),&buf);
 				(axum::http::StatusCode::OK,self.headers.clone(),buf).into_response()
 			},
 			Err(e)=>{
