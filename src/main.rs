@@ -933,6 +933,10 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		let cat = fe.split(':').next().unwrap_or("other");
 		stats.inc_ferr(cat);
 	}
+	// retry_saved: リトライを実行し最終的にステータス200で応答できた数
+	if t.retried && status == 200 {
+		stats.retry_saved.fetch_add(1, Ordering::Relaxed);
+	}
 	let check_ms=t.check.as_millis() as u64;
 	let wait_ms=t.wait.as_millis() as u64;
 	let ttfb_ms=t.ttfb.as_millis() as u64;
@@ -1194,7 +1198,6 @@ async fn get_file(
 							t.ttfb=send_start.elapsed();
 							t.retried=true;
 						}
-						global_stats.retry_saved.fetch_add(1, Ordering::Relaxed);
 						resp
 					},
 					Err(e2) => {
