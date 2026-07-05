@@ -58,6 +58,10 @@ pub struct ConfigFile{
 	/// デコード・再エンコードせず元バイト列を返す。
 	#[serde(default = "default_passthrough_max_bytes")]
 	passthrough_max_bytes:u64,
+	/// DNS解決失敗のネガティブキャッシュTTL(秒、既定10)。
+	/// 落ちているドメインへの連続リクエストが毎回1.5秒のDNSタイムアウトを踏むのを防ぐ。
+	#[serde(default = "default_dns_negative_ttl_secs")]
+	dns_negative_ttl_secs:u64,
 }
 fn default_slow_log_ms()->u64{50}
 fn default_true()->bool{true}
@@ -65,6 +69,7 @@ fn default_cache_max_bytes()->u64{128*1024*1024}
 fn default_cache_entry_max_bytes()->u64{5*1024*1024}
 fn default_cache_ttl_secs()->u64{3600}
 fn default_passthrough_max_bytes()->u64{1024*1024}
+fn default_dns_negative_ttl_secs()->u64{10}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -172,6 +177,7 @@ fn main() {
 			cache_entry_max_bytes:default_cache_entry_max_bytes(),
 			cache_ttl_secs:default_cache_ttl_secs(),
 			passthrough_max_bytes:default_passthrough_max_bytes(),
+			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -209,13 +215,16 @@ fn main() {
 			std::process::exit(1);
 		}
 	};
-	let dns_cache=Arc::new(DnsCache::new(DNS_CACHE_TTL,DNS_CACHE_MAX_ENTRIES));
+	let dns_cache=Arc::new(DnsCache::new(DNS_CACHE_TTL,Duration::from_secs(config.dns_negative_ttl_secs),DNS_CACHE_MAX_ENTRIES));
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 	let client=reqwest::ClientBuilder::new();
 	let client=match &config.proxy{
 		Some(url)=>client.proxy(reqwest::Proxy::http(url).unwrap()),
 		None=>client,
 	};
+	// reqwestのDNS解決をDnsCacheに一本化する。
+	// check_urlと実フェッチが同じキャッシュを共有し、1リクエストあたりのDNS解決を実質1回にする。
+	let client=client.dns_resolver(Arc::new(SharedDnsResolver(dns_cache.clone())));
 	let client=client.build().unwrap();
 	let mut fontdb=resvg::usvg::fontdb::Database::new();
 	if config.load_system_fonts{
@@ -314,17 +323,18 @@ impl NetworkPolicy{
 
 struct DnsCacheEntry{
 	resolved_at: Instant,
-	ips: Vec<IpAddr>,
+	ips: Result<Vec<IpAddr>,String>,
 }
 /// host -> 解決済みIPの簡易キャッシュ(TTL付き・上限付き)。
 pub struct DnsCache{
 	inner: RwLock<HashMap<String,DnsCacheEntry>>,
 	ttl: Duration,
+	negative_ttl: Duration,
 	max_entries: usize,
 }
 impl DnsCache{
-	pub fn new(ttl:Duration,max_entries:usize)->Self{
-		Self{inner:RwLock::new(HashMap::new()),ttl,max_entries}
+	pub fn new(ttl:Duration,negative_ttl:Duration,max_entries:usize)->Self{
+		Self{inner:RwLock::new(HashMap::new()),ttl,negative_ttl,max_entries}
 	}
 	/// hostを非同期解決する。TTL内はキャッシュを返す。
 	/// ポートは解決結果に影響しないためキーはhostのみ。
@@ -333,34 +343,70 @@ impl DnsCache{
 		{
 			let map=self.inner.read().await;
 			if let Some(entry)=map.get(host){
-				if entry.resolved_at.elapsed()<self.ttl{
-					return Ok((entry.ips.clone(),true));
+				let ttl=if entry.ips.is_ok(){self.ttl}else{self.negative_ttl};
+				if entry.resolved_at.elapsed()<ttl{
+					match &entry.ips{
+						Ok(ips)=>return Ok((ips.clone(),true)),
+						Err(e)=>return Err(e.clone()),
+					}
 				}
 			}
 		}
 		let host_port=format!("{}:{}",host,port);
-		let addrs=match tokio::time::timeout(DNS_TIMEOUT,tokio::net::lookup_host(host_port)).await{
-			Ok(Ok(iter))=>iter.map(|sa|sa.ip()).collect::<Vec<_>>(),
-			Ok(Err(e))=>return Err(format!("dns lookup error: {}",e)),
-			Err(_)=>return Err("dns lookup timeout".to_owned()),
+		let result=match tokio::time::timeout(DNS_TIMEOUT,tokio::net::lookup_host(host_port)).await{
+			Ok(Ok(iter))=>{
+				let addrs:Vec<_>=iter.map(|sa|sa.ip()).collect();
+				if addrs.is_empty(){
+					Err("dns lookup: no address".to_owned())
+				}else{
+					Ok(addrs)
+				}
+			},
+			Ok(Err(e))=>Err(format!("dns lookup error: {}",e)),
+			Err(_)=>Err("dns lookup timeout".to_owned()),
 		};
-		if addrs.is_empty(){
-			return Err("dns lookup: no address".to_owned());
-		}
 		{
 			let mut map=self.inner.write().await;
 			if map.len()>=self.max_entries && !map.contains_key(host){
-				// まず期限切れを掃除し、それでも溢れる場合は1件退避する。
-				map.retain(|_,e|e.resolved_at.elapsed()<self.ttl);
+				map.retain(|_,e|{
+					let ttl=if e.ips.is_ok(){self.ttl}else{self.negative_ttl};
+					e.resolved_at.elapsed()<ttl
+				});
 				if map.len()>=self.max_entries{
 					if let Some(k)=map.keys().next().cloned(){
 						map.remove(&k);
 					}
 				}
 			}
-			map.insert(host.to_owned(),DnsCacheEntry{resolved_at:Instant::now(),ips:addrs.clone()});
+			map.insert(host.to_owned(),DnsCacheEntry{resolved_at:Instant::now(),ips:result.clone()});
 		}
-		Ok((addrs,false))
+		match result{
+			Ok(addrs)=>Ok((addrs,false)),
+			Err(e)=>Err(e),
+		}
+	}
+}
+/// reqwest::dns::Resolve の実装ラッパー。Arc<DnsCache> を保持し、
+/// check_url と実フェッチの DNS 解決を一本化する。
+struct SharedDnsResolver(Arc<DnsCache>);
+impl reqwest::dns::Resolve for SharedDnsResolver{
+	fn resolve(&self,name:reqwest::dns::Name)->reqwest::dns::Resolving{
+		let cache=self.0.clone();
+		let host=name.as_str().to_owned();
+		Box::pin(async move{
+			// ポート0で解決(reqwest がポートを上書きする)
+			let result=cache.resolve(&host,0).await;
+			match result{
+				Ok((ips,_hit))=>{
+					let addrs:Vec<std::net::SocketAddr>=ips.into_iter().map(|ip|std::net::SocketAddr::new(ip,0)).collect();
+					let addrs:reqwest::dns::Addrs=Box::new(addrs.into_iter());
+					Ok(addrs)
+				},
+				Err(e)=>{
+					Err(std::io::Error::other(e).into())
+				},
+			}
+		})
 	}
 }
 
@@ -1103,6 +1149,7 @@ mod network_policy_tests{
 			cache_entry_max_bytes:default_cache_entry_max_bytes(),
 			cache_ttl_secs:default_cache_ttl_secs(),
 			passthrough_max_bytes:default_passthrough_max_bytes(),
+			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
 		}
 	}
 	#[test]
