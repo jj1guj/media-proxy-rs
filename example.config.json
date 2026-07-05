@@ -23,5 +23,7 @@
   "dns_timeout_ms": 4000,
   "dns_ttl_secs": 300,
   "jpeg_quality": 85,
-  "webp_method": 4
+  "webp_method": 4,
+  "max_concurrent_downloads": 24,
+  "inflight_buffer_budget_bytes": 268435456
 }

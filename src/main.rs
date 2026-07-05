@@ -20,7 +20,7 @@ mod cache;
 
 use cache::{CacheKey, CacheResult, ResponseCache};
 
-type AppState = (reqwest::Client, Arc<ConfigFile>, Arc<Vec<u8>>, Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>, Arc<ResponseCache>);
+type AppState = (reqwest::Client, Arc<ConfigFile>, Arc<Vec<u8>>, Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>, Arc<ResponseCache>, Arc<Semaphore>, Arc<Semaphore>);
 
 #[derive(Debug,Serialize,Deserialize)]
 pub struct ConfigFile{
@@ -75,6 +75,13 @@ pub struct ConfigFile{
 	/// 値が小さいほどエンコードが速いが圧縮率が下がる。Pi等の低性能環境ではmethod=2を推奨。
 	#[serde(default = "default_webp_method")]
 	webp_method:i32,
+	/// ダウンロードの最大同時接続数(既定24)。バースト時にオリジンへの同時接続が無制限にならないようにする。
+	#[serde(default = "default_max_concurrent_downloads")]
+	max_concurrent_downloads:usize,
+	/// 同時ダウンロードの合計バイト予算(既定256MB)。
+	/// load_all前に予約し、エンコード完了後に解放する。
+	#[serde(default = "default_inflight_buffer_budget")]
+	inflight_buffer_budget_bytes:u64,
 }
 fn default_slow_log_ms()->u64{50}
 fn default_true()->bool{true}
@@ -87,6 +94,8 @@ fn default_dns_timeout_ms()->u64{4000}
 fn default_dns_ttl_secs()->u64{300}
 fn default_jpeg_quality()->i32{85}
 fn default_webp_method()->i32{4}
+fn default_max_concurrent_downloads()->usize{24}
+fn default_inflight_buffer_budget()->u64{256*1024*1024}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -199,6 +208,8 @@ fn main() {
 			dns_ttl_secs:default_dns_ttl_secs(),
 			jpeg_quality:default_jpeg_quality(),
 			webp_method:default_webp_method(),
+			max_concurrent_downloads:default_max_concurrent_downloads(),
+			inflight_buffer_budget_bytes:default_inflight_buffer_budget(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -263,18 +274,20 @@ fn main() {
 	let fontdb=Arc::new(fontdb);
 	// let arg_tup=(client,config,dummy_png,fontdb);
 
-	// 同時に処理する画像数を制限する
-	// num_cpus + 1: 全枠が重いエンコードで埋まっていても軽量リクエスト(ヘルスチェック等)が
-	// 1枠に滑り込めるようにする。Step 4 でキャッシュが入ればヘルスチェックはセマフォ自体を通らなくなる。
-	let max_concurrent_encode = num_cpus::get().max(2) + 1;
+	// CPU保護用セマフォ: decode/encodeのspawn_blocking区間のみ保持。
+	let max_concurrent_encode = num_cpus::get().max(2);
 	let encode_semaphore = Arc::new(Semaphore::new(max_concurrent_encode));
+	// ダウンロード並列数制限: req.send()前〜 load_all完了まで保持。
+	let download_semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
+	// バイト予算: load_all前に予約、エンコード完了後に解放。
+	let buffer_budget = Arc::new(Semaphore::new(config.inflight_buffer_budget_bytes as usize));
 	let response_cache = Arc::new(ResponseCache::new(cache::CacheConfig {
 		enabled: config.enable_cache,
 		max_bytes: config.cache_max_bytes as usize,
 		entry_max_bytes: config.cache_entry_max_bytes as usize,
 		ttl: Duration::from_secs(config.cache_ttl_secs),
 	}));
-	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache, response_cache);
+	let arg_tup = (client, config, dummy_png, fontdb, encode_semaphore, network_policy, dns_cache, response_cache, download_semaphore, buffer_budget);
 	rt.block_on(async{
 		let http_addr:SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
 		let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
@@ -612,9 +625,12 @@ struct PhaseTimings{
 	cache_result:Option<CacheResult>,
 	passthrough:bool,
 	check:Duration,
-	/// download の計測開始時刻(送信直前にセット)。
-	download_start:Option<Instant>,
-	download:Duration,
+	/// permit待ちの合計。
+	wait:Duration,
+	/// TTFB(送信開始〜レスポンスヘッダ受信)。
+	ttfb:Duration,
+	/// ボディ受信時間。
+	body:Duration,
 	decode:Duration,
 	encode:Duration,
 	anim:bool,
@@ -671,10 +687,12 @@ impl ReqSummary{
 /// 1リクエスト1行のサマリを出力する。正常かつ高速(slow_log_ms未満)なら DEBUG に落とす。
 fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_error:bool){
 	let check_ms=t.check.as_millis() as u64;
-	let download_ms=t.download.as_millis() as u64;
+	let wait_ms=t.wait.as_millis() as u64;
+	let ttfb_ms=t.ttfb.as_millis() as u64;
+	let body_ms=t.body.as_millis() as u64;
 	let decode_ms=t.decode.as_millis() as u64;
 	let encode_ms=t.encode.as_millis() as u64;
-	let total_ms=check_ms+download_ms+decode_ms+encode_ms;
+	let total_ms=check_ms+wait_ms+ttfb_ms+body_ms+decode_ms+encode_ms;
 	let mut params=String::new();
 	if s.is_static{params.push_str("static,");}
 	if s.emoji{params.push_str("emoji,");}
@@ -689,7 +707,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		tracing::debug!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,
-			check_ms,download_ms,decode_ms,encode_ms,
+			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
 			anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
@@ -699,7 +717,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		tracing::info!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,
-			check_ms,download_ms,decode_ms,encode_ms,
+			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
 			anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
@@ -710,7 +728,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache,response_cache):AppState,
+	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache,response_cache,download_semaphore,buffer_budget):AppState,
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	let timings=Arc::new(Mutex::new(PhaseTimings::default()));
@@ -876,9 +894,17 @@ async fn get_file(
 		}
 	};
 
+	// --- ダウンロードpermit取得(取得順序: DL permit → バイト予算 → CPU permit) ---
+	let wait_start=Instant::now();
+	let dl_permit = download_semaphore.acquire_owned().await.map_err(|_| {
+		let mut h=HeaderMap::new();
+		h.append("X-Proxy-Error","DownloadSemaphoreError".parse().unwrap());
+		(axum::http::StatusCode::SERVICE_UNAVAILABLE,h).into_response()
+	})?;
 	if let Ok(mut t)=timings.lock(){
-		t.download_start=Some(Instant::now());
+		t.wait+=wait_start.elapsed();
 	}
+	let send_start=Instant::now();
 	let req=client.get(&q.url);
 	let req=req.timeout(std::time::Duration::from_millis(config.timeout));
 	let req=req.header("User-Agent",config.user_agent.clone());
@@ -888,7 +914,12 @@ async fn get_file(
 		req
 	};
 	let resp=match req.send().await{
-		Ok(resp) => resp,
+		Ok(resp) => {
+			if let Ok(mut t)=timings.lock(){
+				t.ttfb=send_start.elapsed();
+			}
+			resp
+		},
 		Err(e) => {
 			let is_fallback=q.fallback.is_some();
 			if let Ok(t)=timings.lock(){
@@ -943,6 +974,8 @@ async fn get_file(
 		dummy_img,
 		fontdb,
 		encode_semaphore,
+		buffer_budget,
+		dl_permit: Some(dl_permit),
 		timings:timings.clone(),
 		response_cache:response_cache.clone(),
 		cache_key:cache_key.clone(),
@@ -974,6 +1007,8 @@ struct RequestContext{
 	dummy_img:Arc<Vec<u8>>,
 	fontdb:Arc<resvg::usvg::fontdb::Database>,
 	encode_semaphore: Arc<Semaphore>,
+	buffer_budget: Arc<Semaphore>,
+	dl_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 	timings: Arc<Mutex<PhaseTimings>>,
 	response_cache: Arc<ResponseCache>,
 	cache_key: CacheKey,
@@ -983,12 +1018,10 @@ impl RequestContext{
 	pub(crate) fn phase_guard(&self,phase:Phase)->PhaseGuard{
 		PhaseGuard{timings:self.timings.clone(),start:Instant::now(),phase}
 	}
-	/// download の計測を確定する(download_start からの経過を download に設定)。
-	pub(crate) fn mark_download_done(&self){
+	/// ボディ受信完了時の計測を記録する。
+	pub(crate) fn mark_body_done(&self,body_duration:Duration){
 		if let Ok(mut t)=self.timings.lock(){
-			if let Some(s)=t.download_start{
-				t.download=s.elapsed();
-			}
+			t.body=body_duration;
 		}
 	}
 	/// encode_anim のフレーム数・入出力バイト数を記録する。
@@ -1093,15 +1126,27 @@ impl RequestContext{
 			}
 		}
 		if is_svg{
-			// セマフォをダウンロードの前に取得する。
-			// 「バッファ済みデータを抱えたままセマフォ待ち」を防ぐ。
-			let semaphore = self.encode_semaphore.clone();
-			let mut header=self.headers.clone();
-			let _permit = semaphore.acquire().await.map_err(|_| {
-				header.append("X-Proxy-Error", "SemaphoreError".parse().unwrap());
-				(axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
+			// バイト予算を取得(仮予約8MB)。Content-Length不明のため固定値。
+			let budget_bytes=8*1024*1024_u32;
+			let budget_sem=self.buffer_budget.clone();
+			let wait_start=Instant::now();
+			let _budget_permit = budget_sem.acquire_many(budget_bytes).await.map_err(|_| {
+				let mut h=self.headers.clone();
+				h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
+				(axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
 			})?;
+			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
 			self.load_all(resp).await?;
+			drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
+			// CPU permit を取得してエンコード
+			let cpu_sem=self.encode_semaphore.clone();
+			let wait_start=Instant::now();
+			let _cpu_permit = cpu_sem.acquire().await.map_err(|_| {
+				let mut h=self.headers.clone();
+				h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
+				(axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
+			})?;
+			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
 			if let Ok(img)=self.encode_svg(self.fontdb.clone()){
 				self.headers.remove("Content-Length");
 				self.headers.remove("Content-Range");
@@ -1119,14 +1164,18 @@ impl RequestContext{
 			let dummy_img=self.dummy_img.clone();
 			let is_fallback=self.parms.fallback.is_some();
 			let mut header=self.headers.clone();
-			// セマフォをダウンロードの前に取得する。
-			// 「バッファ済みデータを抱えたままセマフォ待ち」を防ぐ。
-			let semaphore = self.encode_semaphore.clone();
-			let _permit = semaphore.acquire().await.map_err(|_| {
-                header.append("X-Proxy-Error", "SemaphoreError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
-            })?;
+			// バイト予算を取得(Content-Length or 仮予約8MB)
+			let budget_hint=resp.content_length.unwrap_or(8*1024*1024);
+			let budget_bytes=(budget_hint.min(self.config.max_size) as u32).max(1);
+			let budget_sem=self.buffer_budget.clone();
+			let wait_start=Instant::now();
+			let _budget_permit = budget_sem.acquire_many(budget_bytes).await.map_err(|_| {
+				header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
+				(axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
+			})?;
+			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
 			self.load_all(resp).await?;
+			drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
 			// --- パススルー判定 ---
 			// webp/png/jpeg/gif かつ badge/static 無 かつ寸法が目標以下かつサイズが閾値以下なら
 			// デコード・再エンコードせず元バイト列をそのまま返す。
@@ -1167,6 +1216,14 @@ impl RequestContext{
 					}
 				}
 			}
+			// CPU permit を取得してからエンコード
+			let cpu_sem=self.encode_semaphore.clone();
+			let wait_start=Instant::now();
+			let _cpu_permit = cpu_sem.acquire().await.map_err(|_| {
+				header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
+				(axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
+			})?;
+			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
 			let mut handle=self;
 			let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move ||{
 				handle.encode_img()
@@ -1205,7 +1262,7 @@ impl RequestContext{
 		}
 		let body=axum::body::Body::from_stream(resp);
 		if status.is_success(){
-			self.mark_download_done();
+			// ストリーミングパス: ボディ計測は行わない(パススルー)
 			self.headers.remove("Cache-Control");
 			self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
 			if status==reqwest::StatusCode::PARTIAL_CONTENT{
@@ -1243,6 +1300,7 @@ impl RequestContext{
 		// 虚偽の巨大 Content-Length による即時巨大アロケーションを防ぐ。
 		const INITIAL_CAP_LIMIT: usize = 8 * 1024 * 1024;
 		let mut response_bytes=Vec::with_capacity((len_hint as usize).min(INITIAL_CAP_LIMIT));
+		let body_start=Instant::now();
 		while let Some(x) = resp.next().await{
 			match x{
 				Ok(b)=>{
@@ -1259,7 +1317,7 @@ impl RequestContext{
 			}
 		}
 		self.src_bytes=response_bytes;
-		self.mark_download_done();
+		self.mark_body_done(body_start.elapsed());
 		Ok(())
 	}
 }
@@ -1322,6 +1380,8 @@ mod network_policy_tests{
 			dns_ttl_secs:default_dns_ttl_secs(),
 			jpeg_quality:default_jpeg_quality(),
 			webp_method:default_webp_method(),
+			max_concurrent_downloads:default_max_concurrent_downloads(),
+			inflight_buffer_budget_bytes:default_inflight_buffer_budget(),
 		}
 	}
 	#[test]
