@@ -2,28 +2,7 @@
 use axum::response::IntoResponse;
 use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
 
-use crate::RequestContext;
-
-struct Timer {
-	name: &'static str,
-	start: std::time::Instant,
-}
-
-impl Timer {
-	fn new(name: &'static str) -> Self {
-		Self {
-			name,
-			start: std::time::Instant::now(),
-		}
-	}
-}
-
-impl Drop for Timer {
-	fn drop(&mut self) {
-		let duration = self.start.elapsed();
-		println!("Timer [{}] elapsed: {:?}", self.name, duration);
-	}
-}
+use crate::{Phase, RequestContext};
 
 impl RequestContext{
 	pub(crate) fn image_size_hint(&self)->(u32,u32){
@@ -89,8 +68,11 @@ impl RequestContext{
 			Err(e) => {
 				match self.headers.get("Content-Type").map(|s|std::str::from_utf8(s.as_bytes())){
 					Some(Ok("image/jxl"))=>{
-						let decoder = jxl_oxide::integration::JxlDecoder::new(std::io::Cursor::new(&self.src_bytes));
-						let img=decoder.map(|decoder|DynamicImage::from_decoder(decoder)).unwrap_or_else(|e|Err(e));
+						let img={
+							let _dg=self.phase_guard(Phase::Decode);
+							let decoder = jxl_oxide::integration::JxlDecoder::new(std::io::Cursor::new(&self.src_bytes));
+							decoder.map(|decoder|DynamicImage::from_decoder(decoder)).unwrap_or_else(|e|Err(e))
+						};
 						let img=match img{
 							Ok(img) => img,
 							Err(e) => {
@@ -101,8 +83,11 @@ impl RequestContext{
 						return self.response_img(img);
 					}
 					Some(Ok("image/jp2"))=>{
-						let img=jpeg2k::Image::from_bytes(&self.src_bytes).map(|img|DynamicImage::try_from(&img));
-						let img=img.map(|r|r.map_err(|e|e.to_string())).map_err(|e|e.to_string()).unwrap_or_else(|e|Err(e));
+						let img={
+							let _dg=self.phase_guard(Phase::Decode);
+							let img=jpeg2k::Image::from_bytes(&self.src_bytes).map(|img|DynamicImage::try_from(&img));
+							img.map(|r|r.map_err(|e|e.to_string())).map_err(|e|e.to_string()).unwrap_or_else(|e|Err(e))
+						};
 						let img=match img{
 							Ok(img) => img,
 							Err(e) => {
@@ -127,7 +112,11 @@ impl RequestContext{
 							let img=jpegxr_img(width as u32,height as u32,stride,buffer,info.format());
 							Ok(img.ok_or_else(||format!("color_format={:?}&bgr={}&channels={}&format={:?}",info.color_format(),info.bgr(),info.channels(),info.format())))
 						}
-						match decode_jxr(&self.src_bytes){
+						let decoded={
+							let _dg=self.phase_guard(Phase::Decode);
+							decode_jxr(&self.src_bytes)
+						};
+						match decoded{
 							Ok(Ok(img))=>{
 								return self.response_img(img);
 							},
@@ -150,7 +139,10 @@ impl RequestContext{
 		};
 		match codec{
 			image::ImageFormat::Jpeg => {
-				let img: Result<image::RgbImage, _> = turbojpeg::decompress_image(&self.src_bytes);
+				let img: Result<image::RgbImage, _> = {
+					let _dg=self.phase_guard(Phase::Decode);
+					turbojpeg::decompress_image(&self.src_bytes)
+				};
 				match img {
 					Ok(img) => self.response_img(DynamicImage::ImageRgb8(img)),
 					Err(_) => self.encode_single(),
@@ -229,10 +221,11 @@ impl RequestContext{
 		}
 	}
 	fn encode_anim(&self,frames:image::Frames,loop_count:u32)->axum::response::Response{
+		let _g=self.phase_guard(Phase::Encode);
 		let conf=webp::WebPConfig::new().unwrap();
 		let mut size:Option<(u32, u32)>=None;
 		let mut encoder=None;
-		let mut available_frames=0;
+		let mut available_frames:u32=0;
 		let mut err=None;
 		{
 			let mut timestamp=0;
@@ -290,6 +283,8 @@ impl RequestContext{
 			return (axum::http::StatusCode::BAD_GATEWAY,headers).into_response();
 		};
 		let buf=encoder.unwrap().encode();
+		self.record_anim(available_frames,self.src_bytes.len(),buf.len());
+		tracing::debug!(frames=available_frames as u64,in_bytes=self.src_bytes.len() as u64,out_bytes=buf.len() as u64,"encode_anim");
 		headers.remove("Content-Type");
 		headers.append("Content-Type","image/webp".parse().unwrap());
 		headers.remove("Cache-Control");
@@ -304,25 +299,28 @@ impl RequestContext{
 		(axum::http::StatusCode::OK,headers,buf.to_vec()).into_response()
 	}
 	fn encode_single(&mut self)->axum::response::Response{
-		let img=match &self.codec{
-			Ok(codec)=>image::load_from_memory_with_format(&self.src_bytes,*codec).map_err(|e|format!("{:?}",e)),
-			Err(Some(e))=>Err(format!("{:?}",e)),
-			_=>{
-				self.headers.append("X-Proxy-Error","Unknown Format".parse().unwrap());
-				return (axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response();
-			}
-		};
-		let img=match img{
-			Ok(img)=>img,
-			Err(e)=>{
-				self.headers.append("X-Proxy-Error",format!("DecodeError_{}",e).parse().unwrap());
-				return (axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response();
+		let img={
+			let _dg=self.phase_guard(Phase::Decode);
+			let img=match &self.codec{
+				Ok(codec)=>image::load_from_memory_with_format(&self.src_bytes,*codec).map_err(|e|format!("{:?}",e)),
+				Err(Some(e))=>Err(format!("{:?}",e)),
+				_=>{
+					self.headers.append("X-Proxy-Error","Unknown Format".parse().unwrap());
+					return (axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response();
+				}
+			};
+			match img{
+				Ok(img)=>img,
+				Err(e)=>{
+					self.headers.append("X-Proxy-Error",format!("DecodeError_{}",e).parse().unwrap());
+					return (axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response();
+				}
 			}
 		};
 		self.response_img(img)
 	}
 	pub(crate) fn response_img(&mut self,img:DynamicImage)->axum::response::Response{
-		let _timer = Timer::new("response_img");
+		let _g=self.phase_guard(Phase::Encode);
 		let img=match self.codec{
 			Ok(image::ImageFormat::Jpeg)|Ok(image::ImageFormat::Tiff)=>{
 				self.exif_rotate(img)

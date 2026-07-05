@@ -36,6 +36,8 @@ iprange = "0.6.7"
 ipnet = "*"
 num_cpus = "1.17.0"
 turbojpeg = { version = "1.4", features = ["image"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 strip = true

@@ -2,6 +2,7 @@ use core::str;
 use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
@@ -32,7 +33,12 @@ pub struct ConfigFile{
 	allowed_networks:Option<Vec<String>>,
 	blocked_networks:Option<Vec<String>>,
 	blocked_hosts:Option<Vec<String>>,
+	/// 正常完了かつ全フェーズ合計がこのms未満のリクエストは、
+	/// アクセスログを INFO ではなく DEBUG に落とす(ヘルスチェック等でログが埋まるのを防ぐ)。
+	#[serde(default = "default_slow_log_ms")]
+	slow_log_ms:u64,
 }
+fn default_slow_log_ms()->u64{50}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -99,6 +105,12 @@ async fn shutdown_signal() {
 	}
 }
 fn main() {
+	tracing_subscriber::fmt()
+		.with_env_filter(
+			tracing_subscriber::EnvFilter::try_from_default_env()
+				.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+		)
+		.init();
 	let config_path=match std::env::var("MEDIA_PROXY_CONFIG_PATH"){
 		Ok(path)=>{
 			if path.is_empty(){
@@ -128,6 +140,7 @@ fn main() {
 			allowed_networks:None,
 			blocked_networks:None,
 			blocked_hosts:None,
+			slow_log_ms:default_slow_log_ms(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -161,7 +174,7 @@ fn main() {
 	let network_policy=match NetworkPolicy::from_config(&config){
 		Ok(p)=>Arc::new(p),
 		Err(e)=>{
-			eprintln!("設定エラー(network): {}",e);
+			tracing::error!("設定エラー(network): {}",e);
 			std::process::exit(1);
 		}
 	};
@@ -276,12 +289,13 @@ impl DnsCache{
 	}
 	/// hostを非同期解決する。TTL内はキャッシュを返す。
 	/// ポートは解決結果に影響しないためキーはhostのみ。
-	pub async fn resolve(&self,host:&str,port:u16)->Result<Vec<IpAddr>,String>{
+	/// 戻り値の bool はキャッシュヒットかどうか(true=ヒット)。
+	pub async fn resolve(&self,host:&str,port:u16)->Result<(Vec<IpAddr>,bool),String>{
 		{
 			let map=self.inner.read().await;
 			if let Some(entry)=map.get(host){
 				if entry.resolved_at.elapsed()<self.ttl{
-					return Ok(entry.ips.clone());
+					return Ok((entry.ips.clone(),true));
 				}
 			}
 		}
@@ -307,11 +321,11 @@ impl DnsCache{
 			}
 			map.insert(host.to_owned(),DnsCacheEntry{resolved_at:Instant::now(),ips:addrs.clone()});
 		}
-		Ok(addrs)
+		Ok((addrs,false))
 	}
 }
 
-async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>)->Result<(),String>{
+async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>)->Result<bool,String>{
 	let u=reqwest::Url::from_str(url.as_ref()).map_err(|e|format!("{:?}",e))?;
 	match u.scheme().to_lowercase().as_str(){
 		"http"|"https"=>{},
@@ -323,7 +337,7 @@ async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>
 	}
 	let port=u.port_or_known_default().ok_or_else(||"no port".to_owned())?;
 	// 同期DNS(to_socket_addrs)を廃止し、非同期解決+独自タイムアウトに置き換え。
-	let ips=dns_cache.resolve(host,port).await?;
+	let (ips,dns_cache_hit)=dns_cache.resolve(host,port).await?;
 	for ip in ips{
 		match ip{
 			IpAddr::V4(v4)=>{
@@ -336,7 +350,104 @@ async fn check_url(policy:&NetworkPolicy,dns_cache:&DnsCache,url:impl AsRef<str>
 			},
 		}
 	}
-	Ok(())
+	Ok(dns_cache_hit)
+}
+/// 1リクエストの各フェーズ所要時間と付随情報。Arc<Mutex<>> で get_file と
+/// RequestContext(spawn_blocking 内も含む)で共有する。
+#[derive(Default)]
+struct PhaseTimings{
+	dns_cache_hit:bool,
+	check:Duration,
+	/// download の計測開始時刻(送信直前にセット)。
+	download_start:Option<Instant>,
+	download:Duration,
+	decode:Duration,
+	encode:Duration,
+	anim:bool,
+	anim_frames:u32,
+	anim_in_bytes:usize,
+	anim_out_bytes:usize,
+}
+/// 計測対象フェーズ(decode/encode は複数の return を持つ関数が多いため Drop で計測する)。
+pub(crate) enum Phase{
+	Decode,
+	Encode,
+}
+/// スコープ離脱時に経過時間を該当フェーズへ加算するガード。
+/// self を借用せず Arc を複製して保持するため、&mut self のメソッド内でも使える。
+pub(crate) struct PhaseGuard{
+	timings:Arc<Mutex<PhaseTimings>>,
+	start:Instant,
+	phase:Phase,
+}
+impl Drop for PhaseGuard{
+	fn drop(&mut self){
+		if let Ok(mut t)=self.timings.lock(){
+			let e=self.start.elapsed();
+			match self.phase{
+				Phase::Decode=>t.decode+=e,
+				Phase::Encode=>t.encode+=e,
+			}
+		}
+	}
+}
+/// アクセスログ用に、消費(move)される前の RequestParams から必要な値だけ控えておく。
+struct ReqSummary{
+	url:String,
+	is_static:bool,
+	emoji:bool,
+	avatar:bool,
+	preview:bool,
+	badge:bool,
+	fallback:bool,
+}
+impl ReqSummary{
+	fn new(q:&RequestParams)->Self{
+		Self{
+			url:q.url.clone(),
+			is_static:q.r#static.is_some(),
+			emoji:q.emoji.is_some(),
+			avatar:q.avatar.is_some(),
+			preview:q.preview.is_some(),
+			badge:q.badge.is_some(),
+			fallback:q.fallback.is_some(),
+		}
+	}
+}
+/// 1リクエスト1行のサマリを出力する。正常かつ高速(slow_log_ms未満)なら DEBUG に落とす。
+fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_error:bool){
+	let check_ms=t.check.as_millis() as u64;
+	let download_ms=t.download.as_millis() as u64;
+	let decode_ms=t.decode.as_millis() as u64;
+	let encode_ms=t.encode.as_millis() as u64;
+	let total_ms=check_ms+download_ms+decode_ms+encode_ms;
+	let mut params=String::new();
+	if s.is_static{params.push_str("static,");}
+	if s.emoji{params.push_str("emoji,");}
+	if s.avatar{params.push_str("avatar,");}
+	if s.preview{params.push_str("preview,");}
+	if s.badge{params.push_str("badge,");}
+	if s.fallback{params.push_str("fallback,");}
+	let fast=status<400 && !has_error && total_ms<cfg.slow_log_ms;
+	if fast{
+		tracing::debug!(
+			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,
+			check_ms,download_ms,decode_ms,encode_ms,
+			status=status as u64,error=has_error,anim=t.anim,
+			anim_frames=t.anim_frames as u64,
+			anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
+			"request"
+		);
+	}else{
+		tracing::info!(
+			url=%s.url,params=%params,dns_hit=t.dns_cache_hit,
+			check_ms,download_ms,decode_ms,encode_ms,
+			status=status as u64,error=has_error,anim=t.anim,
+			anim_frames=t.anim_frames as u64,
+			anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
+			"request"
+		);
+	}
 }
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
@@ -344,16 +455,8 @@ async fn get_file(
 	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache):(reqwest::Client,Arc<ConfigFile>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>),
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
-	println!("{}\t{}\tavatar:{:?}\tpreview:{:?}\tbadge:{:?}\temoji:{:?}\tstatic:{:?}\tfallback:{:?}",
-		chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-		q.url,
-		q.avatar,
-		q.preview,
-		q.badge,
-		q.emoji,
-		q.r#static,
-		q.fallback,
-	);
+	let timings=Arc::new(Mutex::new(PhaseTimings::default()));
+	let summary=ReqSummary::new(&q);
 	let mut headers=HeaderMap::new();
 	if let Ok(url)=q.url.parse(){
 		headers.append("X-Remote-Url",url);
@@ -361,19 +464,39 @@ async fn get_file(
 	if config.encode_avif{
 		headers.append("Vary","Accept,Range".parse().unwrap());
 	}
-	let time=chrono::Utc::now();
-	if let Err(s)=check_url(&network_policy,&dns_cache,&q.url).await{
-		if let Ok(v)=s.parse(){
-			headers.append("X-Proxy-Error",v);
+	let check_start=Instant::now();
+	match check_url(&network_policy,&dns_cache,&q.url).await{
+		Ok(hit)=>{
+			if let Ok(mut t)=timings.lock(){
+				t.check=check_start.elapsed();
+				t.dns_cache_hit=hit;
+			}
+		},
+		Err(s)=>{
+			if let Ok(mut t)=timings.lock(){
+				t.check=check_start.elapsed();
+			}
+			let has_error=if let Ok(v)=s.parse(){
+				headers.append("X-Proxy-Error",v);
+				true
+			}else{
+				false
+			};
+			let is_fallback=q.fallback.is_some();
+			if let Ok(t)=timings.lock(){
+				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},has_error);
+			}
+			if is_fallback{
+				headers.append("Content-Type","image/png".parse().unwrap());
+				return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
+			}
+			return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 		}
-		if q.fallback.is_some(){
-			headers.append("Content-Type","image/png".parse().unwrap());
-			return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
-		}
-		return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 	};
 
-	println!("check_url {}ms",(chrono::Utc::now()-time).num_milliseconds());
+	if let Ok(mut t)=timings.lock(){
+		t.download_start=Some(Instant::now());
+	}
 	let req=client.get(&q.url);
 	let req=req.timeout(std::time::Duration::from_millis(config.timeout));
 	let req=req.header("User-Agent",config.user_agent.clone());
@@ -385,7 +508,11 @@ async fn get_file(
 	let resp=match req.send().await{
 		Ok(resp) => resp,
 		Err(e) => {
-			if q.fallback.is_some(){
+			let is_fallback=q.fallback.is_some();
+			if let Ok(t)=timings.lock(){
+				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},false);
+			}
+			if is_fallback{
 				headers.append("Content-Type","image/png".parse().unwrap());
 				return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
 			}
@@ -436,17 +563,26 @@ async fn get_file(
 			}
 		}
 	}
-	RequestContext{
+	let result=RequestContext{
 		is_accept_avif,
 		headers,
 		parms:q,
 		src_bytes:Vec::new(),
-		config,
+		config:config.clone(),
 		codec:Err(None),
 		dummy_img,
 		fontdb,
 		encode_semaphore,
-	}.encode(resp,is_img).await
+		timings:timings.clone(),
+	}.encode(resp,is_img).await;
+	let (status,has_error)=match &result{
+		Ok((sc,h,_))=>(sc.as_u16(),h.contains_key("X-Proxy-Error")),
+		Err(r)=>(r.status().as_u16(),r.headers().contains_key("X-Proxy-Error")),
+	};
+	if let Ok(t)=timings.lock(){
+		emit_summary(&config,&summary,&t,status,has_error);
+	}
+	result
 }
 struct RequestContext{
 	is_accept_avif:bool,
@@ -458,6 +594,30 @@ struct RequestContext{
 	dummy_img:Arc<Vec<u8>>,
 	fontdb:Arc<resvg::usvg::fontdb::Database>,
 	encode_semaphore: Arc<Semaphore>,
+	timings: Arc<Mutex<PhaseTimings>>,
+}
+impl RequestContext{
+	/// フェーズ計測ガードを生成する(Arcを複製して保持するため self を借用し続けない)。
+	pub(crate) fn phase_guard(&self,phase:Phase)->PhaseGuard{
+		PhaseGuard{timings:self.timings.clone(),start:Instant::now(),phase}
+	}
+	/// download の計測を確定する(download_start からの経過を download に設定)。
+	pub(crate) fn mark_download_done(&self){
+		if let Ok(mut t)=self.timings.lock(){
+			if let Some(s)=t.download_start{
+				t.download=s.elapsed();
+			}
+		}
+	}
+	/// encode_anim のフレーム数・入出力バイト数を記録する。
+	pub(crate) fn record_anim(&self,frames:u32,in_bytes:usize,out_bytes:usize){
+		if let Ok(mut t)=self.timings.lock(){
+			t.anim=true;
+			t.anim_frames=frames;
+			t.anim_in_bytes=in_bytes;
+			t.anim_out_bytes=out_bytes;
+		}
+	}
 }
 impl RequestContext{
 	pub fn disposition_ext(headers:&mut HeaderMap,ext:&str){
@@ -607,6 +767,7 @@ impl RequestContext{
 		}
 		let body=axum::body::Body::from_stream(resp);
 		if status.is_success(){
+			self.mark_download_done();
 			self.headers.remove("Cache-Control");
 			self.headers.append("Cache-Control","max-age=31536000, immutable".parse().unwrap());
 			if status==reqwest::StatusCode::PARTIAL_CONTENT{
@@ -657,6 +818,7 @@ impl RequestContext{
 			}
 		}
 		self.src_bytes=response_bytes;
+		self.mark_download_done();
 		Ok(())
 	}
 }
@@ -708,6 +870,7 @@ mod network_policy_tests{
 			allowed_networks:None,
 			blocked_networks:None,
 			blocked_hosts:None,
+			slow_log_ms:default_slow_log_ms(),
 		}
 	}
 	#[test]

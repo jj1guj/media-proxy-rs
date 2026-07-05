@@ -3,10 +3,11 @@ use std::sync::Arc;
 use image::{DynamicImage, ImageBuffer};
 use resvg::usvg;
 
-use crate::RequestContext;
+use crate::{Phase, RequestContext};
 
 impl RequestContext{
 	pub(crate) fn encode_svg(&self,fontdb:Arc<usvg::fontdb::Database>)->Result<DynamicImage,()>{
+		let _dg=self.phase_guard(Phase::Decode);
 		let mut options=usvg::Options{
 			fontdb:fontdb.clone(),
 			..Default::default()
