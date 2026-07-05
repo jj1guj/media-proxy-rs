@@ -111,6 +111,8 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `dns_ttl_secs` | u64 | `300` | DNSキャッシュのTTL(秒) |
 | `max_concurrent_downloads` | usize | `24` | ダウンロードの最大同時接続数 |
 | `inflight_buffer_budget_bytes` | u64 | `268435456` (256MB) | 同時ダウンロードの合計バイト予算 |
+| `connect_timeout_ms` | u64 | `3000` | TCP接続タイムアウト(ms)。`timeout`より小さく設定すること |
+| `fetch_retry_delay_ms` | u64 | `500` | 接続失敗時のリトライ前待機(ms) |
 | `allowed_networks` | string[]? | `null` | 許可するCIDR。ヘルスチェック等でloopbackを使う場合は`["127.0.0.1/32"]`を追加 |
 | `blocked_networks` | string[]? | `null` | 遮断するCIDR |
 | `blocked_hosts` | string[]? | `null` | 遮断するホスト名 |
@@ -203,3 +205,18 @@ cp example.config.rpi5.json config.json
 - type_complexity警告をDnsResult型エイリアスで解消
 - len_without_is_empty警告をpub(crate)で回避
 - 設定項目一覧・CHANGELOGを最新化
+
+### Step 13: fetchエラーの完全可視化
+- `classify_reqwest_error` で reqwest::Error を connect/timeout/dns/reset/body/other に分類
+- サマリログに `fetch_err=` フィールド追加(正常時は `-`)
+- `req.send()` 失敗時に `X-Proxy-Error` ヘッダ付与・`error=true` に修正(従来はerror=falseで原因不明だった)
+- `load_all` ボディ受信エラーも同様に分類
+- periodic_stats に `ferr_connect`/`ferr_timeout`/`ferr_dns`/`ferr_reset`/`ferr_body`/`ferr_other` カウンタ追加
+- サマリログに `dns_v4`/`dns_v6` フィールド追加(DNS解決結果のv4/v6アドレス数)
+
+### Step 14: connect_timeoutと接続リトライ
+- `connect_timeout_ms`(既定3000)でTCP接続タイムアウトを全体タイムアウトより短く設定
+- 接続段階の失敗(is_connect/is_timeout)時に `fetch_retry_delay_ms`(既定500ms)待って1回リトライ
+- Rangeリクエスト・ボディ受信中エラー・4xx/5xxはリトライしない
+- 2回目のsendには残り時間ベースのタイムアウトを適用(全体 `timeout` を超えない)
+- サマリログに `retried=true/false`、periodic_stats に `retry_attempts`/`retry_saved` を追加

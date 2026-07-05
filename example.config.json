@@ -25,5 +25,7 @@
   "jpeg_quality": 85,
   "webp_method": 4,
   "max_concurrent_downloads": 24,
-  "inflight_buffer_budget_bytes": 268435456
+  "inflight_buffer_budget_bytes": 268435456,
+  "connect_timeout_ms": 3000,
+  "fetch_retry_delay_ms": 500
 }

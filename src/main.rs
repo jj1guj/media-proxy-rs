@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use std::error::Error as StdError;
+use std::error::Error as _;
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use iprange::IpRange;
@@ -35,6 +35,8 @@ struct GlobalStats {
 	ferr_reset: AtomicU64,
 	ferr_body: AtomicU64,
 	ferr_other: AtomicU64,
+	retry_attempts: AtomicU64,
+	retry_saved: AtomicU64,
 }
 impl GlobalStats {
 	fn new() -> Self {
@@ -49,6 +51,8 @@ impl GlobalStats {
 			ferr_reset: AtomicU64::new(0),
 			ferr_body: AtomicU64::new(0),
 			ferr_other: AtomicU64::new(0),
+			retry_attempts: AtomicU64::new(0),
+			retry_saved: AtomicU64::new(0),
 		}
 	}
 	/// カウンタをリセットし、リセット前の値を返す。
@@ -69,6 +73,13 @@ impl GlobalStats {
 			self.ferr_reset.swap(0, Ordering::Relaxed),
 			self.ferr_body.swap(0, Ordering::Relaxed),
 			self.ferr_other.swap(0, Ordering::Relaxed),
+		)
+	}
+	/// retry カウンタをリセットし値を返す。
+	fn swap_reset_retry(&self) -> (u64, u64) {
+		(
+			self.retry_attempts.swap(0, Ordering::Relaxed),
+			self.retry_saved.swap(0, Ordering::Relaxed),
 		)
 	}
 	/// fetch_err 分類に応じたカウンタをインクリメントする。
@@ -146,6 +157,12 @@ pub struct ConfigFile{
 	/// load_all前に予約し、エンコード完了後に解放する。
 	#[serde(default = "default_inflight_buffer_budget")]
 	inflight_buffer_budget_bytes:u64,
+	/// TCP接続タイムアウト(ms、既定3000)。全体タイムアウト(timeout)より小さく設定すること。
+	#[serde(default = "default_connect_timeout_ms")]
+	connect_timeout_ms:u64,
+	/// 接続段階失敗時のリトライ前待機(ms、既定500)。SYN再送で瞬断窓を跨ぐ効果を狙う。
+	#[serde(default = "default_fetch_retry_delay_ms")]
+	fetch_retry_delay_ms:u64,
 }
 fn default_slow_log_ms()->u64{50}
 fn default_true()->bool{true}
@@ -160,6 +177,8 @@ fn default_jpeg_quality()->i32{85}
 fn default_webp_method()->i32{4}
 fn default_max_concurrent_downloads()->usize{24}
 fn default_inflight_buffer_budget()->u64{256*1024*1024}
+fn default_connect_timeout_ms()->u64{3000}
+fn default_fetch_retry_delay_ms()->u64{500}
 #[derive(Debug, Deserialize)]
 pub struct RequestParams{
 	url: String,
@@ -274,6 +293,8 @@ fn main() {
 			webp_method:default_webp_method(),
 			max_concurrent_downloads:default_max_concurrent_downloads(),
 			inflight_buffer_budget_bytes:default_inflight_buffer_budget(),
+			connect_timeout_ms:default_connect_timeout_ms(),
+			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 		};
 		let default_config=serde_json::to_string_pretty(&default_config).unwrap();
 		std::fs::File::create(&config_path).expect("create default config.json").write_all(default_config.as_bytes()).unwrap();
@@ -326,6 +347,14 @@ fn main() {
 	// reqwestのDNS解決をDnsCacheに一本化する。
 	// check_urlと実フェッチが同じキャッシュを共有し、1リクエストあたりのDNS解決を実質1回にする。
 	let client=client.dns_resolver(Arc::new(SharedDnsResolver(dns_cache.clone())));
+	let client=client.connect_timeout(Duration::from_millis(config.connect_timeout_ms));
+	if config.connect_timeout_ms >= config.timeout {
+		tracing::warn!(
+			connect_timeout_ms=config.connect_timeout_ms,
+			timeout=config.timeout,
+			"connect_timeout_ms >= timeout: リトライの余地がありません"
+		);
+	}
 	let client=client.build().unwrap();
 	let mut fontdb=resvg::usvg::fontdb::Database::new();
 	if config.load_system_fonts{
@@ -372,6 +401,7 @@ fn main() {
 					interval.tick().await;
 					let (reqs, errs, hits, misses) = stats.swap_reset();
 					let (fc, ft, fd, fr, fb, fo) = stats.swap_reset_ferr();
+					let (retry_att, retry_sav) = stats.swap_reset_retry();
 					let dl_active = max_dl - dl_sem.available_permits();
 					let cpu_active = max_encode - encode_sem.available_permits();
 					let buf_used = max_buf - buf_sem.available_permits();
@@ -397,6 +427,8 @@ fn main() {
 						ferr_reset = fr,
 						ferr_body = fb,
 						ferr_other = fo,
+						retry_attempts = retry_att,
+						retry_saved = retry_sav,
 						"periodic_stats"
 					);
 				}
@@ -772,6 +804,8 @@ struct PhaseTimings{
 	dns_v4:u16,
 	/// DNS解決結果のIPv6アドレス数。
 	dns_v6:u16,
+	/// 接続リトライが実行された。
+	retried:bool,
 }
 /// 計測対象フェーズ(decode/encode は複数の return を持つ関数が多いため Drop で計測する)。
 pub(crate) enum Phase{
@@ -904,7 +938,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	if fast{
 		tracing::debug!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
-			passthrough=t.passthrough,fetch_err=%fetch_err_str,
+			passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
 			dns_v4=t.dns_v4,dns_v6=t.dns_v6,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
@@ -915,7 +949,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	}else{
 		tracing::info!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
-			passthrough=t.passthrough,fetch_err=%fetch_err_str,
+			passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
 			dns_v4=t.dns_v4,dns_v6=t.dns_v6,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
@@ -1111,15 +1145,18 @@ async fn get_file(
 		t.wait+=wait_start.elapsed();
 	}
 	let send_start=Instant::now();
-	let req=client.get(&q.url);
-	let req=req.timeout(std::time::Duration::from_millis(config.timeout));
-	let req=req.header("User-Agent",config.user_agent.clone());
-	let req=if let Some(range)=client_headers.get("Range"){
-		req.header("Range",range.as_bytes())
-	}else{
-		req
+	let build_req=||{
+		let req=client.get(&q.url);
+		let remaining=config.timeout.saturating_sub(send_start.elapsed().as_millis() as u64);
+		let req=req.timeout(Duration::from_millis(remaining.max(1)));
+		let req=req.header("User-Agent",config.user_agent.clone());
+		if let Some(range)=client_headers.get("Range"){
+			req.header("Range",range.as_bytes())
+		}else{
+			req
+		}
 	};
-	let resp=match req.send().await{
+	let resp=match build_req().send().await{
 		Ok(resp) => {
 			if let Ok(mut t)=timings.lock(){
 				t.ttfb=send_start.elapsed();
@@ -1127,21 +1164,58 @@ async fn get_file(
 			resp
 		},
 		Err(e) => {
-			let fetch_err = classify_reqwest_error(&e);
-			let is_fallback=q.fallback.is_some();
-			if let Ok(mut t)=timings.lock(){
-				t.ttfb=send_start.elapsed();
-				t.fetch_err=Some(fetch_err.clone());
+			let first_err = classify_reqwest_error(&e);
+			let is_connect_phase = e.is_connect() || e.is_timeout();
+			// 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
+			let remaining_ms = config.timeout.saturating_sub(send_start.elapsed().as_millis() as u64);
+			if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
+				global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+				tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
+				match build_req().send().await {
+					Ok(resp) => {
+						if let Ok(mut t)=timings.lock(){
+							t.ttfb=send_start.elapsed();
+							t.retried=true;
+						}
+						global_stats.retry_saved.fetch_add(1, Ordering::Relaxed);
+						resp
+					},
+					Err(e2) => {
+						let fetch_err = classify_reqwest_error(&e2);
+						let is_fallback=q.fallback.is_some();
+						if let Ok(mut t)=timings.lock(){
+							t.ttfb=send_start.elapsed();
+							t.fetch_err=Some(fetch_err.clone());
+							t.retried=true;
+						}
+						headers.append("X-Proxy-Error",format!("Send:{}",fetch_err).parse().unwrap_or_else(|_|"Send:unknown".parse().unwrap()));
+						if let Ok(t)=timings.lock(){
+							emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
+						}
+						if is_fallback{
+							headers.append("Content-Type","image/png".parse().unwrap());
+							return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
+						}
+						return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
+					}
+				}
+			} else {
+				// リトライ不可(接続段階以外 or 残り時間不足 or Rangeリクエスト)
+				let is_fallback=q.fallback.is_some();
+				if let Ok(mut t)=timings.lock(){
+					t.ttfb=send_start.elapsed();
+					t.fetch_err=Some(first_err.clone());
+				}
+				headers.append("X-Proxy-Error",format!("Send:{}",first_err).parse().unwrap_or_else(|_|"Send:unknown".parse().unwrap()));
+				if let Ok(t)=timings.lock(){
+					emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
+				}
+				if is_fallback{
+					headers.append("Content-Type","image/png".parse().unwrap());
+					return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
+				}
+				return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 			}
-			headers.append("X-Proxy-Error",format!("Send:{}",fetch_err).parse().unwrap_or_else(|_|"Send:unknown".parse().unwrap()));
-			if let Ok(t)=timings.lock(){
-				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
-			}
-			if is_fallback{
-				headers.append("Content-Type","image/png".parse().unwrap());
-				return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
-			}
-			return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 		}
 	};
 	fn add_remote_header(key:&'static str,headers:&mut HeaderMap,remote_headers:&reqwest::header::HeaderMap){
@@ -1598,6 +1672,8 @@ mod network_policy_tests{
 			webp_method:default_webp_method(),
 			max_concurrent_downloads:default_max_concurrent_downloads(),
 			inflight_buffer_budget_bytes:default_inflight_buffer_budget(),
+			connect_timeout_ms:default_connect_timeout_ms(),
+			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 		}
 	}
 	#[test]
