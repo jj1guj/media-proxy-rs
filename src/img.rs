@@ -36,15 +36,11 @@ impl RequestContext{
 			let x_start=(width-img.width())/2;
 			let y_start=(height-img.height())/2;
 			let mut sub_canvas=canvas.sub_image(x_start,y_start,width-x_start,height-y_start);
-			let mut y=0;
-			for rows in img.rows(){
-				let mut x=0;
-				for p in rows{
+			for (y, rows) in img.rows().enumerate(){
+				for (x, p) in rows.enumerate(){
 					let p:image::LumaA<u8>=[p.0[0],p.0[0]].into();
-					sub_canvas.put_pixel(x,y,p);
-					x+=1;
+					sub_canvas.put_pixel(x as u32,y as u32,p);
 				}
-				y+=1;
 			}
 			return Some(DynamicImage::ImageLumaA8(canvas));
 		}
@@ -71,7 +67,7 @@ impl RequestContext{
 						let img={
 							let _dg=self.phase_guard(Phase::Decode);
 							let decoder = jxl_oxide::integration::JxlDecoder::new(std::io::Cursor::new(&self.src_bytes));
-							decoder.map(|decoder|DynamicImage::from_decoder(decoder)).unwrap_or_else(|e|Err(e))
+							decoder.map(DynamicImage::from_decoder).unwrap_or_else(Err)
 						};
 						let img=match img{
 							Ok(img) => img,
@@ -86,7 +82,7 @@ impl RequestContext{
 						let img={
 							let _dg=self.phase_guard(Phase::Decode);
 							let img=jpeg2k::Image::from_bytes(&self.src_bytes).map(|img|DynamicImage::try_from(&img));
-							img.map(|r|r.map_err(|e|e.to_string())).map_err(|e|e.to_string()).unwrap_or_else(|e|Err(e))
+							img.map(|r|r.map_err(|e|e.to_string())).map_err(|e|e.to_string()).unwrap_or_else(Err)
 						};
 						let img=match img{
 							Ok(img) => img,
@@ -103,10 +99,9 @@ impl RequestContext{
 							let mut decoder = ImageDecode::with_reader(std::io::Cursor::new(src_bytes))?;
 							let (width, height) = decoder.get_size()?;
 							let info = PixelInfo::from_format(decoder.get_pixel_format()?);
-							let stride = width as usize * info.bits_per_pixel() as usize/8;
+							let stride = width as usize * info.bits_per_pixel()/8;
 							let size = stride * height as usize;
-							let mut buffer = Vec::<u8>::with_capacity(size);
-							buffer.resize(size, 0);
+							let mut buffer = vec![0u8; size];
 							decoder.alpha_mode(info.has_alpha());
 							decoder.copy_all(&mut buffer, stride)?;
 							let img=jpegxr_img(width as u32,height as u32,stride,buffer,info.format());
@@ -400,20 +395,17 @@ impl RequestContext{
 		let exifreader = rexif::parse_buffer_quiet(&self.src_bytes);
 		if let Ok(exif)=exifreader.0{
 			for e in exif.entries{
-				match e.tag{
-					rexif::ExifTag::Orientation=>{
-						return match e.value.to_i64(0).unwrap_or(0){
-							2=>DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&img)),
-							3=>DynamicImage::ImageRgba8(image::imageops::rotate180(&img)),
-							4=>DynamicImage::ImageRgba8(image::imageops::flip_vertical(&img)),
-							5=>DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&image::imageops::rotate90(&img))),
-							6=>DynamicImage::ImageRgba8(image::imageops::rotate90(&img)),
-							7=>DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&image::imageops::rotate270(&img))),
-							8=>DynamicImage::ImageRgba8(image::imageops::rotate270(&img)),
-							_=>img,
-						};
-					},
-					_=>{}
+				if e.tag == rexif::ExifTag::Orientation {
+					return match e.value.to_i64(0).unwrap_or(0){
+						2=>DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&img)),
+						3=>DynamicImage::ImageRgba8(image::imageops::rotate180(&img)),
+						4=>DynamicImage::ImageRgba8(image::imageops::flip_vertical(&img)),
+						5=>DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&image::imageops::rotate90(&img))),
+						6=>DynamicImage::ImageRgba8(image::imageops::rotate90(&img)),
+						7=>DynamicImage::ImageRgba8(image::imageops::flip_horizontal(&image::imageops::rotate270(&img))),
+						8=>DynamicImage::ImageRgba8(image::imageops::rotate270(&img)),
+						_=>img,
+					};
 				}
 			}
 		}
@@ -424,22 +416,20 @@ impl RequestContext{
 fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::PixelFormat)->Option<DynamicImage>{
 	match info{
 		jpegxr::PixelFormat::PixelFormat8bppGray => {
-			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageLuma8(i))
+			image::ImageBuffer::from_raw(width,height,buffer).map(DynamicImage::ImageLuma8)
 		},
 		jpegxr::PixelFormat::PixelFormat24bppBGR => {
 			let mut buffer=buffer;
 			for y in 0..height{
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*3;
-					let r=buffer[offset];
-					buffer[offset]=buffer[offset+2];
-					buffer[offset+2]=r;
+					buffer.swap(offset, offset+2);
 				}
 			}
-			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
+			image::ImageBuffer::from_raw(width,height,buffer).map(DynamicImage::ImageRgb8)
 		},
 		jpegxr::PixelFormat::PixelFormat24bppRGB => {
-			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgb8(i))
+			image::ImageBuffer::from_raw(width,height,buffer).map(DynamicImage::ImageRgb8)
 		},
 		jpegxr::PixelFormat::PixelFormat32bppBGR => {
 			let mut raw_img=Vec::with_capacity(width as usize*height as usize*3);
@@ -448,37 +438,35 @@ fn jpegxr_img(width:u32,height:u32,stride:usize,buffer:Vec<u8>,info:jpegxr::Pixe
 					let offset=y as usize*stride+x as usize*4;
 					raw_img.push(buffer[offset+2]);
 					raw_img.push(buffer[offset+1]);
-					raw_img.push(buffer[offset+0]);
+					raw_img.push(buffer[offset]);
 				}
 			}
-			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
+			image::ImageBuffer::from_raw(width,height,raw_img).map(DynamicImage::ImageRgb8)
 		},
 		jpegxr::PixelFormat::PixelFormat32bppBGRA => {
 			let mut buffer=buffer;
 			for y in 0..height{
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*4;
-					let r=buffer[offset];
-					buffer[offset]=buffer[offset+2];
-					buffer[offset+2]=r;
+					buffer.swap(offset, offset+2);
 				}
 			}
-			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgba8(i))
+			image::ImageBuffer::from_raw(width,height,buffer).map(DynamicImage::ImageRgba8)
 		},
 		jpegxr::PixelFormat::PixelFormat32bppRGB => {
 			let mut raw_img=Vec::with_capacity(height as usize*3);
 			for y in 0..height{
 				for x in 0..width{
 					let offset=y as usize*stride+x as usize*4;
-					raw_img.push(buffer[offset+0]);
+					raw_img.push(buffer[offset]);
 					raw_img.push(buffer[offset+1]);
 					raw_img.push(buffer[offset+2]);
 				}
 			}
-			image::ImageBuffer::from_raw(width,height,raw_img).map(|i|DynamicImage::ImageRgb8(i))
+			image::ImageBuffer::from_raw(width,height,raw_img).map(DynamicImage::ImageRgb8)
 		},
 		jpegxr::PixelFormat::PixelFormat32bppRGBA => {
-			image::ImageBuffer::from_raw(width,height,buffer).map(|i|DynamicImage::ImageRgba8(i))
+			image::ImageBuffer::from_raw(width,height,buffer).map(DynamicImage::ImageRgba8)
 		},
 		_ => None,
 	}

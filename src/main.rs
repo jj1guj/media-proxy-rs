@@ -17,6 +17,8 @@ mod svg;
 mod browsersafe;
 mod image_test;
 
+type AppState = (reqwest::Client, Arc<ConfigFile>, Arc<Vec<u8>>, Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>);
+
 #[derive(Debug,Serialize,Deserialize)]
 pub struct ConfigFile{
 	bind_addr: String,
@@ -58,9 +60,9 @@ enum FilterType{
 	Gaussian,
 	Lanczos3,
 }
-impl Into<image::imageops::FilterType> for FilterType{
-	fn into(self) -> image::imageops::FilterType {
-		match self {
+impl From<FilterType> for image::imageops::FilterType{
+	fn from(val: FilterType) -> Self {
+		match val {
 			FilterType::Nearest => image::imageops::Nearest,
 			FilterType::Triangle => image::imageops::Triangle,
 			FilterType::CatmullRom => image::imageops::CatmullRom,
@@ -69,9 +71,9 @@ impl Into<image::imageops::FilterType> for FilterType{
 		}
 	}
 }
-impl Into<fast_image_resize::FilterType> for FilterType{
-	fn into(self) -> fast_image_resize::FilterType {
-		match self {
+impl From<FilterType> for fast_image_resize::FilterType{
+	fn from(val: FilterType) -> Self {
+		match val {
 			FilterType::Nearest => fast_image_resize::FilterType::Box,
 			FilterType::Triangle => fast_image_resize::FilterType::Bilinear,
 			FilterType::CatmullRom => fast_image_resize::FilterType::CatmullRom,
@@ -264,7 +266,7 @@ impl NetworkPolicy{
 			}
 		}
 		if self.ipv4_private_range.contains(ip){
-			let allow=self.allowed_networks.as_ref().map_or(false,|a|a.contains(ip));
+			let allow=self.allowed_networks.as_ref().is_some_and(|a|a.contains(ip));
 			if !allow{
 				return Err("Blocked address".to_owned());
 			}
@@ -452,7 +454,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
 	client_headers:axum::http::HeaderMap,
-	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache):(reqwest::Client,Arc<ConfigFile>,Arc<Vec<u8>>,Arc<resvg::usvg::fontdb::Database>, Arc<Semaphore>, Arc<NetworkPolicy>, Arc<DnsCache>),
+	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache):AppState,
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	let timings=Arc::new(Mutex::new(PhaseTimings::default()));
@@ -637,15 +639,15 @@ impl RequestContext{
 				if name.is_none(){
 					if let Some(filename)=cd.params.get("filename"){
 						let m_filename=format!("_:{}",filename);
-						let parsed=mailparse::parse_header(&m_filename.as_bytes());
+						let parsed=mailparse::parse_header(m_filename.as_bytes());
 						if let Ok((parsed,_))=&parsed{
 							name=Some(parsed.get_value());
-						}else if cd.params.get("name").is_none(){
+						}else if !cd.params.contains_key("name"){
 							name=Some(filename.clone());
 						}
 					}
 				}
-				let name=name.unwrap_or_else(||cd.params.get("name").map(|s|s.clone()).unwrap_or_else(||"null".to_owned()));
+				let name=name.unwrap_or_else(||cd.params.get("name").cloned().unwrap_or_else(||"null".to_owned()));
 				let mut name_arr:Vec<&str>=name.split('.').collect();
 				name_arr.pop();
 				let name=name_arr.join(".")+ext;
@@ -673,10 +675,10 @@ impl RequestContext{
 		let resp=PreDataStream::new(resp).await;
 		if let Some(Ok(head))=resp.head.as_ref(){
 			//utf8にパースできて空白文字を削除した後の先頭部分が<svgの場合はsvg
-			if std::str::from_utf8(&head).map(|s|s.trim().starts_with("<svg")).unwrap_or(false){
+			if std::str::from_utf8(head).map(|s|s.trim().starts_with("<svg")).unwrap_or(false){
 				is_svg=true;
 			}else{
-				self.codec=image::guess_format(head).map_err(|e|Some(e));
+				self.codec=image::guess_format(head).map_err(Some);
 				if self.codec.is_err(){
 					if let Some(content_type)=content_type.as_ref(){
 						match content_type.as_ref(){
@@ -730,12 +732,11 @@ impl RequestContext{
             })?;
 			let mut handle=self;
 			let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move ||{
-				let resp=handle.encode_img();
-				resp
+				handle.encode_img()
 			}).await{
 				resp
 			}else{
-				header.append("X-Proxy-Error",format!("ImageEncodeThread").parse().unwrap());
+				header.append("X-Proxy-Error","ImageEncodeThread".parse().unwrap());
 				return Err(if is_fallback{
 					header.remove("Content-Type");
 					header.append("Content-Type","image/png".parse().unwrap());

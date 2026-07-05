@@ -13,7 +13,7 @@ impl RequestContext{
 			..Default::default()
 		};
 		for f in fontdb.faces(){
-			if let Some((name,_))=f.families.get(0){
+			if let Some((name,_))=f.families.first(){
 				//デフォルトフォントに存在する事が確実なフォントを使う
 				options.font_family=name.to_owned();
 				break;
