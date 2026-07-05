@@ -1148,9 +1148,11 @@ async fn get_file(
 				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},has_error,&global_stats);
 			}
 			if is_fallback{
+				headers.append("Cache-Control","no-store".parse().unwrap());
 				headers.append("Content-Type","image/png".parse().unwrap());
 				return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
 			}
+			headers.append("Cache-Control","no-store".parse().unwrap());
 			return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 		}
 	};
@@ -1213,9 +1215,11 @@ async fn get_file(
 							emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
 						}
 						if is_fallback{
+							headers.append("Cache-Control","no-store".parse().unwrap());
 							headers.append("Content-Type","image/png".parse().unwrap());
 							return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
 						}
+						headers.append("Cache-Control","no-store".parse().unwrap());
 						return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 					}
 				}
@@ -1231,9 +1235,11 @@ async fn get_file(
 					emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
 				}
 				if is_fallback{
+					headers.append("Cache-Control","no-store".parse().unwrap());
 					headers.append("Content-Type","image/png".parse().unwrap());
 					return Err((axum::http::StatusCode::OK,headers,(*dummy_img).clone()).into_response());
 				}
+				headers.append("Cache-Control","no-store".parse().unwrap());
 				return Err((axum::http::StatusCode::BAD_REQUEST,headers).into_response())
 			}
 		}
@@ -1267,7 +1273,7 @@ async fn get_file(
 		add_remote_header("Content-Range",&mut headers,remote_headers);
 		add_remote_header("Accept-Ranges",&mut headers,remote_headers);
 	}
-	headers.append("Cache-Control","max-age=300".parse().unwrap());
+	headers.append("Cache-Control","no-store".parse().unwrap());
 	for line in config.append_headers.iter(){
 		if let Some(idx)=line.find(":"){
 			if idx+1>=line.len(){
