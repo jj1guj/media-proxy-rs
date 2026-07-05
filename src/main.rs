@@ -37,6 +37,8 @@ struct GlobalStats {
 	ferr_other: AtomicU64,
 	retry_attempts: AtomicU64,
 	retry_saved: AtomicU64,
+	http1_responses: AtomicU64,
+	http2_responses: AtomicU64,
 }
 impl GlobalStats {
 	fn new() -> Self {
@@ -53,6 +55,8 @@ impl GlobalStats {
 			ferr_other: AtomicU64::new(0),
 			retry_attempts: AtomicU64::new(0),
 			retry_saved: AtomicU64::new(0),
+			http1_responses: AtomicU64::new(0),
+			http2_responses: AtomicU64::new(0),
 		}
 	}
 	/// カウンタをリセットし、リセット前の値を返す。
@@ -80,6 +84,13 @@ impl GlobalStats {
 		(
 			self.retry_attempts.swap(0, Ordering::Relaxed),
 			self.retry_saved.swap(0, Ordering::Relaxed),
+		)
+	}
+	/// HTTP バージョンカウンタをリセットし値を返す。
+	fn swap_reset_http(&self) -> (u64, u64) {
+		(
+			self.http1_responses.swap(0, Ordering::Relaxed),
+			self.http2_responses.swap(0, Ordering::Relaxed),
 		)
 	}
 	/// fetch_err 分類に応じたカウンタをインクリメントする。
@@ -402,6 +413,7 @@ fn main() {
 					let (reqs, errs, hits, misses) = stats.swap_reset();
 					let (fc, ft, fd, fr, fb, fo) = stats.swap_reset_ferr();
 					let (retry_att, retry_sav) = stats.swap_reset_retry();
+					let (http1, http2) = stats.swap_reset_http();
 					let dl_active = max_dl - dl_sem.available_permits();
 					let cpu_active = max_encode - encode_sem.available_permits();
 					let buf_used = max_buf - buf_sem.available_permits();
@@ -429,6 +441,8 @@ fn main() {
 						ferr_other = fo,
 						retry_attempts = retry_att,
 						retry_saved = retry_sav,
+						http1_responses = http1,
+						http2_responses = http2,
 						"periodic_stats"
 					);
 				}
@@ -806,6 +820,8 @@ struct PhaseTimings{
 	dns_v6:u16,
 	/// 接続リトライが実行された。
 	retried:bool,
+	/// レスポンスのHTTPバージョン(例: "1.1", "2")。
+	http_version:Option<&'static str>,
 }
 /// 計測対象フェーズ(decode/encode は複数の return を持つ関数が多いため Drop で計測する)。
 pub(crate) enum Phase{
@@ -934,12 +950,13 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	let dns_str=t.dns_hit.map(|d|d.to_string()).unwrap_or_else(||"-".to_owned());
 	let cache_str=t.cache_result.map(|c|c.to_string()).unwrap_or_else(||"-".to_owned());
 	let fetch_err_str=t.fetch_err.as_deref().unwrap_or("-");
+	let http_str=t.http_version.unwrap_or("-");
 	let fast=status<400 && !has_error && total_ms<cfg.slow_log_ms;
 	if fast{
 		tracing::debug!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
-			dns_v4=t.dns_v4,dns_v6=t.dns_v6,
+			http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -950,7 +967,7 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		tracing::info!(
 			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
-			dns_v4=t.dns_v4,dns_v6=t.dns_v6,
+			http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
 			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
@@ -1222,6 +1239,16 @@ async fn get_file(
 		for v in remote_headers.get_all(key){
 			headers.append(key,String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
 		}
+	}
+	// HTTPバージョンを記録
+	{
+		let ver = match resp.version() {
+			reqwest::Version::HTTP_2 => { global_stats.http2_responses.fetch_add(1, Ordering::Relaxed); "2" },
+			reqwest::Version::HTTP_11 => { global_stats.http1_responses.fetch_add(1, Ordering::Relaxed); "1.1" },
+			reqwest::Version::HTTP_10 => { global_stats.http1_responses.fetch_add(1, Ordering::Relaxed); "1.0" },
+			_ => "?",
+		};
+		if let Ok(mut t)=timings.lock(){ t.http_version=Some(ver); }
 	}
 	let remote_headers=resp.headers();
 	add_remote_header("Content-Disposition",&mut headers,remote_headers);
