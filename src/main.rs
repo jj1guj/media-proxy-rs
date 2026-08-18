@@ -570,6 +570,33 @@ pub struct DnsCache{
 	/// singleflight: 進行中のDNS解決。同一ホストへの並列lookup_hostを1本に束ねる。
 	inflight: Mutex<HashMap<String,tokio::sync::broadcast::Sender<DnsResult>>>,
 }
+
+struct DnsFlightGuard<'a>{
+	cache:&'a DnsCache,
+	host:String,
+	tx:tokio::sync::broadcast::Sender<DnsResult>,
+	active:bool,
+}
+impl DnsFlightGuard<'_>{
+	fn complete(mut self){
+		self.remove_if_current();
+		self.active=false;
+	}
+	fn remove_if_current(&self){
+		let mut inflight=self.cache.inflight.lock().unwrap_or_else(|e|e.into_inner());
+		let is_current=inflight.get(&self.host).is_some_and(|tx|tx.same_channel(&self.tx));
+		if is_current{
+			inflight.remove(&self.host);
+		}
+	}
+}
+impl Drop for DnsFlightGuard<'_>{
+	fn drop(&mut self){
+		if self.active{
+			self.remove_if_current();
+		}
+	}
+}
 impl DnsCache{
 	pub fn new(ttl:Duration,negative_ttl:Duration,dns_timeout:Duration,max_entries:usize)->Self{
 		Self{
@@ -620,29 +647,32 @@ impl DnsCache{
 		// --- singleflight: 既に進行中なら合流、そうでなければ自分が処理開始 ---
 		let rx_opt=self.try_subscribe(host);
 		if let Some(mut rx)=rx_opt{
-			if let Ok(result)=rx.recv().await{
+			if let Ok(Ok(result))=tokio::time::timeout(self.dns_timeout,rx.recv()).await{
 				match result{
 					Ok(ips)=>return Ok((ips,DnsHitStatus::Miss)),
 					Err(e)=>return self.try_stale_or_err(host,e).await,
 				}
 			}
-			// broadcast側がdropされた→自分で解決にフォールスルー
+			self.remove_inflight_if_current(host,&rx);
+			// broadcast側がdropまたは応答しない→自分で解決にフォールスルー
 		}
 		// --- singleflight: 処理開始を登録(race check込み) ---
 		let tx=match self.register_or_subscribe(host){
 			Err(mut rx)=>{
 				// 別タスクが先に登録した→合流
-				if let Ok(result)=rx.recv().await{
+				if let Ok(Ok(result))=tokio::time::timeout(self.dns_timeout,rx.recv()).await{
 					match result{
 						Ok(ips)=>return Ok((ips,DnsHitStatus::Miss)),
 						Err(e)=>return self.try_stale_or_err(host,e).await,
 					}
 				}
-				// broadcast側がdropされた→自分で解決にフォールスルー(txを登録)
+				self.remove_inflight_if_current(host,&rx);
+				// broadcast側がdropまたは応答しない→自分で解決にフォールスルー(txを登録)
 				self.force_register(host)
 			},
 			Ok(tx)=>tx,
 		};
+		let flight_guard=DnsFlightGuard{cache:self,host:host.to_owned(),tx:tx.clone(),active:true};
 		// --- 実際のDNS解決(リトライ1回付き) ---
 		let result=self.do_lookup(host,port).await;
 		let result=match &result{
@@ -680,10 +710,7 @@ impl DnsCache{
 		}
 		// --- singleflight: 結果を通知して inflight から削除 ---
 		let _ = tx.send(result.clone());
-		{
-			let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
-			inflight.remove(host);
-		}
+		flight_guard.complete();
 		// --- 結果を返す(失敗時はstaleを試す) ---
 		match result{
 			Ok(addrs)=>Ok((addrs,DnsHitStatus::Miss)),
@@ -730,6 +757,13 @@ impl DnsCache{
 		let (tx,_)=tokio::sync::broadcast::channel(1);
 		inflight.insert(host.to_owned(),tx.clone());
 		tx
+	}
+	fn remove_inflight_if_current(&self,host:&str,rx:&tokio::sync::broadcast::Receiver<DnsResult>){
+		let mut inflight=self.inflight.lock().unwrap_or_else(|e|e.into_inner());
+		let is_current=inflight.get(host).is_some_and(|tx|rx.same_channel(&tx.subscribe()));
+		if is_current{
+			inflight.remove(host);
+		}
 	}
 
 	/// 解決失敗時にstaleエントリがあればそれを返す。なければエラー。
@@ -1778,6 +1812,9 @@ impl futures::stream::Stream for PreDataStream{
 #[cfg(test)]
 mod network_policy_tests{
 	use super::*;
+	fn test_dns_cache(timeout:Duration)->DnsCache{
+		DnsCache::new(Duration::from_secs(60),Duration::from_secs(1),timeout,16)
+	}
 	fn base_config()->ConfigFile{
 		ConfigFile{
 			bind_addr:"0.0.0.0:12766".to_owned(),
@@ -1841,6 +1878,35 @@ mod network_policy_tests{
 		let policy=NetworkPolicy::from_config(&c).unwrap();
 		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(10,1,2,3)).is_ok());
 		assert!(policy.check_ipv4(&std::net::Ipv4Addr::new(10,1,2,4)).is_err());
+	}
+	#[test]
+	fn dns_flight_guard_removes_cancelled_owner(){
+		let cache=test_dns_cache(Duration::from_millis(20));
+		let tx=cache.force_register("cancelled.test");
+		{
+			let _guard=DnsFlightGuard{cache:&cache,host:"cancelled.test".to_owned(),tx,active:true};
+		}
+		assert!(cache.try_subscribe("cancelled.test").is_none());
+	}
+	#[test]
+	fn dns_flight_guard_does_not_remove_replacement(){
+		let cache=test_dns_cache(Duration::from_millis(20));
+		let old_tx=cache.force_register("replaced.test");
+		let guard=DnsFlightGuard{cache:&cache,host:"replaced.test".to_owned(),tx:old_tx,active:true};
+		let new_tx=cache.force_register("replaced.test");
+		drop(guard);
+		let rx=cache.try_subscribe("replaced.test").expect("replacement flight should remain");
+		assert!(rx.same_channel(&new_tx.subscribe()));
+	}
+	#[test]
+	fn dns_resolve_recovers_from_stale_flight(){
+		let cache=test_dns_cache(Duration::from_millis(20));
+		let _stale_tx=cache.force_register("localhost");
+		let runtime=tokio::runtime::Runtime::new().unwrap();
+		let start=Instant::now();
+		let result=runtime.block_on(cache.resolve("localhost",80));
+		assert!(result.is_ok());
+		assert!(start.elapsed()<Duration::from_secs(1));
 	}
 }
 
