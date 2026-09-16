@@ -862,8 +862,8 @@ const DNS_STALE_FACTOR: u32 = 10;
 /// 起動時に1度だけパースするネットワークポリシー。
 /// check_url には Arc の参照として渡す(リクエストごとの再パースをしない)。
 pub struct NetworkPolicy {
-    /// RFC1918 プライベートレンジ(allowedが無ければ遮断)。
-    ipv4_private_range: IpRange<Ipv4Net>,
+    /// 組み込み遮断レンジ(allowedが無ければ遮断)。
+    ipv4_blocked_default: IpRange<Ipv4Net>,
     allowed_networks: Option<IpRange<Ipv4Net>>,
     blocked_networks: Option<IpRange<Ipv4Net>>,
     /// 小文字化済みの遮断ホスト集合。
@@ -882,13 +882,17 @@ impl NetworkPolicy {
         Ok(range)
     }
     pub fn from_config(config: &ConfigFile) -> Result<Self, String> {
-        let ipv4_private_range = Self::parse_ranges(
+        let ipv4_blocked_default = Self::parse_ranges(
             &[
                 "10.0.0.0/8".to_owned(),
                 "172.16.0.0/12".to_owned(),
                 "192.168.0.0/16".to_owned(),
+                "127.0.0.0/8".to_owned(),
+                "169.254.0.0/16".to_owned(),
+                "100.64.0.0/10".to_owned(),
+                "0.0.0.0/8".to_owned(),
             ],
-            "builtin private range",
+            "builtin blocked range",
         )?;
         let allowed_networks = match &config.allowed_networks {
             Some(list) => Some(Self::parse_ranges(list, "allowed_networks")?),
@@ -904,7 +908,7 @@ impl NetworkPolicy {
             .map(|hosts| hosts.iter().map(|h| h.to_lowercase()).collect())
             .unwrap_or_default();
         Ok(Self {
-            ipv4_private_range,
+            ipv4_blocked_default,
             allowed_networks,
             blocked_networks,
             blocked_hosts,
@@ -917,7 +921,7 @@ impl NetworkPolicy {
                 return Err("Blocked address".to_owned());
             }
         }
-        if self.ipv4_private_range.contains(ip) {
+        if self.ipv4_blocked_default.contains(ip) {
             let allow = self
                 .allowed_networks
                 .as_ref()
@@ -1297,8 +1301,18 @@ async fn check_url(
                 policy.check_ipv4(&v4)?;
             }
             IpAddr::V6(v6) => {
-                if v6.is_multicast() || v6.is_unicast_link_local() {
+                if v6.is_multicast()
+                    || v6.is_unicast_link_local()
+                    || v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_unique_local()
+                {
                     return Err("Blocked address".to_owned());
+                }
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    if policy.ipv4_blocked_default.contains(&mapped) {
+                        return Err("Blocked address".to_owned());
+                    }
                 }
             }
         }
