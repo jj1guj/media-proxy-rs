@@ -1,5 +1,5 @@
 use axum::response::IntoResponse;
-use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
+use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView, ImageDecoder};
 
 use crate::{Phase, RequestContext};
 
@@ -69,6 +69,14 @@ fn webp_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(
 }
 
 impl RequestContext {
+    fn decode_limit_response(&mut self, width: u64, height: u64) -> axum::response::Response {
+        let message = format!("DecodeDimensions {}x{} over limit", width, height);
+        let value = reqwest::header::HeaderValue::from_bytes(message.as_bytes())
+            .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("DecodeLimit"));
+        self.headers.append("X-Proxy-Error", value);
+        (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+    }
+
     pub(crate) fn image_size_hint(&self) -> (u32, u32) {
         if self.parms.badge.is_some() {
             return (96, 96);
@@ -118,6 +126,14 @@ impl RequestContext {
         resize(img, max_width, max_height, filter)
     }
     pub(crate) fn encode_img(&mut self) -> axum::response::Response {
+        let max_decode_pixels = (self.config.max_size / 4).max(1);
+        if self.codec.is_ok() {
+            if let Some((width, height)) = probe_dimensions(&self.src_bytes) {
+                if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
+                    return self.decode_limit_response(width as u64, height as u64);
+                }
+            }
+        }
         if self.parms.r#static.is_some() {
             return self.encode_single();
         }
@@ -133,12 +149,26 @@ impl RequestContext {
                     .map(|s| std::str::from_utf8(s.as_bytes()))
                 {
                     Some(Ok("image/jxl")) => {
+                        let decoder = match jxl_oxide::integration::JxlDecoder::new(
+                            std::io::Cursor::new(&self.src_bytes),
+                        ) {
+                            Ok(decoder) => decoder,
+                            Err(error) => {
+                                self.headers.append(
+                                    "X-Proxy-Error",
+                                    format!("JpegXL Error:{:?}", error).parse().unwrap(),
+                                );
+                                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                                    .into_response();
+                            }
+                        };
+                        let (width, height) = decoder.dimensions();
+                        if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
+                            return self.decode_limit_response(width as u64, height as u64);
+                        }
                         let img = {
                             let _dg = self.phase_guard(Phase::Decode);
-                            let decoder = jxl_oxide::integration::JxlDecoder::new(
-                                std::io::Cursor::new(&self.src_bytes),
-                            );
-                            decoder.map(DynamicImage::from_decoder).unwrap_or_else(Err)
+                            DynamicImage::from_decoder(decoder)
                         };
                         let img = match img {
                             Ok(img) => img,
@@ -154,6 +184,18 @@ impl RequestContext {
                         return self.response_img(img);
                     }
                     Some(Ok("image/jp2")) => {
+                        let dimensions = jpeg2k::DumpImage::from_bytes(&self.src_bytes)
+                            .ok()
+                            .map(|dump| (dump.img.width(), dump.img.height()));
+                        if let Some((width, height)) = dimensions {
+                            if !dimensions_allowed_for(
+                                max_decode_pixels,
+                                width as u64,
+                                height as u64,
+                            ) {
+                                return self.decode_limit_response(width as u64, height as u64);
+                            }
+                        }
                         let img = {
                             let _dg = self.phase_guard(Phase::Decode);
                             let img = jpeg2k::Image::from_bytes(&self.src_bytes)
@@ -178,12 +220,23 @@ impl RequestContext {
                     Some(Ok("image/jxr")) => {
                         fn decode_jxr(
                             src_bytes: &[u8],
+                            max_decode_pixels: u64,
                         ) -> Result<Result<DynamicImage, String>, jpegxr::JXRError>
                         {
                             use jpegxr::{ImageDecode, PixelInfo};
                             let mut decoder =
                                 ImageDecode::with_reader(std::io::Cursor::new(src_bytes))?;
                             let (width, height) = decoder.get_size()?;
+                            if !dimensions_allowed_for(
+                                max_decode_pixels,
+                                width as u64,
+                                height as u64,
+                            ) {
+                                return Ok(Err(format!(
+                                    "DecodeDimensions {}x{} over limit",
+                                    width, height
+                                )));
+                            }
                             let info = PixelInfo::from_format(decoder.get_pixel_format()?);
                             let stride = width as usize * info.bits_per_pixel() / 8;
                             let size = stride * height as usize;
@@ -209,7 +262,7 @@ impl RequestContext {
                         }
                         let decoded = {
                             let _dg = self.phase_guard(Phase::Decode);
-                            decode_jxr(&self.src_bytes)
+                            decode_jxr(&self.src_bytes, max_decode_pixels)
                         };
                         match decoded {
                             Ok(Ok(img)) => {
