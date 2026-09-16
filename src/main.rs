@@ -18,6 +18,7 @@ mod browsersafe;
 mod cache;
 mod image_test;
 mod img;
+mod ssrf;
 mod svg;
 
 use cache::{CacheKey, CacheResult, ResponseCache};
@@ -571,7 +572,7 @@ fn main() {
 			connect_timeout_ms:default_connect_timeout_ms(),
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 			cache_stale_max_secs:default_cache_stale_max_secs(),
-		};
+        };
         let default_config = serde_json::to_string_pretty(&default_config).unwrap();
         std::fs::File::create(&config_path)
             .expect("create default config.json")
@@ -629,7 +630,11 @@ fn main() {
     };
     // reqwestのDNS解決をDnsCacheに一本化する。
     // check_urlと実フェッチが同じキャッシュを共有し、1リクエストあたりのDNS解決を実質1回にする。
-    let client = client.dns_resolver(Arc::new(SharedDnsResolver(dns_cache.clone())));
+    let client = client.dns_resolver(Arc::new(ssrf::ValidatingResolver::new(
+        dns_cache.clone(),
+        network_policy.clone(),
+        config.proxy.as_deref(),
+    )));
     let client = client.connect_timeout(Duration::from_millis(config.connect_timeout_ms));
     if config.connect_timeout_ms >= config.timeout {
         tracing::warn!(
@@ -873,6 +878,10 @@ pub struct NetworkPolicy {
     blocked_hosts: HashSet<String>,
 }
 impl NetworkPolicy {
+    fn normalize_host(host: &str) -> String {
+        host.trim_end_matches('.').to_lowercase()
+    }
+
     fn parse_ranges(list: &[String], label: &str) -> Result<IpRange<Ipv4Net>, String> {
         let mut range = IpRange::new();
         for s in list {
@@ -908,13 +917,23 @@ impl NetworkPolicy {
         let blocked_hosts = config
             .blocked_hosts
             .as_ref()
-            .map(|hosts| hosts.iter().map(|h| h.to_lowercase()).collect())
+            .map(|hosts| hosts.iter().map(|h| Self::normalize_host(h)).collect())
             .unwrap_or_default();
         Ok(Self {
             ipv4_blocked_default,
             allowed_networks,
             blocked_networks,
             blocked_hosts,
+        })
+    }
+    pub(crate) fn is_host_blocked(&self, host: &str) -> bool {
+        let host = Self::normalize_host(host);
+        self.blocked_hosts.iter().any(|entry| {
+            if let Some(suffix) = entry.strip_prefix('.') {
+                host.ends_with(&format!(".{}", suffix))
+            } else {
+                host == *entry || host.ends_with(&format!(".{}", entry))
+            }
         })
     }
     /// IPv4アドレスの遮断判定。allowed_networks は遮断より優先。
@@ -934,6 +953,25 @@ impl NetworkPolicy {
             }
         }
         Ok(())
+    }
+    pub(crate) fn check_ip(&self, ip: IpAddr) -> Result<(), String> {
+        match ip {
+            IpAddr::V4(v4) => self.check_ipv4(&v4),
+            IpAddr::V6(v6) => {
+                if v6.is_multicast()
+                    || v6.is_unicast_link_local()
+                    || v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_unique_local()
+                {
+                    return Err("Blocked address".to_owned());
+                }
+                if let Some(mapped) = v6.to_ipv4_mapped() {
+                    self.check_ipv4(&mapped)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -1243,30 +1281,6 @@ impl DnsCache {
         Err(err)
     }
 }
-/// reqwest::dns::Resolve の実装ラッパー。Arc<DnsCache> を保持し、
-/// check_url と実フェッチの DNS 解決を一本化する。
-struct SharedDnsResolver(Arc<DnsCache>);
-impl reqwest::dns::Resolve for SharedDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let cache = self.0.clone();
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            let result = cache.resolve(&host, 0).await;
-            match result {
-                Ok((ips, _hit)) => {
-                    let addrs: Vec<std::net::SocketAddr> = ips
-                        .into_iter()
-                        .map(|ip| std::net::SocketAddr::new(ip, 0))
-                        .collect();
-                    let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
-                    Ok(addrs)
-                }
-                Err(e) => Err(std::io::Error::other(e).into()),
-            }
-        })
-    }
-}
-
 async fn check_url(
     policy: &NetworkPolicy,
     dns_cache: &DnsCache,
@@ -1278,17 +1292,10 @@ async fn check_url(
         scheme => return Err(format!("scheme: {}", scheme)),
     }
     let host = u.host_str().ok_or_else(|| "no host".to_owned())?;
-    let host = host.to_lowercase();
-    let blocked = policy.blocked_hosts.iter().any(|entry| {
-        if let Some(suffix) = entry.strip_prefix('.') {
-            host.ends_with(&format!(".{}", suffix))
-        } else {
-            host == *entry || host.ends_with(&format!(".{}", entry))
-        }
-    });
-    if blocked {
+    if policy.is_host_blocked(host) {
         return Err("Blocked address".to_owned());
     }
+    let host = NetworkPolicy::normalize_host(host);
     let port = u
         .port_or_known_default()
         .ok_or_else(|| "no port".to_owned())?;
@@ -1306,27 +1313,11 @@ async fn check_url(
             }
         }
     }
+    if ips.is_empty() {
+        return Err("Blocked address".to_owned());
+    }
     for ip in ips {
-        match ip {
-            IpAddr::V4(v4) => {
-                policy.check_ipv4(&v4)?;
-            }
-            IpAddr::V6(v6) => {
-                if v6.is_multicast()
-                    || v6.is_unicast_link_local()
-                    || v6.is_loopback()
-                    || v6.is_unspecified()
-                    || v6.is_unique_local()
-                {
-                    return Err("Blocked address".to_owned());
-                }
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    if policy.ipv4_blocked_default.contains(&mapped) {
-                        return Err("Blocked address".to_owned());
-                    }
-                }
-            }
-        }
+        policy.check_ip(ip)?;
     }
     Ok((dns_cache_hit, v4_count, v6_count))
 }
