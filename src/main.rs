@@ -2558,10 +2558,11 @@ impl RequestContext {
             );
             return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response());
         }
-        // with_capacity の初期確保を min(len_hint, 8MB) に抑える。
-        // 虚偽の巨大 Content-Length による即時巨大アロケーションを防ぐ。
-        const INITIAL_CAP_LIMIT: usize = 8 * 1024 * 1024;
-        let mut response_bytes = Vec::with_capacity((len_hint as usize).min(INITIAL_CAP_LIMIT));
+        // Never trust the remote Content-Length hint for pre-allocation
+        // (finding #5): cap the initial reservation and let the buffer grow
+        // as bytes actually arrive (still bounded by max_size below).
+        const INITIAL_CAP: u64 = 16 * 1024;
+        let mut response_bytes = Vec::with_capacity(len_hint.min(INITIAL_CAP) as usize);
         let body_start = Instant::now();
         while let Some(x) = resp.next().await {
             match x {
