@@ -858,6 +858,7 @@ fn main() {
                 get_file(Some(path), uri, headers, arg_tup.clone(), parms)
             }),
         );
+        let app = app.layer(tower_http::catch_panic::CatchPanicLayer::new());
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -2182,7 +2183,9 @@ async fn get_file(
         remote_headers: &reqwest::header::HeaderMap,
     ) {
         for v in remote_headers.get_all(key) {
-            headers.append(key, String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
+            if let Ok(value) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
+                headers.append(key, value);
+            }
         }
     }
     // HTTPバージョンを記録
@@ -2415,7 +2418,9 @@ impl RequestContext {
                 let content_disposition =
                     format!("inline; filename=\"{}\";filename*=UTF-8''{};", name, name);
                 headers.remove(k);
-                headers.append(k, content_disposition.parse().unwrap());
+                if let Ok(value) = content_disposition.parse() {
+                    headers.append(k, value);
+                }
             }
         }
     }

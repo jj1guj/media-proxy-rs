@@ -365,7 +365,7 @@ impl RequestContext {
                     Ok(a) => a,
                     Err(_) => return self.encode_single(),
                 };
-                if !a.is_apng().unwrap() {
+                if !a.is_apng().unwrap_or(false) {
                     return self.encode_single();
                 }
                 match a.apng() {
@@ -419,20 +419,22 @@ impl RequestContext {
                                     .into_response();
                             }
                             let img = if frame.get_layout().is_alpha() {
-                                let image = image::ImageBuffer::from_raw(
+                                let Some(image) = image::ImageBuffer::from_raw(
                                     frame.width(),
                                     frame.height(),
                                     frame.get_image().to_owned(),
-                                )
-                                .expect("ImageBuffer couldn't be created");
+                                ) else {
+                                    continue;
+                                };
                                 image
                             } else {
-                                let image = image::ImageBuffer::from_raw(
+                                let Some(image) = image::ImageBuffer::from_raw(
                                     frame.width(),
                                     frame.height(),
                                     frame.get_image().to_owned(),
-                                )
-                                .expect("ImageBuffer couldn't be created");
+                                ) else {
+                                    continue;
+                                };
                                 DynamicImage::ImageRgb8(image).into_rgba8()
                             };
                             let delay = frame.get_time_ms() - offset;
@@ -506,11 +508,13 @@ impl RequestContext {
                     }
                     let aframe = image_to_frame(&img, timestamp);
                     if let Ok(aframe) = aframe {
-                        let res = encoder.as_mut().unwrap().add_frame(aframe);
-                        if let Err(e) = res {
-                            err = Some(e);
-                        } else {
-                            available_frames += 1;
+                        if let Some(encoder) = encoder.as_mut() {
+                            let res = encoder.add_frame(aframe);
+                            if let Err(e) = res {
+                                err = Some(e);
+                            } else {
+                                available_frames += 1;
+                            }
                         }
                     }
                 } else {
@@ -827,9 +831,12 @@ fn resize(
         algorithm: fast_image_resize::ResizeAlg::Convolution(filter),
         ..Default::default()
     };
-    resizer
+    if resizer
         .resize(&src_image, &mut dst_image, &options)
-        .unwrap();
+        .is_err()
+    {
+        return None;
+    }
     let rgba =
         image::RgbaImage::from_raw(dst_image.width(), dst_image.height(), dst_image.into_vec());
     Some(DynamicImage::ImageRgba8(rgba?))
