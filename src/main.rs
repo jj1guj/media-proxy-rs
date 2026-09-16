@@ -638,7 +638,10 @@ fn main() {
             "connect_timeout_ms >= timeout: リトライの余地がありません"
         );
     }
-    let client = client.build().unwrap();
+    let client = client
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
     let mut fontdb = resvg::usvg::fontdb::Database::new();
     if config.load_system_fonts {
         fontdb.load_system_fonts();
@@ -1275,14 +1278,22 @@ async fn check_url(
         scheme => return Err(format!("scheme: {}", scheme)),
     }
     let host = u.host_str().ok_or_else(|| "no host".to_owned())?;
-    if policy.blocked_hosts.contains(&host.to_lowercase()) {
+    let host = host.to_lowercase();
+    let blocked = policy.blocked_hosts.iter().any(|entry| {
+        if let Some(suffix) = entry.strip_prefix('.') {
+            host.ends_with(&format!(".{}", suffix))
+        } else {
+            host == *entry || host.ends_with(&format!(".{}", entry))
+        }
+    });
+    if blocked {
         return Err("Blocked address".to_owned());
     }
     let port = u
         .port_or_known_default()
         .ok_or_else(|| "no port".to_owned())?;
     // 同期DNS(to_socket_addrs)を廃止し、非同期解決+独自タイムアウトに置き換え。
-    let (ips, dns_cache_hit) = dns_cache.resolve(host, port).await?;
+    let (ips, dns_cache_hit) = dns_cache.resolve(&host, port).await?;
     let mut v4_count: u16 = 0;
     let mut v6_count: u16 = 0;
     for ip in &ips {
@@ -1883,146 +1894,200 @@ async fn get_file(
         t.dl_wait += elapsed;
     }
     let send_start = Instant::now();
-    let build_req = || {
-        let req = client.get(&q.url);
-        let remaining = config
-            .timeout
-            .saturating_sub(send_start.elapsed().as_millis() as u64);
-        let req = req.timeout(Duration::from_millis(remaining.max(1)));
-        let req = req.header("User-Agent", config.user_agent.clone());
-        if let Some(range) = client_headers.get("Range") {
-            req.header("Range", range.as_bytes())
-        } else {
-            req
-        }
-    };
-    let resp = match build_req().send().await {
-        Ok(resp) => {
-            if let Ok(mut t) = timings.lock() {
-                t.ttfb = send_start.elapsed();
-            }
-            resp
-        }
-        Err(e) => {
-            let first_err = classify_reqwest_error(&e);
-            let is_connect_phase = e.is_connect() || e.is_timeout();
-            // 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
-            let remaining_ms = config
+    const MAX_REDIRECTS: u8 = 5;
+    let mut current_url = reqwest::Url::from_str(&q.url).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            headers.clone(),
+            format!("{:?}", e),
+        )
+            .into_response()
+    })?;
+    let mut redirects = 0;
+    let resp = loop {
+        let build_req = || {
+            let req = client.get(current_url.as_str());
+            let remaining = config
                 .timeout
                 .saturating_sub(send_start.elapsed().as_millis() as u64);
-            if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
-                global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
-                match build_req().send().await {
-                    Ok(resp) => {
-                        if let Ok(mut t) = timings.lock() {
-                            t.ttfb = send_start.elapsed();
-                            t.retried = true;
-                        }
-                        resp
-                    }
-                    Err(e2) => {
-                        let fetch_err = classify_reqwest_error(&e2);
-                        let is_fallback = q.fallback.is_some();
-                        if let Ok(mut t) = timings.lock() {
-                            t.ttfb = send_start.elapsed();
-                            t.fetch_err = Some(fetch_err.clone());
-                            t.retried = true;
-                        }
-                        headers.append(
-                            "X-Proxy-Error",
-                            format!("Send:{}", fetch_err)
-                                .parse()
-                                .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
-                        );
-                        // stale-if-error
-                        if !has_range {
-                            if let Some(stale) = response_cache.get_stale(&cache_key) {
-                                let resp = build_stale_response(&stale, &config, &timings);
-                                if let Ok(t) = timings.lock() {
-                                    emit_summary(
-                                        &config,
-                                        &summary,
-                                        &t,
-                                        200,
-                                        true,
-                                        None,
-                                        &global_stats,
-                                    );
-                                }
-                                return Err(resp);
-                            }
-                        }
-                        if let Ok(t) = timings.lock() {
-                            emit_summary(
-                                &config,
-                                &summary,
-                                &t,
-                                if is_fallback { 200 } else { 400 },
-                                true,
-                                Some(&fetch_err),
-                                &global_stats,
-                            );
-                        }
-                        if is_fallback {
-                            headers.append("Cache-Control", "no-store".parse().unwrap());
-                            headers.append("Content-Type", "image/png".parse().unwrap());
-                            return Err((
-                                axum::http::StatusCode::OK,
-                                headers,
-                                (*dummy_img).clone(),
-                            )
-                                .into_response());
-                        }
-                        headers.append("Cache-Control", "no-store".parse().unwrap());
-                        return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
-                    }
-                }
+            let req = req.timeout(Duration::from_millis(remaining.max(1)));
+            let req = req.header("User-Agent", config.user_agent.clone());
+            if let Some(range) = client_headers.get("Range") {
+                req.header("Range", range.as_bytes())
             } else {
-                // リトライ不可(接続段階以外 or 残り時間不足 or Rangeリクエスト)
-                let is_fallback = q.fallback.is_some();
+                req
+            }
+        };
+        let resp = match build_req().send().await {
+            Ok(resp) => {
                 if let Ok(mut t) = timings.lock() {
                     t.ttfb = send_start.elapsed();
-                    t.fetch_err = Some(first_err.clone());
                 }
-                headers.append(
-                    "X-Proxy-Error",
-                    format!("Send:{}", first_err)
-                        .parse()
-                        .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
-                );
-                // stale-if-error
-                if !has_range {
-                    if let Some(stale) = response_cache.get_stale(&cache_key) {
-                        let resp = build_stale_response(&stale, &config, &timings);
-                        if let Ok(t) = timings.lock() {
-                            emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+                resp
+            }
+            Err(e) => {
+                let first_err = classify_reqwest_error(&e);
+                let is_connect_phase = e.is_connect() || e.is_timeout();
+                // 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
+                let remaining_ms = config
+                    .timeout
+                    .saturating_sub(send_start.elapsed().as_millis() as u64);
+                if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
+                    global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
+                    match build_req().send().await {
+                        Ok(resp) => {
+                            if let Ok(mut t) = timings.lock() {
+                                t.ttfb = send_start.elapsed();
+                                t.retried = true;
+                            }
+                            resp
                         }
-                        return Err(resp);
+                        Err(e2) => {
+                            let fetch_err = classify_reqwest_error(&e2);
+                            let is_fallback = q.fallback.is_some();
+                            if let Ok(mut t) = timings.lock() {
+                                t.ttfb = send_start.elapsed();
+                                t.fetch_err = Some(fetch_err.clone());
+                                t.retried = true;
+                            }
+                            headers.append(
+                                "X-Proxy-Error",
+                                format!("Send:{}", fetch_err)
+                                    .parse()
+                                    .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
+                            );
+                            // stale-if-error
+                            if !has_range {
+                                if let Some(stale) = response_cache.get_stale(&cache_key) {
+                                    let resp = build_stale_response(&stale, &config, &timings);
+                                    if let Ok(t) = timings.lock() {
+                                        emit_summary(
+                                            &config,
+                                            &summary,
+                                            &t,
+                                            200,
+                                            true,
+                                            None,
+                                            &global_stats,
+                                        );
+                                    }
+                                    return Err(resp);
+                                }
+                            }
+                            if let Ok(t) = timings.lock() {
+                                emit_summary(
+                                    &config,
+                                    &summary,
+                                    &t,
+                                    if is_fallback { 200 } else { 400 },
+                                    true,
+                                    Some(&fetch_err),
+                                    &global_stats,
+                                );
+                            }
+                            if is_fallback {
+                                headers.append("Cache-Control", "no-store".parse().unwrap());
+                                headers.append("Content-Type", "image/png".parse().unwrap());
+                                return Err((
+                                    axum::http::StatusCode::OK,
+                                    headers,
+                                    (*dummy_img).clone(),
+                                )
+                                    .into_response());
+                            }
+                            headers.append("Cache-Control", "no-store".parse().unwrap());
+                            return Err(
+                                (axum::http::StatusCode::BAD_REQUEST, headers).into_response()
+                            );
+                        }
                     }
-                }
-                if let Ok(t) = timings.lock() {
-                    emit_summary(
-                        &config,
-                        &summary,
-                        &t,
-                        if is_fallback { 200 } else { 400 },
-                        true,
-                        Some(&first_err),
-                        &global_stats,
+                } else {
+                    // リトライ不可(接続段階以外 or 残り時間不足 or Rangeリクエスト)
+                    let is_fallback = q.fallback.is_some();
+                    if let Ok(mut t) = timings.lock() {
+                        t.ttfb = send_start.elapsed();
+                        t.fetch_err = Some(first_err.clone());
+                    }
+                    headers.append(
+                        "X-Proxy-Error",
+                        format!("Send:{}", first_err)
+                            .parse()
+                            .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
                     );
-                }
-                if is_fallback {
+                    // stale-if-error
+                    if !has_range {
+                        if let Some(stale) = response_cache.get_stale(&cache_key) {
+                            let resp = build_stale_response(&stale, &config, &timings);
+                            if let Ok(t) = timings.lock() {
+                                emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+                            }
+                            return Err(resp);
+                        }
+                    }
+                    if let Ok(t) = timings.lock() {
+                        emit_summary(
+                            &config,
+                            &summary,
+                            &t,
+                            if is_fallback { 200 } else { 400 },
+                            true,
+                            Some(&first_err),
+                            &global_stats,
+                        );
+                    }
+                    if is_fallback {
+                        headers.append("Cache-Control", "no-store".parse().unwrap());
+                        headers.append("Content-Type", "image/png".parse().unwrap());
+                        return Err((axum::http::StatusCode::OK, headers, (*dummy_img).clone())
+                            .into_response());
+                    }
                     headers.append("Cache-Control", "no-store".parse().unwrap());
-                    headers.append("Content-Type", "image/png".parse().unwrap());
-                    return Err(
-                        (axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
-                    );
+                    return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
                 }
-                headers.append("Cache-Control", "no-store".parse().unwrap());
+            }
+        };
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+        if redirects >= MAX_REDIRECTS {
+            headers.append("X-Proxy-Error", "TooManyRedirects".parse().unwrap());
+            return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
+        }
+        let Some(location) = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            break resp;
+        };
+        let next_url = current_url.join(location).map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                headers.clone(),
+                format!("{:?}", e),
+            )
+                .into_response()
+        })?;
+        let _ = resp.bytes().await;
+        let check_start = Instant::now();
+        match check_url(&network_policy, &dns_cache, next_url.as_str()).await {
+            Ok((_hit, v4_count, v6_count)) => {
+                if let Ok(mut t) = timings.lock() {
+                    t.check += check_start.elapsed();
+                    t.dns_v4 = t.dns_v4.saturating_add(v4_count);
+                    t.dns_v6 = t.dns_v6.saturating_add(v6_count);
+                }
+            }
+            Err(s) => {
+                if let Ok(value) = s.parse() {
+                    headers.append("X-Proxy-Error", value);
+                }
                 return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
             }
         }
+        current_url = next_url;
+        redirects += 1;
     };
     fn add_remote_header(
         key: &'static str,
