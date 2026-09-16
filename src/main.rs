@@ -1567,6 +1567,7 @@ fn build_stale_response(
     }
     headers.append("Cache-Control", "max-age=300".parse().unwrap());
     headers.append("X-Proxy-Stale", "1".parse().unwrap());
+    headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
     if config.encode_avif {
         headers.append("Vary", "Accept,Range".parse().unwrap());
     }
@@ -1640,6 +1641,7 @@ async fn get_file(
                 t.cache_result = Some(CacheResult::Hit);
             }
             let mut headers = HeaderMap::new();
+            headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
             if let Some(ct) = &cached.content_type {
                 if let Ok(v) = ct.parse() {
                     headers.append("Content-Type", v);
@@ -1696,6 +1698,7 @@ async fn get_file(
             match rx.recv().await {
                 Ok(Some(cached)) => {
                     let mut headers = HeaderMap::new();
+                    headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
                     if let Some(ct) = &cached.content_type {
                         if let Ok(v) = ct.parse() {
                             headers.append("Content-Type", v);
@@ -2051,6 +2054,7 @@ async fn get_file(
         add_remote_header("Accept-Ranges", &mut headers, remote_headers);
     }
     headers.append("Cache-Control", "no-store".parse().unwrap());
+    headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
     for line in config.append_headers.iter() {
         if let Some(idx) = line.find(":") {
             if idx + 1 >= line.len() {
@@ -2362,12 +2366,25 @@ impl RequestContext {
                 );
                 return Err(self.response_img(img));
             } else {
-                return Err((
-                    axum::http::StatusCode::OK,
-                    self.headers.clone(),
-                    self.src_bytes.clone(),
-                )
-                    .into_response());
+                self.headers.remove("Content-Type");
+                self.headers.remove("Content-Length");
+                self.headers.remove("Content-Range");
+                self.headers.remove("Accept-Ranges");
+                if self.parms.fallback.is_some() {
+                    self.headers
+                        .append("Content-Type", "image/png".parse().unwrap());
+                    return Err((
+                        axum::http::StatusCode::OK,
+                        self.headers.clone(),
+                        (*self.dummy_img).clone(),
+                    )
+                        .into_response());
+                }
+                self.headers
+                    .append("X-Proxy-Error", "SvgEncodeError".parse().unwrap());
+                return Err(
+                    (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+                );
             }
         } else if is_img || self.codec.is_ok() {
             self.headers.remove("Content-Length");
