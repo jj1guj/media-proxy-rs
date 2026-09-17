@@ -3,52 +3,77 @@ use std::sync::Arc;
 use image::{DynamicImage, ImageBuffer};
 use resvg::usvg;
 
-use crate::{Phase, RequestContext};
-
-impl RequestContext {
-    pub(crate) fn encode_svg(
-        &self,
-        fontdb: Arc<usvg::fontdb::Database>,
-    ) -> Result<DynamicImage, ()> {
-        let _dg = self.phase_guard(Phase::Decode);
-        let mut options = usvg::Options {
-            fontdb: fontdb.clone(),
-            ..Default::default()
-        };
-        for f in fontdb.faces() {
-            if let Some((name, _)) = f.families.first() {
-                //デフォルトフォントに存在する事が確実なフォントを使う
-                options.font_family = name.to_owned();
-                break;
-            }
-        }
-        let tree = usvg::Tree::from_data(&self.src_bytes, &options);
-        let tree = match tree {
-            Ok(t) => t,
-            Err(_) => return Err(()),
-        };
-        let size = size(&tree);
-        let hint = self.image_size_hint();
-
-        let (width, height, scale) =
-            if size.width() > hint.0 as f32 || size.height() > hint.1 as f32 {
-                let scale = f32::min(hint.0 as f32 / size.width(), hint.1 as f32 / size.height());
-                let width = std::cmp::max((size.width() * scale).round() as u32, 1);
-                let height = std::cmp::max((size.height() * scale).round() as u32, 1);
-                (width, height, scale)
-            } else {
-                (size.width() as u32, size.height() as u32, 1f32)
-            };
-        let tf = usvg::Transform::from_scale(scale, scale);
-        let mut rgba = vec![0; (width * height * 4) as usize];
-        let mut pxmap = resvg::tiny_skia::PixmapMut::from_bytes(&mut rgba, width, height).unwrap();
-        resvg::render(&tree, tf, &mut pxmap);
-        match ImageBuffer::from_vec(width, height, rgba) {
-            Some(img) => Ok(DynamicImage::ImageRgba8(img)),
-            None => Err(()),
-        }
+fn image_href_resolver() -> usvg::ImageHrefResolver<'static> {
+    usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_, _| None),
     }
 }
+
+pub(crate) fn render_svg(
+    src_bytes: &[u8],
+    fontdb: Arc<usvg::fontdb::Database>,
+    size_hint: (u32, u32),
+    max_decode_pixels: u64,
+) -> Result<DynamicImage, ()> {
+    let mut options = usvg::Options {
+        fontdb: fontdb.clone(),
+        image_href_resolver: image_href_resolver(),
+        ..Default::default()
+    };
+    for f in fontdb.faces() {
+        if let Some((name, _)) = f.families.first() {
+            options.font_family = name.to_owned();
+            break;
+        }
+    }
+    let tree = usvg::Tree::from_data(src_bytes, &options).map_err(|_| ())?;
+    let size = size(&tree);
+    let (width, height, scale) =
+        if size.width() > size_hint.0 as f32 || size.height() > size_hint.1 as f32 {
+            let scale = f32::min(
+                size_hint.0 as f32 / size.width(),
+                size_hint.1 as f32 / size.height(),
+            );
+            let width = std::cmp::max((size.width() * scale).round() as u32, 1);
+            let height = std::cmp::max((size.height() * scale).round() as u32, 1);
+            (width, height, scale)
+        } else {
+            (size.width() as u32, size.height() as u32, 1f32)
+        };
+    let pixels = (width as u64).checked_mul(height as u64).ok_or(())?;
+    if pixels > max_decode_pixels {
+        return Err(());
+    }
+    let len = pixels
+        .checked_mul(4)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or(())?;
+    let mut rgba = vec![0; len];
+    let mut pxmap = resvg::tiny_skia::PixmapMut::from_bytes(&mut rgba, width, height).ok_or(())?;
+    let transform = usvg::Transform::from_scale(scale, scale);
+    resvg::render(&tree, transform, &mut pxmap);
+    ImageBuffer::from_vec(width, height, rgba)
+        .map(DynamicImage::ImageRgba8)
+        .ok_or(())
+}
+
+pub(crate) async fn render_svg_blocking(
+    src_bytes: Vec<u8>,
+    fontdb: Arc<usvg::fontdb::Database>,
+    size_hint: (u32, u32),
+    max_decode_pixels: u64,
+    timeout_ms: u64,
+) -> Result<DynamicImage, ()> {
+    let task = tokio::task::spawn_blocking(move || {
+        render_svg(&src_bytes, fontdb, size_hint, max_decode_pixels)
+    });
+    match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.max(1)), task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => Err(()),
+    }
+}
+
 fn size(tree: &usvg::Tree) -> usvg::Size {
     let bb = tree.root().bounding_box();
     if bb.width() > tree.size().width() || bb.height() > tree.size().height() {

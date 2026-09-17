@@ -2355,7 +2355,21 @@ impl RequestContext {
                 t.wait += elapsed;
                 t.cpu_wait += elapsed;
             }
-            if let Ok(img) = self.encode_svg(self.fontdb.clone()) {
+            let _decode_guard = self.phase_guard(Phase::Decode);
+            let src_bytes = std::mem::take(&mut self.src_bytes);
+            let fontdb = self.fontdb.clone();
+            let size_hint = self.image_size_hint();
+            let max_decode_pixels = (self.config.max_size / 4).max(1);
+            let timeout_ms = self.config.timeout;
+            if let Ok(img) = crate::svg::render_svg_blocking(
+                src_bytes,
+                fontdb,
+                size_hint,
+                max_decode_pixels,
+                timeout_ms,
+            )
+            .await
+            {
                 self.headers.remove("Content-Length");
                 self.headers.remove("Content-Range");
                 self.headers.remove("Accept-Ranges");
