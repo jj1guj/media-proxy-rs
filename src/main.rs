@@ -629,7 +629,7 @@ fn main() {
             tracing::warn!(
                 "プロキシ利用時は接続先に対するSSRF再検証が適用されません。プロキシ側で同等のSSRF対策を行ってください"
             );
-            client.proxy(reqwest::Proxy::http(url).unwrap())
+            client.proxy(reqwest::Proxy::all(url).unwrap())
         }
         None => client,
     };
@@ -2655,7 +2655,7 @@ impl RequestContext {
             // CPU permit を取得してからエンコード
             let cpu_sem = self.encode_semaphore.clone();
             let wait_start = Instant::now();
-            let _cpu_permit = cpu_sem.acquire().await.map_err(|_| {
+            let cpu_permit = cpu_sem.clone().acquire_owned().await.map_err(|_| {
                 header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
                 (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
             })?;
@@ -2666,21 +2666,41 @@ impl RequestContext {
                 t.wait += elapsed;
                 t.cpu_wait += elapsed;
             }
+            let timeout_ms = self.config.timeout;
             let mut handle = self;
-            let resp = if let Ok(resp) = tokio::runtime::Handle::current()
-                .spawn_blocking(move || handle.encode_img())
-                .await
+            let task = tokio::runtime::Handle::current().spawn_blocking(move || {
+                let _cpu_permit = cpu_permit;
+                handle.encode_img()
+            });
+            let abort_handle = task.abort_handle();
+            let resp = match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms.max(1)),
+                task,
+            )
+            .await
             {
-                resp
-            } else {
-                header.append("X-Proxy-Error", "ImageEncodeThread".parse().unwrap());
-                return Err(if is_fallback {
-                    header.remove("Content-Type");
-                    header.append("Content-Type", "image/png".parse().unwrap());
-                    (axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
-                } else {
-                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, header).into_response()
-                });
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => {
+                    header.append("X-Proxy-Error", "ImageEncodeThread".parse().unwrap());
+                    return Err(if is_fallback {
+                        header.remove("Content-Type");
+                        header.append("Content-Type", "image/png".parse().unwrap());
+                        (axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
+                    } else {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, header).into_response()
+                    });
+                }
+                Err(_) => {
+                    abort_handle.abort();
+                    header.append("X-Proxy-Error", "ImageEncodeTimeout".parse().unwrap());
+                    return Err(if is_fallback {
+                        header.remove("Content-Type");
+                        header.append("Content-Type", "image/png".parse().unwrap());
+                        (axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
+                    } else {
+                        (axum::http::StatusCode::GATEWAY_TIMEOUT, header).into_response()
+                    });
+                }
             };
             if is_fallback {
                 return Err(if resp.status() == axum::http::StatusCode::OK {
