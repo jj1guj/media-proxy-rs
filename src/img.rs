@@ -23,6 +23,47 @@ pub(crate) fn dimensions_allowed_for(max_decode_pixels: u64, width: u64, height:
         .is_some_and(|pixels| pixels <= max_decode_pixels)
 }
 
+fn le24(bytes: &[u8]) -> u32 {
+    (bytes[0] as u32) | ((bytes[1] as u32) << 8) | ((bytes[2] as u32) << 16)
+}
+
+fn webp_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), String> {
+    const FRAMES_LIMIT: u64 = 1000;
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return Ok(());
+    }
+    let mut offset = 12usize;
+    let mut frames = 0u64;
+    let mut pixels = 0u64;
+    while offset + 8 <= data.len() {
+        let fourcc = &data[offset..offset + 4];
+        let size = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]) as usize;
+        let body = offset + 8;
+        if body.checked_add(size).map_or(true, |end| end > data.len()) {
+            break;
+        }
+        if fourcc == b"ANMF" && size >= 16 {
+            let width = 1 + le24(&data[body + 6..body + 9]);
+            let height = 1 + le24(&data[body + 9..body + 12]);
+            frames += 1;
+            pixels = pixels.saturating_add((width as u64).saturating_mul(height as u64));
+            if frames > FRAMES_LIMIT {
+                return Err(format!("FramesLimit {}>{}", frames, FRAMES_LIMIT));
+            }
+            if pixels > max_decode_pixels {
+                return Err(format!("DecodePixels {}>{}", pixels, max_decode_pixels));
+            }
+        }
+        offset = body + size + (size & 1);
+    }
+    Ok(())
+}
+
 impl RequestContext {
     pub(crate) fn image_size_hint(&self) -> (u32, u32) {
         if self.parms.badge.is_some() {
@@ -348,12 +389,27 @@ impl RequestContext {
                     Err(_) => return self.encode_single(),
                 };
                 if a.has_animation() {
+                    let max_decode_pixels = (self.config.max_size / 4).max(1);
+                    if let Err(e) = webp_animation_within_budget(&self.src_bytes, max_decode_pixels)
+                    {
+                        self.headers
+                            .append("X-Proxy-Error", format!("WebPAnim {}", e).parse().unwrap());
+                        return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                            .into_response();
+                    }
                     let decoder = webp::AnimDecoder::new(&self.src_bytes);
                     if let Ok(mut dec) = decoder.decode() {
                         let mut offset = 0;
                         let mut frames = vec![];
                         dec.sort_by_time_stamp();
                         for frame in dec.into_iter() {
+                            if frames.len() >= 1000 {
+                                let mut headers = self.headers.clone();
+                                headers
+                                    .append("X-Proxy-Error", "FramesLimit 1000".parse().unwrap());
+                                return (axum::http::StatusCode::BAD_GATEWAY, headers)
+                                    .into_response();
+                            }
                             let img = if frame.get_layout().is_alpha() {
                                 let image = image::ImageBuffer::from_raw(
                                     frame.width(),
