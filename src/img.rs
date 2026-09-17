@@ -3,6 +3,26 @@ use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
 
 use crate::{Phase, RequestContext};
 
+pub(crate) fn probe_dimensions(src: &[u8]) -> Option<(u32, u32)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(src))
+        .with_guessed_format()
+        .ok()?;
+    reader.into_dimensions().ok()
+}
+
+pub(crate) fn dimensions_allowed_for(max_decode_pixels: u64, width: u64, height: u64) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    const MAX_SIDE: u64 = 32768;
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return false;
+    }
+    width
+        .checked_mul(height)
+        .is_some_and(|pixels| pixels <= max_decode_pixels)
+}
+
 impl RequestContext {
     pub(crate) fn image_size_hint(&self) -> (u32, u32) {
         if self.parms.badge.is_some() {

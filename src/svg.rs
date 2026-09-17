@@ -3,9 +3,21 @@ use std::sync::Arc;
 use image::{DynamicImage, ImageBuffer};
 use resvg::usvg;
 
-fn image_href_resolver() -> usvg::ImageHrefResolver<'static> {
+fn image_href_resolver(max_decode_pixels: u64) -> usvg::ImageHrefResolver<'static> {
+    let resolve_data = usvg::ImageHrefResolver::default_data_resolver();
     usvg::ImageHrefResolver {
-        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_data: Box::new(move |mime, data, options| {
+            if let Some((width, height)) = crate::img::probe_dimensions(&data[..]) {
+                if !crate::img::dimensions_allowed_for(
+                    max_decode_pixels,
+                    width as u64,
+                    height as u64,
+                ) {
+                    return None;
+                }
+            }
+            resolve_data(mime, data, options)
+        }),
         resolve_string: Box::new(|_, _| None),
     }
 }
@@ -18,7 +30,7 @@ pub(crate) fn render_svg(
 ) -> Result<DynamicImage, ()> {
     let mut options = usvg::Options {
         fontdb: fontdb.clone(),
-        image_href_resolver: image_href_resolver(),
+        image_href_resolver: image_href_resolver(max_decode_pixels),
         ..Default::default()
     };
     for f in fontdb.faces() {
