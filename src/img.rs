@@ -155,7 +155,64 @@ impl RequestContext{
 							}
 						};
 						return self.response_img(img);
-					}
+					},
+					Some(Ok("application/pdf"))=> {
+						fn decode_pdf(src_bytes: &[u8]) -> Result<DynamicImage, String> {
+							use hayro::hayro_interpret::InterpreterSettings;
+							use hayro::hayro_syntax::Pdf;
+							use hayro::{render, RenderCache, RenderSettings};
+
+							const MAX_RENDER_DIMENSION: f32 = 2000.0;
+
+							let pdf=Pdf::new(src_bytes.to_vec()).map_err(|e|format!("{e:?}"))?;
+							let page=pdf.pages().first().ok_or("PDF has no pages")?;
+
+							let (width,height)=page.render_dimensions();
+							let longest=width.max(height);
+
+							if !longest.is_finite()||longest<=0.0{
+								return Err("Invalid PDF page dimensions".to_owned());
+							}
+
+							let scale=(MAX_RENDER_DIMENSION/longest).min(1.0);
+							let settings=RenderSettings{
+								x_scale:scale,
+								y_scale:scale,
+								..Default::default()
+							};
+
+							let cache=RenderCache::new();
+							let interpreter_settings=InterpreterSettings::default();
+							let pixmap=render(page,&cache,&interpreter_settings,&settings);
+							let width = pixmap.width() as u32;
+							let height = pixmap.height() as u32;
+							let rgba = pixmap.take_unpremultiplied()
+								.into_iter()
+								.flat_map(|pixel|pixel.to_u8_array())
+								.collect::<Vec<u8>>();
+
+							let image=image::RgbaImage::from_raw(
+								width,
+								height,
+								rgba,
+							).ok_or("Invalid PDF pixel buffer")?;
+
+							Ok(DynamicImage::ImageRgba8(image))
+						}
+
+						let img = {
+							let _dg = self.phase_guard(Phase::Decode);
+							decode_pdf(&self.src_bytes)
+						};
+
+						match img {
+							Ok(img) => return self.response_img(img),
+							Err(e) => {
+								self.headers.append("X-Proxy-Error", format!("PDF Error:{:?}", e).parse().unwrap());
+								return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+							}
+						}
+					},
 					_=>{
 						self.headers.append("X-Proxy-Error",format!("CodecError:{:?}",e).parse().unwrap());
 						return (axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response();
