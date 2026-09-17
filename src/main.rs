@@ -828,6 +828,10 @@ fn main() {
         let http_addr: SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
         let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
         let app = Router::new();
+        let app = app.route(
+            "/healthz",
+            axum::routing::get(|| async { (axum::http::StatusCode::OK, "ok") }),
+        );
         let arg_tup0 = arg_tup.clone();
         let app = app.route(
             "/",
