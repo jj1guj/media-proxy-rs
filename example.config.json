@@ -22,6 +22,7 @@
   "dns_negative_ttl_secs": 10,
   "dns_timeout_ms": 4000,
   "dns_ttl_secs": 300,
+  "dns_cache_max_entries": 1024,
   "jpeg_quality": 85,
   "webp_method": 4,
   "max_concurrent_downloads": 24,

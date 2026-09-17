@@ -156,6 +156,9 @@ pub struct ConfigFile{
 	/// DNSキャッシュのTTL(秒、既定300)。
 	#[serde(default = "default_dns_ttl_secs")]
 	dns_ttl_secs:u64,
+	/// DNSキャッシュの最大エントリ数(既定1024)。
+	#[serde(default = "default_dns_cache_max_entries")]
+	dns_cache_max_entries:usize,
 	/// JPEG出力用の品質(0-100、既定85)。webp_qualityの流用をやめる。
 	#[serde(default = "default_jpeg_quality")]
 	jpeg_quality:i32,
@@ -190,6 +193,7 @@ fn default_passthrough_max_bytes()->u64{1024*1024}
 fn default_dns_negative_ttl_secs()->u64{10}
 fn default_dns_timeout_ms()->u64{4000}
 fn default_dns_ttl_secs()->u64{300}
+fn default_dns_cache_max_entries()->usize{1024}
 fn default_jpeg_quality()->i32{85}
 fn default_webp_method()->i32{4}
 fn default_max_concurrent_downloads()->usize{24}
@@ -307,6 +311,7 @@ fn main() {
 			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
 			dns_timeout_ms:default_dns_timeout_ms(),
 			dns_ttl_secs:default_dns_ttl_secs(),
+			dns_cache_max_entries:default_dns_cache_max_entries(),
 			jpeg_quality:default_jpeg_quality(),
 			webp_method:default_webp_method(),
 			max_concurrent_downloads:default_max_concurrent_downloads(),
@@ -355,7 +360,7 @@ fn main() {
 		Duration::from_secs(config.dns_ttl_secs),
 		Duration::from_secs(config.dns_negative_ttl_secs),
 		Duration::from_millis(config.dns_timeout_ms),
-		DNS_CACHE_MAX_ENTRIES,
+		config.dns_cache_max_entries,
 	));
 	let rt=tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
 	let client=reqwest::ClientBuilder::new();
@@ -468,8 +473,6 @@ fn main() {
 		axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
 	});
 }
-/// DNSキャッシュの最大エントリ数(無制限成長の防止)。
-const DNS_CACHE_MAX_ENTRIES: usize = 1024;
 /// タイムアウト由来のネガティブキャッシュの短いTTL。
 const DNS_TIMEOUT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
 /// stale-while-error の上限倍率(元TTLのこの倍までstaleエントリを使う)。
@@ -1840,6 +1843,7 @@ mod network_policy_tests{
 			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
 			dns_timeout_ms:default_dns_timeout_ms(),
 			dns_ttl_secs:default_dns_ttl_secs(),
+			dns_cache_max_entries:default_dns_cache_max_entries(),
 			jpeg_quality:default_jpeg_quality(),
 			webp_method:default_webp_method(),
 			max_concurrent_downloads:default_max_concurrent_downloads(),
@@ -1848,6 +1852,13 @@ mod network_policy_tests{
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 			cache_stale_max_secs:default_cache_stale_max_secs(),
 		}
+	}
+	#[test]
+	fn dns_cache_max_entries_defaults_for_existing_config(){
+		let mut value=serde_json::to_value(base_config()).unwrap();
+		value.as_object_mut().unwrap().remove("dns_cache_max_entries");
+		let config:ConfigFile=serde_json::from_value(value).unwrap();
+		assert_eq!(config.dns_cache_max_entries,1024);
 	}
 	#[test]
 	fn parse_valid_config(){

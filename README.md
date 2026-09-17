@@ -109,6 +109,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `dns_negative_ttl_secs` | u64 | `10` | DNS解決失敗のネガティブキャッシュTTL(秒) |
 | `dns_timeout_ms` | u64 | `4000` | DNS解決のタイムアウト(ms)。タイムアウト時は1回リトライ |
 | `dns_ttl_secs` | u64 | `300` | DNSキャッシュのTTL(秒) |
+| `dns_cache_max_entries` | usize | `1024` | DNSキャッシュの最大エントリ数 |
 | `max_concurrent_downloads` | usize | `24` | ダウンロードの最大同時接続数 |
 | `inflight_buffer_budget_bytes` | u64 | `268435456` (256MB) | 同時ダウンロードの合計バイト予算 |
 | `connect_timeout_ms` | u64 | `3000` | TCP接続タイムアウト(ms)。`timeout`より小さく設定すること |
@@ -127,6 +128,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 - **`cache_entry_max_bytes`: 3MB** — 大きなアニメGIF等のキャッシュを抑制
 - **`webp_quality`: 70** / **`jpeg_quality`: 80** — やや品質を下げてエンコード時間を短縮
 - **`slow_log_ms`: 100** — Pi上では処理が遅いため、ログ降格閾値を緩める
+- **`dns_cache_max_entries`: 4096** — 多数の連合先ホストを保持し、DNSキャッシュの回転を抑える
 - **`max_concurrent_downloads`: 16** — メモリ4GBに合わせて制限
 - **`inflight_buffer_budget_bytes`: 128MB** — メモリ4GBに合わせて半減
 
