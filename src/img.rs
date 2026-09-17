@@ -27,14 +27,15 @@ fn le24(bytes: &[u8]) -> u32 {
     (bytes[0] as u32) | ((bytes[1] as u32) << 8) | ((bytes[2] as u32) << 16)
 }
 
+pub(crate) const ANIMATION_FRAMES_LIMIT: u64 = 1000;
+
 fn webp_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), String> {
-    const FRAMES_LIMIT: u64 = 1000;
     if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
         return Ok(());
     }
     let mut offset = 12usize;
+    let mut canvas_pixels = None;
     let mut frames = 0u64;
-    let mut pixels = 0u64;
     while offset + 8 <= data.len() {
         let fourcc = &data[offset..offset + 4];
         let size = u32::from_le_bytes([
@@ -47,16 +48,19 @@ fn webp_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(
         if body.checked_add(size).map_or(true, |end| end > data.len()) {
             break;
         }
+        if fourcc == b"VP8X" && size >= 10 {
+            let width = 1u64 + le24(&data[body + 4..body + 7]) as u64;
+            let height = 1u64 + le24(&data[body + 7..body + 10]) as u64;
+            canvas_pixels = Some(width.saturating_mul(height));
+        }
         if fourcc == b"ANMF" && size >= 16 {
-            let width = 1 + le24(&data[body + 6..body + 9]);
-            let height = 1 + le24(&data[body + 9..body + 12]);
             frames += 1;
-            pixels = pixels.saturating_add((width as u64).saturating_mul(height as u64));
-            if frames > FRAMES_LIMIT {
-                return Err(format!("FramesLimit {}>{}", frames, FRAMES_LIMIT));
+            if frames > ANIMATION_FRAMES_LIMIT {
+                return Err(format!("FramesLimit {}>{}", frames, ANIMATION_FRAMES_LIMIT));
             }
-            if pixels > max_decode_pixels {
-                return Err(format!("DecodePixels {}>{}", pixels, max_decode_pixels));
+            let total = canvas_pixels.unwrap_or(u64::MAX).saturating_mul(frames);
+            if total > max_decode_pixels {
+                return Err(format!("DecodePixels {}>{}", total, max_decode_pixels));
             }
         }
         offset = body + size + (size & 1);
@@ -403,10 +407,14 @@ impl RequestContext {
                         let mut frames = vec![];
                         dec.sort_by_time_stamp();
                         for frame in dec.into_iter() {
-                            if frames.len() >= 1000 {
+                            if frames.len() >= ANIMATION_FRAMES_LIMIT as usize {
                                 let mut headers = self.headers.clone();
-                                headers
-                                    .append("X-Proxy-Error", "FramesLimit 1000".parse().unwrap());
+                                headers.append(
+                                    "X-Proxy-Error",
+                                    format!("FramesLimit {}", ANIMATION_FRAMES_LIMIT)
+                                        .parse()
+                                        .unwrap(),
+                                );
                                 return (axum::http::StatusCode::BAD_GATEWAY, headers)
                                     .into_response();
                             }
@@ -460,7 +468,7 @@ impl RequestContext {
         let mut err = None;
         {
             let mut timestamp = 0;
-            const FRAMES_LIMIT: u32 = 1000;
+            const FRAMES_LIMIT: u32 = ANIMATION_FRAMES_LIMIT as u32;
             let mut allow_frames = FRAMES_LIMIT;
             for frame in frames {
                 allow_frames -= 1;
