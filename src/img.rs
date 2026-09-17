@@ -129,6 +129,7 @@ impl RequestContext{
 						let decode_options = heic_rs::DecodeOptions {
 							max_pixels: Some(64 * 1024 * 1024),
 							threads: Some(1),
+							layout: heic_rs::PixelLayout::Rgba8,
 							..Default::default()
 						};
 						let decoded_img = heic_rs::decode(&self.src_bytes, &decode_options);
