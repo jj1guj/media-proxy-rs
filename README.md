@@ -85,6 +85,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 - JPEG 2000(openjp2)
 - JPEG XR(jxrlib)
 - HEIC
+- PDF
 
 ## 設定項目一覧
 
