@@ -625,7 +625,12 @@ fn main() {
         .unwrap();
     let client = reqwest::ClientBuilder::new();
     let client = match &config.proxy {
-        Some(url) => client.proxy(reqwest::Proxy::http(url).unwrap()),
+        Some(url) => {
+            tracing::warn!(
+                "プロキシ利用時は接続先に対するSSRF再検証が適用されません。プロキシ側で同等のSSRF対策を行ってください"
+            );
+            client.proxy(reqwest::Proxy::http(url).unwrap())
+        }
         None => client,
     };
     // reqwestのDNS解決をDnsCacheに一本化する。

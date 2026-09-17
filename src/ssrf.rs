@@ -11,6 +11,11 @@
 //! `reqwest::dns::Resolve` implementation for every hostname connect (IP
 //! literals skip DNS entirely, so they cannot be rebound), which makes the
 //! pre-check vs connect resolutions a non-issue.
+//!
+//! Caveat: when `config.proxy` is set, the proxy resolves and connects to the
+//! target. This resolver sees only the proxy host, so only the independent URL
+//! pre-check protects the target from SSRF. The proxy must enforce an equivalent
+//! policy to close the DNS-rebinding TOCTOU in that configuration.
 
 use std::sync::Arc;
 
@@ -58,6 +63,8 @@ impl reqwest::dns::Resolve for ValidatingResolver {
                 .resolve(&host, 0)
                 .await
                 .map_err(|error| -> BoxError { error.into() })?;
+            // The proxy itself is not a fetch target. This bypass also means the
+            // target is outside connect-time validation when proxying is enabled.
             let is_proxy = proxy_host
                 .as_ref()
                 .is_some_and(|proxy_host| NetworkPolicy::normalize_host(&host) == *proxy_host);
