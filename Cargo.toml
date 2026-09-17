@@ -40,7 +40,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = "2"
 sha2 = "0.10"
-heic-rs = "0.1.1"
+heic-rs = { version = "0.1.1", default-features = false }
 
 [profile.release]
 strip = true
