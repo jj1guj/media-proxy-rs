@@ -133,11 +133,19 @@ impl RequestContext{
 						};
 						let decoded_img = heic_rs::decode(&self.src_bytes, &decode_options);
 						let img = match decoded_img {
-							Ok(img) => match image::RgbImage::from_raw(img.width, img.height, img.data) {
-								Some(img) => DynamicImage::ImageRgb8(img),
-								None => {
-									self.headers.append("X-Proxy-Error", "Invalid HEIC pixel buffer".parse().unwrap());
-									return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+							Ok(img) => {
+								let buf = match img.layout {
+									heic_rs::PixelLayout::Rgba8 => image::RgbaImage::from_raw(img.width, img.height, img.data)
+										.map(DynamicImage::ImageRgba8),
+									_ => image::RgbImage::from_raw(img.width, img.height, img.data)
+										.map(DynamicImage::ImageRgb8),
+								};
+								match buf {
+									Some(img) => img,
+									None => {
+										self.headers.append("X-Proxy-Error", "Invalid HEIC pixel buffer".parse().unwrap());
+										return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+									}
 								}
 							},
 							Err(e) => {
