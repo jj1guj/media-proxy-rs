@@ -2139,7 +2139,16 @@ async fn get_file(
             )
                 .into_response()
         })?;
-        let _ = resp.bytes().await;
+        const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
+        let mut stream = resp.bytes_stream();
+        let mut drained = 0;
+        while let Some(Ok(chunk)) = stream.next().await {
+            drained += chunk.len();
+            if drained >= MAX_REDIRECT_DRAIN {
+                break;
+            }
+        }
+        drop(stream);
         let check_start = Instant::now();
         match check_url(&network_policy, &dns_cache, next_url.as_str()).await {
             Ok((_hit, v4_count, v6_count)) => {
