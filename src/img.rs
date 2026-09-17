@@ -154,10 +154,13 @@ impl RequestContext {
                         ) {
                             Ok(decoder) => decoder,
                             Err(error) => {
-                                self.headers.append(
-                                    "X-Proxy-Error",
-                                    format!("JpegXL Error:{:?}", error).parse().unwrap(),
-                                );
+                                let value = reqwest::header::HeaderValue::from_bytes(
+                                    format!("JpegXL Error:{:?}", error).as_bytes(),
+                                )
+                                .unwrap_or_else(|_| {
+                                    reqwest::header::HeaderValue::from_static("JpegXLError")
+                                });
+                                self.headers.append("X-Proxy-Error", value);
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
                             }
@@ -173,10 +176,13 @@ impl RequestContext {
                         let img = match img {
                             Ok(img) => img,
                             Err(e) => {
-                                self.headers.append(
-                                    "X-Proxy-Error",
-                                    format!("JpegXL Error:{:?}", e).parse().unwrap(),
-                                );
+                                let value = reqwest::header::HeaderValue::from_bytes(
+                                    format!("JpegXL Error:{:?}", e).as_bytes(),
+                                )
+                                .unwrap_or_else(|_| {
+                                    reqwest::header::HeaderValue::from_static("JpegXLError")
+                                });
+                                self.headers.append("X-Proxy-Error", value);
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
                             }

@@ -629,7 +629,14 @@ fn main() {
             tracing::warn!(
                 "プロキシ利用時は接続先に対するSSRF再検証が適用されません。プロキシ側で同等のSSRF対策を行ってください"
             );
-            client.proxy(reqwest::Proxy::all(url).unwrap())
+            let proxy = match reqwest::Proxy::all(url) {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    tracing::error!(proxy = ?url, %error, "不正なプロキシ設定");
+                    std::process::exit(1);
+                }
+            };
+            client.proxy(proxy)
         }
         None => client,
     };
@@ -870,6 +877,7 @@ fn main() {
 }
 /// タイムアウト由来のネガティブキャッシュの短いTTL。
 const DNS_TIMEOUT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
+const RESOURCE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// stale-while-error の上限倍率(元TTLのこの倍までstaleエントリを使う)。
 const DNS_STALE_FACTOR: u32 = 10;
 
@@ -1959,15 +1967,19 @@ async fn get_file(
 
     // --- ダウンロードpermit取得(取得順序: DL permit → バイト予算 → CPU permit) ---
     let wait_start = Instant::now();
-    let dl_permit = download_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| {
+    let dl_permit = match tokio::time::timeout(
+        RESOURCE_WAIT_TIMEOUT,
+        download_semaphore.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
             let mut h = HeaderMap::new();
             h.append("X-Proxy-Error", "DownloadSemaphoreError".parse().unwrap());
-            (axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
-        })?;
+            return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
+        }
+    };
     global_stats.observe_dl_active(
         config.max_concurrent_downloads - download_semaphore.available_permits(),
     );
@@ -2509,11 +2521,19 @@ impl RequestContext {
             let budget_bytes = 8 * 1024 * 1024_u32;
             let budget_sem = self.buffer_budget.clone();
             let wait_start = Instant::now();
-            let _budget_permit = budget_sem.acquire_many(budget_bytes).await.map_err(|_| {
-                let mut h = self.headers.clone();
-                h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
-            })?;
+            let _budget_permit = match tokio::time::timeout(
+                RESOURCE_WAIT_TIMEOUT,
+                budget_sem.acquire_many(budget_bytes),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    let mut h = self.headers.clone();
+                    h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
+                    return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
+                }
+            };
             self.global_stats.observe_buf_used(
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
@@ -2525,11 +2545,16 @@ impl RequestContext {
                                          // CPU permit を取得してエンコード
             let cpu_sem = self.encode_semaphore.clone();
             let wait_start = Instant::now();
-            let _cpu_permit = cpu_sem.acquire().await.map_err(|_| {
-                let mut h = self.headers.clone();
-                h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
-            })?;
+            let _cpu_permit = match tokio::time::timeout(RESOURCE_WAIT_TIMEOUT, cpu_sem.acquire())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    let mut h = self.headers.clone();
+                    h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
+                    return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
+                }
+            };
             self.global_stats
                 .observe_cpu_active(num_cpus::get().max(2) - cpu_sem.available_permits());
             if let Ok(mut t) = self.timings.lock() {
@@ -2594,10 +2619,21 @@ impl RequestContext {
             let budget_bytes = (budget_hint.min(self.config.max_size) as u32).max(1);
             let budget_sem = self.buffer_budget.clone();
             let wait_start = Instant::now();
-            let _budget_permit = budget_sem.acquire_many(budget_bytes).await.map_err(|_| {
-                header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
-            })?;
+            let _budget_permit = match tokio::time::timeout(
+                RESOURCE_WAIT_TIMEOUT,
+                budget_sem.acquire_many(budget_bytes),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
+                    return Err(
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
+                            .into_response(),
+                    );
+                }
+            };
             self.global_stats.observe_buf_used(
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
@@ -2662,10 +2698,19 @@ impl RequestContext {
             // CPU permit を取得してからエンコード
             let cpu_sem = self.encode_semaphore.clone();
             let wait_start = Instant::now();
-            let cpu_permit = cpu_sem.clone().acquire_owned().await.map_err(|_| {
-                header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
-            })?;
+            let cpu_permit =
+                match tokio::time::timeout(RESOURCE_WAIT_TIMEOUT, cpu_sem.clone().acquire_owned())
+                    .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    _ => {
+                        header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
+                        return Err(
+                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
+                                .into_response(),
+                        );
+                    }
+                };
             self.global_stats
                 .observe_cpu_active(num_cpus::get().max(2) - cpu_sem.available_permits());
             if let Ok(mut t) = self.timings.lock() {
