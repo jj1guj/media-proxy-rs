@@ -80,9 +80,14 @@ pub(crate) async fn render_svg_blocking(
     let task = tokio::task::spawn_blocking(move || {
         render_svg(&src_bytes, fontdb, size_hint, max_decode_pixels)
     });
+    let abort_handle = task.abort_handle();
     match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.max(1)), task).await {
         Ok(Ok(result)) => result,
-        Ok(Err(_)) | Err(_) => Err(()),
+        Ok(Err(_)) => Err(()),
+        Err(_) => {
+            abort_handle.abort();
+            Err(())
+        }
     }
 }
 
