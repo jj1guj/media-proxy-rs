@@ -124,6 +124,24 @@ impl RequestContext{
 								return (axum::http::StatusCode::BAD_GATEWAY,self.headers.clone()).into_response();
 							}
 						}
+					},
+					Some(Ok("image/heic"))=> {
+						let decode_options = heic_rs::DecodeOptions::default();
+						let decoded_img = heic_rs::decode(&self.src_bytes, &decode_options);
+						let img = match decoded_img {
+							Ok(img) => match image::RgbImage::from_raw(img.width, img.height, img.data) {
+								Some(img) => DynamicImage::ImageRgb8(img),
+								None => {
+									self.headers.append("X-Proxy-Error", "Invalid HEIC pixel buffer".parse().unwrap());
+									return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+								}
+							},
+							Err(e) => {
+								self.headers.append("X-Proxy-Error", format!("HEIC Error:{:?}", e).parse().unwrap());
+								return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+							}
+						};
+						return self.response_img(img);
 					}
 					_=>{
 						self.headers.append("X-Proxy-Error",format!("CodecError:{:?}",e).parse().unwrap());
