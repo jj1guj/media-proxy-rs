@@ -39,6 +39,7 @@ turbojpeg = { version = "1.4", features = ["image"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = "2"
+sha2 = "0.10"
 
 [profile.release]
 strip = true

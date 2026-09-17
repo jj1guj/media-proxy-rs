@@ -40,6 +40,44 @@ struct GlobalStats {
 	http1_responses: AtomicU64,
 	http2_responses: AtomicU64,
 	cache_stale_served: AtomicU64,
+	upstream_2xx: AtomicU64,
+	upstream_3xx: AtomicU64,
+	upstream_404: AtomicU64,
+	upstream_410: AtomicU64,
+	upstream_429: AtomicU64,
+	upstream_other_4xx: AtomicU64,
+	upstream_5xx: AtomicU64,
+	dl_wait_ms: AtomicU64,
+	dl_wait_max_ms: AtomicU64,
+	cpu_wait_ms: AtomicU64,
+	cpu_wait_max_ms: AtomicU64,
+	ttfb_max_ms: AtomicU64,
+	body_max_ms: AtomicU64,
+	decode_max_ms: AtomicU64,
+	encode_max_ms: AtomicU64,
+	dl_active_max: AtomicU64,
+	cpu_active_max: AtomicU64,
+	buf_used_max_bytes: AtomicU64,
+	perr_upstream_status: AtomicU64,
+	decode_error: AtomicU64,
+	encode_error: AtomicU64,
+	size_reject: AtomicU64,
+	policy_reject: AtomicU64,
+	internal_error: AtomicU64,
+	passthrough_requests: AtomicU64,
+	output_jpeg: AtomicU64,
+	output_png: AtomicU64,
+	output_webp: AtomicU64,
+	output_avif: AtomicU64,
+	output_other: AtomicU64,
+	processed_input_bytes: AtomicU64,
+	processed_output_bytes: AtomicU64,
+	static_requests: AtomicU64,
+	static_hits: AtomicU64,
+	static_misses: AtomicU64,
+	static_joined: AtomicU64,
+	static_cache_insertions: AtomicU64,
+	static_output_bytes: AtomicU64,
 }
 impl GlobalStats {
 	fn new() -> Self {
@@ -59,6 +97,44 @@ impl GlobalStats {
 			http1_responses: AtomicU64::new(0),
 			http2_responses: AtomicU64::new(0),
 			cache_stale_served: AtomicU64::new(0),
+			upstream_2xx: AtomicU64::new(0),
+			upstream_3xx: AtomicU64::new(0),
+			upstream_404: AtomicU64::new(0),
+			upstream_410: AtomicU64::new(0),
+			upstream_429: AtomicU64::new(0),
+			upstream_other_4xx: AtomicU64::new(0),
+			upstream_5xx: AtomicU64::new(0),
+			dl_wait_ms: AtomicU64::new(0),
+			dl_wait_max_ms: AtomicU64::new(0),
+			cpu_wait_ms: AtomicU64::new(0),
+			cpu_wait_max_ms: AtomicU64::new(0),
+			ttfb_max_ms: AtomicU64::new(0),
+			body_max_ms: AtomicU64::new(0),
+			decode_max_ms: AtomicU64::new(0),
+			encode_max_ms: AtomicU64::new(0),
+			dl_active_max: AtomicU64::new(0),
+			cpu_active_max: AtomicU64::new(0),
+			buf_used_max_bytes: AtomicU64::new(0),
+			perr_upstream_status: AtomicU64::new(0),
+			decode_error: AtomicU64::new(0),
+			encode_error: AtomicU64::new(0),
+			size_reject: AtomicU64::new(0),
+			policy_reject: AtomicU64::new(0),
+			internal_error: AtomicU64::new(0),
+			passthrough_requests: AtomicU64::new(0),
+			output_jpeg: AtomicU64::new(0),
+			output_png: AtomicU64::new(0),
+			output_webp: AtomicU64::new(0),
+			output_avif: AtomicU64::new(0),
+			output_other: AtomicU64::new(0),
+			processed_input_bytes: AtomicU64::new(0),
+			processed_output_bytes: AtomicU64::new(0),
+			static_requests: AtomicU64::new(0),
+			static_hits: AtomicU64::new(0),
+			static_misses: AtomicU64::new(0),
+			static_joined: AtomicU64::new(0),
+			static_cache_insertions: AtomicU64::new(0),
+			static_output_bytes: AtomicU64::new(0),
 		}
 	}
 	/// カウンタをリセットし、リセット前の値を返す。
@@ -105,6 +181,87 @@ impl GlobalStats {
 			"body" => { self.ferr_body.fetch_add(1, Ordering::Relaxed); },
 			_ => { self.ferr_other.fetch_add(1, Ordering::Relaxed); },
 		}
+	}
+	fn observe_request(&self, timings:&PhaseTimings, is_static_path:bool) {
+		let dl_wait_ms=timings.dl_wait.as_millis() as u64;
+		let cpu_wait_ms=timings.cpu_wait.as_millis() as u64;
+		self.dl_wait_ms.fetch_add(dl_wait_ms,Ordering::Relaxed);
+		self.dl_wait_max_ms.fetch_max(dl_wait_ms,Ordering::Relaxed);
+		self.cpu_wait_ms.fetch_add(cpu_wait_ms,Ordering::Relaxed);
+		self.cpu_wait_max_ms.fetch_max(cpu_wait_ms,Ordering::Relaxed);
+		self.ttfb_max_ms.fetch_max(timings.ttfb.as_millis() as u64, Ordering::Relaxed);
+		self.body_max_ms.fetch_max(timings.body.as_millis() as u64, Ordering::Relaxed);
+		self.decode_max_ms.fetch_max(timings.decode.as_millis() as u64, Ordering::Relaxed);
+		self.encode_max_ms.fetch_max(timings.encode.as_millis() as u64, Ordering::Relaxed);
+		if timings.passthrough {
+			self.passthrough_requests.fetch_add(1,Ordering::Relaxed);
+		}
+		if is_static_path {
+			self.static_requests.fetch_add(1,Ordering::Relaxed);
+			match timings.cache_result {
+				Some(CacheResult::Hit)=>{ self.static_hits.fetch_add(1,Ordering::Relaxed); },
+				Some(CacheResult::Miss)=>{ self.static_misses.fetch_add(1,Ordering::Relaxed); },
+				Some(CacheResult::Joined)=>{ self.static_joined.fetch_add(1,Ordering::Relaxed); },
+				_=>{},
+			}
+		}
+		if let Some(status)=timings.upstream_status {
+			match status {
+				200..=299=>&self.upstream_2xx,
+				300..=399=>&self.upstream_3xx,
+				404=>&self.upstream_404,
+				410=>&self.upstream_410,
+				429=>&self.upstream_429,
+				400..=499=>&self.upstream_other_4xx,
+				500..=599=>&self.upstream_5xx,
+				_=>return,
+			}.fetch_add(1, Ordering::Relaxed);
+		}
+	}
+	fn observe_dl_active(&self, active:usize) {
+		self.dl_active_max.fetch_max(active as u64, Ordering::Relaxed);
+	}
+	fn observe_cpu_active(&self, active:usize) {
+		self.cpu_active_max.fetch_max(active as u64, Ordering::Relaxed);
+	}
+	fn observe_buf_used(&self, bytes:usize) {
+		self.buf_used_max_bytes.fetch_max(bytes as u64, Ordering::Relaxed);
+	}
+	fn inc_proxy_error(&self, timings:&PhaseTimings, detail:Option<&str>) {
+		if timings.fetch_err.is_some() {
+			return;
+		}
+		let detail=detail.unwrap_or_default().to_ascii_lowercase();
+		let counter=if detail.starts_with("status:") {
+			&self.perr_upstream_status
+		}else if detail.contains("decode") || detail.contains("unknown format") {
+			&self.decode_error
+		}else if detail.contains("encode") || detail.contains("cpusemaphore") {
+			&self.encode_error
+		}else if detail.contains("length") || detail.contains("bufferbudget") {
+			&self.size_reject
+		}else if detail.contains("blocked") || detail.contains("private") || detail.contains("loopback") || detail.starts_with("scheme:") || detail=="no host" || detail=="no port" {
+			&self.policy_reject
+		}else{
+			&self.internal_error
+		};
+		counter.fetch_add(1, Ordering::Relaxed);
+	}
+	fn record_processed_output(&self,content_type:Option<&str>,input_bytes:usize,output_bytes:usize){
+		let counter=match content_type.unwrap_or_default().split(';').next().unwrap_or_default().trim(){
+			"image/jpeg"=>&self.output_jpeg,
+			"image/png"=>&self.output_png,
+			"image/webp"=>&self.output_webp,
+			"image/avif"=>&self.output_avif,
+			_=>&self.output_other,
+		};
+		counter.fetch_add(1,Ordering::Relaxed);
+		self.processed_input_bytes.fetch_add(input_bytes as u64,Ordering::Relaxed);
+		self.processed_output_bytes.fetch_add(output_bytes as u64,Ordering::Relaxed);
+	}
+	fn record_static_insertion(&self,output_bytes:usize){
+		self.static_cache_insertions.fetch_add(1,Ordering::Relaxed);
+		self.static_output_bytes.fetch_add(output_bytes as u64,Ordering::Relaxed);
 	}
 }
 
@@ -429,11 +586,51 @@ fn main() {
 					let (retry_att, retry_sav) = stats.swap_reset_retry();
 					let (http1, http2) = stats.swap_reset_http();
 					let stale_served = stats.cache_stale_served.swap(0, Ordering::Relaxed);
+					let upstream_2xx = stats.upstream_2xx.swap(0, Ordering::Relaxed);
+					let upstream_3xx = stats.upstream_3xx.swap(0, Ordering::Relaxed);
+					let upstream_404 = stats.upstream_404.swap(0, Ordering::Relaxed);
+					let upstream_410 = stats.upstream_410.swap(0, Ordering::Relaxed);
+					let upstream_429 = stats.upstream_429.swap(0, Ordering::Relaxed);
+					let upstream_other_4xx = stats.upstream_other_4xx.swap(0, Ordering::Relaxed);
+					let upstream_5xx = stats.upstream_5xx.swap(0, Ordering::Relaxed);
+					let dl_wait_ms = stats.dl_wait_ms.swap(0, Ordering::Relaxed);
+					let dl_wait_max_ms = stats.dl_wait_max_ms.swap(0, Ordering::Relaxed);
+					let cpu_wait_ms = stats.cpu_wait_ms.swap(0, Ordering::Relaxed);
+					let cpu_wait_max_ms = stats.cpu_wait_max_ms.swap(0, Ordering::Relaxed);
+					let ttfb_max_ms = stats.ttfb_max_ms.swap(0, Ordering::Relaxed);
+					let body_max_ms = stats.body_max_ms.swap(0, Ordering::Relaxed);
+					let decode_max_ms = stats.decode_max_ms.swap(0, Ordering::Relaxed);
+					let encode_max_ms = stats.encode_max_ms.swap(0, Ordering::Relaxed);
+					let dl_active_max = stats.dl_active_max.swap(0, Ordering::Relaxed);
+					let cpu_active_max = stats.cpu_active_max.swap(0, Ordering::Relaxed);
+					let buf_used_max_bytes = stats.buf_used_max_bytes.swap(0, Ordering::Relaxed);
+					let perr_upstream_status = stats.perr_upstream_status.swap(0, Ordering::Relaxed);
+					let decode_error = stats.decode_error.swap(0, Ordering::Relaxed);
+					let encode_error = stats.encode_error.swap(0, Ordering::Relaxed);
+					let size_reject = stats.size_reject.swap(0, Ordering::Relaxed);
+					let policy_reject = stats.policy_reject.swap(0, Ordering::Relaxed);
+					let internal_error = stats.internal_error.swap(0, Ordering::Relaxed);
+					let passthrough_requests = stats.passthrough_requests.swap(0, Ordering::Relaxed);
+					let output_jpeg = stats.output_jpeg.swap(0, Ordering::Relaxed);
+					let output_png = stats.output_png.swap(0, Ordering::Relaxed);
+					let output_webp = stats.output_webp.swap(0, Ordering::Relaxed);
+					let output_avif = stats.output_avif.swap(0, Ordering::Relaxed);
+					let output_other = stats.output_other.swap(0, Ordering::Relaxed);
+					let processed_input_bytes = stats.processed_input_bytes.swap(0, Ordering::Relaxed);
+					let processed_output_bytes = stats.processed_output_bytes.swap(0, Ordering::Relaxed);
+					let static_requests = stats.static_requests.swap(0, Ordering::Relaxed);
+					let static_hits = stats.static_hits.swap(0, Ordering::Relaxed);
+					let static_misses = stats.static_misses.swap(0, Ordering::Relaxed);
+					let static_joined = stats.static_joined.swap(0, Ordering::Relaxed);
+					let static_cache_insertions = stats.static_cache_insertions.swap(0, Ordering::Relaxed);
+					let static_output_bytes = stats.static_output_bytes.swap(0, Ordering::Relaxed);
 					let dl_active = max_dl - dl_sem.available_permits();
 					let cpu_active = max_encode - encode_sem.available_permits();
 					let buf_used = max_buf - buf_sem.available_permits();
 					let (cache_entries, cache_bytes) = resp_cache.stats();
+					let (cache_capacity_evictions, cache_expired_evictions) = resp_cache.swap_reset_evictions();
 					let dns_entries = dns.len();
+					let (dns_retry_attempts,dns_retry_saved) = dns.swap_reset_retries();
 					tracing::info!(
 						requests = reqs,
 						errors = errs,
@@ -447,7 +644,11 @@ fn main() {
 						buf_max_mb = (max_buf / (1024 * 1024)) as u64,
 						cache_entries = cache_entries as u64,
 						cache_bytes = cache_bytes as u64,
+						cache_capacity_evictions,
+						cache_expired_evictions,
 						dns_entries = dns_entries as u64,
+						dns_retry_attempts,
+						dns_retry_saved,
 						ferr_connect = fc,
 						ferr_timeout = ft,
 						ferr_dns = fd,
@@ -459,6 +660,44 @@ fn main() {
 						http1_responses = http1,
 						http2_responses = http2,
 						cache_stale_served = stale_served,
+						upstream_2xx,
+						upstream_3xx,
+						upstream_404,
+						upstream_410,
+						upstream_429,
+						upstream_other_4xx,
+						upstream_5xx,
+						dl_wait_ms,
+						dl_wait_max_ms,
+						cpu_wait_ms,
+						cpu_wait_max_ms,
+						upstream_ttfb_max_ms = ttfb_max_ms,
+						body_max_ms,
+						decode_max_ms,
+						encode_max_ms,
+						dl_active_max,
+						cpu_active_max,
+						buf_used_max_mb = buf_used_max_bytes / (1024 * 1024),
+						perr_upstream_status,
+						decode_error,
+						encode_error,
+						size_reject,
+						policy_reject,
+						internal_error,
+						passthrough_requests,
+						output_jpeg,
+						output_png,
+						output_webp,
+						output_avif,
+						output_other,
+						processed_input_bytes,
+						processed_output_bytes,
+						static_requests,
+						static_hits,
+						static_misses,
+						static_joined,
+						static_cache_insertions,
+						static_output_bytes,
 						"periodic_stats"
 					);
 				}
@@ -468,8 +707,8 @@ fn main() {
 		let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
 		let app = Router::new();
 		let arg_tup0=arg_tup.clone();
-		let app=app.route("/",axum::routing::get(move|headers,parms|get_file(None,headers,arg_tup0.clone(),parms)));
-		let app=app.route("/{*path}",axum::routing::get(move|path,headers,parms|get_file(Some(path),headers,arg_tup.clone(),parms)));
+		let app=app.route("/",axum::routing::get(move|uri,headers,parms|get_file(None,uri,headers,arg_tup0.clone(),parms)));
+		let app=app.route("/{*path}",axum::routing::get(move|path,uri,headers,parms|get_file(Some(path),uri,headers,arg_tup.clone(),parms)));
 		axum::serve(listener,app.into_make_service_with_connect_info::<SocketAddr>()).with_graceful_shutdown(shutdown_signal()).await.unwrap();
 	});
 }
@@ -572,6 +811,8 @@ pub struct DnsCache{
 	max_entries: usize,
 	/// singleflight: 進行中のDNS解決。同一ホストへの並列lookup_hostを1本に束ねる。
 	inflight: Mutex<HashMap<String,tokio::sync::broadcast::Sender<DnsResult>>>,
+	retry_attempts:AtomicU64,
+	retry_saved:AtomicU64,
 }
 
 struct DnsFlightGuard<'a>{
@@ -606,6 +847,8 @@ impl DnsCache{
 			inner:RwLock::new(HashMap::new()),
 			ttl,negative_ttl,dns_timeout,max_entries,
 			inflight:Mutex::new(HashMap::new()),
+			retry_attempts:AtomicU64::new(0),
+			retry_saved:AtomicU64::new(0),
 		}
 	}
 	/// エントリのTTLを返す。タイムアウト由来の失敗は短いTTL(2秒)、確定的失敗はnegative_ttl。
@@ -629,6 +872,12 @@ impl DnsCache{
 	/// DNSキャッシュのエントリ数を返す(統計ログ用)。
 	pub(crate) fn len(&self) -> usize {
 		self.inner.try_read().map(|m| m.len()).unwrap_or(0)
+	}
+	pub(crate) fn swap_reset_retries(&self)->(u64,u64){
+		(
+			self.retry_attempts.swap(0,Ordering::Relaxed),
+			self.retry_saved.swap(0,Ordering::Relaxed),
+		)
 	}
 
 	/// hostを非同期解決する。TTL内はキャッシュを返す。singleflight付き。
@@ -681,7 +930,12 @@ impl DnsCache{
 		let result=match &result{
 			Err(e) if e.contains("timeout")=>{
 				// タイムアウト→1回リトライ
-				self.do_lookup(host,port).await
+				self.retry_attempts.fetch_add(1,Ordering::Relaxed);
+				let retry=self.do_lookup(host,port).await;
+				if retry.is_ok(){
+					self.retry_saved.fetch_add(1,Ordering::Relaxed);
+				}
+				retry
 			},
 			_=>result,
 		};
@@ -850,6 +1104,10 @@ struct PhaseTimings{
 	check:Duration,
 	/// permit待ちの合計。
 	wait:Duration,
+	/// ダウンロードセマフォの待機時間。
+	dl_wait:Duration,
+	/// CPUセマフォの待機時間。
+	cpu_wait:Duration,
 	/// TTFB(送信開始〜レスポンスヘッダ受信)。
 	ttfb:Duration,
 	/// ボディ受信時間。
@@ -870,6 +1128,8 @@ struct PhaseTimings{
 	retried:bool,
 	/// レスポンスのHTTPバージョン(例: "1.1", "2")。
 	http_version:Option<&'static str>,
+	/// 上流が返したHTTPステータス。上流応答前の失敗ではNone。
+	upstream_status:Option<u16>,
 }
 /// 計測対象フェーズ(decode/encode は複数の return を持つ関数が多いため Drop で計測する)。
 pub(crate) enum Phase{
@@ -896,7 +1156,11 @@ impl Drop for PhaseGuard{
 }
 /// アクセスログ用に、消費(move)される前の RequestParams から必要な値だけ控えておく。
 struct ReqSummary{
+	path:String,
 	url:String,
+	request_uri_hash:String,
+	cache_key_hash:String,
+	is_static_path:bool,
 	is_static:bool,
 	emoji:bool,
 	avatar:bool,
@@ -905,9 +1169,14 @@ struct ReqSummary{
 	fallback:bool,
 }
 impl ReqSummary{
-	fn new(q:&RequestParams)->Self{
+	fn new(q:&RequestParams,uri:&axum::http::Uri,cache_key:&CacheKey)->Self{
+		let path=uri.path().to_owned();
 		Self{
+			is_static_path:path=="/static.webp",
+			path,
 			url:q.url.clone(),
+			request_uri_hash:cache::fingerprint_bytes(uri.to_string().as_bytes()),
+			cache_key_hash:cache_key.fingerprint(),
 			is_static:q.r#static.is_some(),
 			emoji:q.emoji.is_some(),
 			avatar:q.avatar.is_some(),
@@ -966,10 +1235,14 @@ fn classify_reqwest_error(e: &reqwest::Error) -> String {
 }
 
 /// 1リクエスト1行のサマリを出力する。正常かつ高速(slow_log_ms未満)なら DEBUG に落とす。
-fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_error:bool,stats:&GlobalStats){
+fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_error:bool,error_detail:Option<&str>,stats:&GlobalStats){
 	stats.requests.fetch_add(1, Ordering::Relaxed);
+	stats.observe_request(t,s.is_static_path);
 	if status >= 400 || has_error {
 		stats.errors.fetch_add(1, Ordering::Relaxed);
+		if has_error {
+			stats.inc_proxy_error(t,error_detail);
+		}
 	}
 	match t.cache_result {
 		Some(CacheResult::Hit | CacheResult::Joined) => { stats.cache_hits.fetch_add(1, Ordering::Relaxed); },
@@ -988,6 +1261,8 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	}
 	let check_ms=t.check.as_millis() as u64;
 	let wait_ms=t.wait.as_millis() as u64;
+	let dl_wait_ms=t.dl_wait.as_millis() as u64;
+	let cpu_wait_ms=t.cpu_wait.as_millis() as u64;
 	let ttfb_ms=t.ttfb.as_millis() as u64;
 	let body_ms=t.body.as_millis() as u64;
 	let decode_ms=t.decode.as_millis() as u64;
@@ -1004,13 +1279,14 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 	let cache_str=t.cache_result.map(|c|c.to_string()).unwrap_or_else(||"-".to_owned());
 	let fetch_err_str=t.fetch_err.as_deref().unwrap_or("-");
 	let http_str=t.http_version.unwrap_or("-");
-	let fast=status<400 && !has_error && total_ms<cfg.slow_log_ms;
+	let fast=status<400 && !has_error && !s.is_static_path && total_ms<cfg.slow_log_ms;
 	if fast{
 		tracing::debug!(
-			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
+			path=%s.path,url=%s.url,request_uri_hash=%s.request_uri_hash,
+			cache_key_hash=%s.cache_key_hash,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
 			http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
-			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
+			check_ms,wait_ms,dl_wait_ms,cpu_wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
 			anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
@@ -1018,10 +1294,11 @@ fn emit_summary(cfg:&ConfigFile,s:&ReqSummary,t:&PhaseTimings,status:u16,has_err
 		);
 	}else{
 		tracing::info!(
-			url=%s.url,params=%params,dns_hit=%dns_str,cache=%cache_str,
+			path=%s.path,url=%s.url,request_uri_hash=%s.request_uri_hash,
+			cache_key_hash=%s.cache_key_hash,params=%params,dns_hit=%dns_str,cache=%cache_str,
 			passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
 			http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
-			check_ms,wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
+			check_ms,wait_ms,dl_wait_ms,cpu_wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
 			status=status as u64,error=has_error,anim=t.anim,
 			anim_frames=t.anim_frames as u64,
 			anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
@@ -1064,12 +1341,12 @@ fn build_stale_response(
 }
 async fn get_file(
 	_path:Option<axum::extract::Path<String>>,
+	axum::extract::OriginalUri(original_uri):axum::extract::OriginalUri,
 	client_headers:axum::http::HeaderMap,
 	(client,config,dummy_img,fontdb,encode_semaphore,network_policy,dns_cache,response_cache,download_semaphore,buffer_budget,global_stats):AppState,
 	axum::extract::Query(q):axum::extract::Query<RequestParams>,
 )->Result<(axum::http::StatusCode,HeaderMap,axum::body::Body),axum::response::Response>{
 	let timings=Arc::new(Mutex::new(PhaseTimings::default()));
-	let summary=ReqSummary::new(&q);
 
 	// Range リクエストはキャッシュ対象外
 	let has_range=client_headers.contains_key("Range");
@@ -1097,6 +1374,7 @@ async fn get_file(
 		badge:q.badge.is_some(),
 		accept_avif:is_accept_avif,
 	};
+	let summary=ReqSummary::new(&q,&original_uri,&cache_key);
 
 	// --- キャッシュヒット ---
 	if !has_range {
@@ -1128,7 +1406,7 @@ async fn get_file(
 				}
 			}
 			if let Ok(t)=timings.lock(){
-				emit_summary(&config,&summary,&t,cached.status,false,&global_stats);
+				emit_summary(&config,&summary,&t,cached.status,false,None,&global_stats);
 			}
 			let status=axum::http::StatusCode::from_u16(cached.status)
 				.unwrap_or(axum::http::StatusCode::OK);
@@ -1168,7 +1446,7 @@ async fn get_file(
 						}
 					}
 					if let Ok(t)=timings.lock(){
-						emit_summary(&config,&summary,&t,cached.status,false,&global_stats);
+						emit_summary(&config,&summary,&t,cached.status,false,None,&global_stats);
 					}
 					let status=axum::http::StatusCode::from_u16(cached.status)
 						.unwrap_or(axum::http::StatusCode::OK);
@@ -1179,7 +1457,7 @@ async fn get_file(
 					if let Some(stale) = response_cache.get_stale(&cache_key) {
 						let resp = build_stale_response(&stale, &config, &timings);
 						if let Ok(t)=timings.lock(){
-							emit_summary(&config,&summary,&t,200,false,&global_stats);
+							emit_summary(&config,&summary,&t,200,false,None,&global_stats);
 						}
 						return Err(resp);
 					}
@@ -1238,14 +1516,14 @@ async fn get_file(
 				if let Some(stale) = response_cache.get_stale(&cache_key) {
 					let resp = build_stale_response(&stale, &config, &timings);
 					if let Ok(t)=timings.lock(){
-						emit_summary(&config,&summary,&t,200,has_error,&global_stats);
+						emit_summary(&config,&summary,&t,200,has_error,None,&global_stats);
 					}
 					return Err(resp);
 				}
 			}
 			let is_fallback=q.fallback.is_some();
 			if let Ok(t)=timings.lock(){
-				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},has_error,&global_stats);
+				emit_summary(&config,&summary,&t,if is_fallback{200}else{400},has_error,Some(&s),&global_stats);
 			}
 			if is_fallback{
 				headers.append("Cache-Control","no-store".parse().unwrap());
@@ -1259,13 +1537,16 @@ async fn get_file(
 
 	// --- ダウンロードpermit取得(取得順序: DL permit → バイト予算 → CPU permit) ---
 	let wait_start=Instant::now();
-	let dl_permit = download_semaphore.acquire_owned().await.map_err(|_| {
+	let dl_permit = download_semaphore.clone().acquire_owned().await.map_err(|_| {
 		let mut h=HeaderMap::new();
 		h.append("X-Proxy-Error","DownloadSemaphoreError".parse().unwrap());
 		(axum::http::StatusCode::SERVICE_UNAVAILABLE,h).into_response()
 	})?;
+	global_stats.observe_dl_active(config.max_concurrent_downloads-download_semaphore.available_permits());
 	if let Ok(mut t)=timings.lock(){
-		t.wait+=wait_start.elapsed();
+		let elapsed=wait_start.elapsed();
+		t.wait+=elapsed;
+		t.dl_wait+=elapsed;
 	}
 	let send_start=Instant::now();
 	let build_req=||{
@@ -1316,13 +1597,13 @@ async fn get_file(
 							if let Some(stale) = response_cache.get_stale(&cache_key) {
 								let resp = build_stale_response(&stale, &config, &timings);
 								if let Ok(t)=timings.lock(){
-									emit_summary(&config,&summary,&t,200,true,&global_stats);
+									emit_summary(&config,&summary,&t,200,true,None,&global_stats);
 								}
 								return Err(resp);
 							}
 						}
 						if let Ok(t)=timings.lock(){
-							emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
+							emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,Some(&fetch_err),&global_stats);
 						}
 						if is_fallback{
 							headers.append("Cache-Control","no-store".parse().unwrap());
@@ -1346,13 +1627,13 @@ async fn get_file(
 					if let Some(stale) = response_cache.get_stale(&cache_key) {
 						let resp = build_stale_response(&stale, &config, &timings);
 						if let Ok(t)=timings.lock(){
-							emit_summary(&config,&summary,&t,200,true,&global_stats);
+							emit_summary(&config,&summary,&t,200,true,None,&global_stats);
 						}
 						return Err(resp);
 					}
 				}
 				if let Ok(t)=timings.lock(){
-					emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,&global_stats);
+					emit_summary(&config,&summary,&t,if is_fallback{200}else{400},true,Some(&first_err),&global_stats);
 				}
 				if is_fallback{
 					headers.append("Cache-Control","no-store".parse().unwrap());
@@ -1380,6 +1661,7 @@ async fn get_file(
 		if let Ok(mut t)=timings.lock(){ t.http_version=Some(ver); }
 	}
 	let remote_headers=resp.headers();
+	if let Ok(mut t)=timings.lock(){ t.upstream_status=Some(resp.status().as_u16()); }
 	add_remote_header("Content-Disposition",&mut headers,remote_headers);
 	add_remote_header("Content-Type",&mut headers,remote_headers);
 	let is_img=if let Some(media)=headers.get("Content-Type"){
@@ -1421,6 +1703,8 @@ async fn get_file(
 		timings:timings.clone(),
 		response_cache:response_cache.clone(),
 		cache_key:cache_key.clone(),
+		is_static_path:summary.is_static_path,
+		global_stats:global_stats.clone(),
 	}.encode(resp,is_img).await;
 
 	// --- singleflight 完了通知 ---
@@ -1446,12 +1730,12 @@ async fn get_file(
 		result
 	};
 
-	let (status,has_error)=match &result{
-		Ok((sc,h,_))=>(sc.as_u16(),h.contains_key("X-Proxy-Error")),
-		Err(r)=>(r.status().as_u16(),r.headers().contains_key("X-Proxy-Error")),
+	let (status,error_detail)=match &result{
+		Ok((sc,h,_))=>(sc.as_u16(),h.get("X-Proxy-Error").and_then(|v|v.to_str().ok())),
+		Err(r)=>(r.status().as_u16(),r.headers().get("X-Proxy-Error").and_then(|v|v.to_str().ok())),
 	};
 	if let Ok(t)=timings.lock(){
-		emit_summary(&config,&summary,&t,status,has_error,&global_stats);
+		emit_summary(&config,&summary,&t,status,error_detail.is_some(),error_detail,&global_stats);
 	}
 	result
 }
@@ -1470,6 +1754,8 @@ struct RequestContext{
 	timings: Arc<Mutex<PhaseTimings>>,
 	response_cache: Arc<ResponseCache>,
 	cache_key: CacheKey,
+	is_static_path: bool,
+	global_stats: Arc<GlobalStats>,
 }
 impl RequestContext{
 	/// フェーズ計測ガードを生成する(Arcを複製して保持するため self を借用し続けない)。
@@ -1496,8 +1782,11 @@ impl RequestContext{
 		let ct=headers.get("Content-Type").and_then(|v|v.to_str().ok()).map(|s|s.to_owned());
 		let cd=headers.get("Content-Disposition").and_then(|v|v.to_str().ok()).map(|s|s.to_owned());
 		let cc=headers.get("Cache-Control").and_then(|v|v.to_str().ok()).map(|s|s.to_owned());
+		self.global_stats.record_processed_output(ct.as_deref(),self.src_bytes.len(),body.len());
 		let entry=cache::CacheEntry::new(status,ct,cd,cc,body.to_vec());
-		self.response_cache.put(self.cache_key.clone(),entry);
+		if self.response_cache.put(self.cache_key.clone(),entry) && self.is_static_path {
+			self.global_stats.record_static_insertion(body.len());
+		}
 	}
 }
 impl RequestContext{
@@ -1593,6 +1882,9 @@ impl RequestContext{
 				h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
 				(axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
 			})?;
+			self.global_stats.observe_buf_used(
+				self.config.inflight_buffer_budget_bytes as usize-budget_sem.available_permits()
+			);
 			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
 			self.load_all(resp).await?;
 			drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
@@ -1604,7 +1896,12 @@ impl RequestContext{
 				h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
 				(axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
 			})?;
-			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
+			self.global_stats.observe_cpu_active(num_cpus::get().max(2)-cpu_sem.available_permits());
+			if let Ok(mut t)=self.timings.lock(){
+				let elapsed=wait_start.elapsed();
+				t.wait+=elapsed;
+				t.cpu_wait+=elapsed;
+			}
 			if let Ok(img)=self.encode_svg(self.fontdb.clone()){
 				self.headers.remove("Content-Length");
 				self.headers.remove("Content-Range");
@@ -1631,6 +1928,9 @@ impl RequestContext{
 				header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
 				(axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
 			})?;
+			self.global_stats.observe_buf_used(
+				self.config.inflight_buffer_budget_bytes as usize-budget_sem.available_permits()
+			);
 			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
 			self.load_all(resp).await?;
 			drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
@@ -1681,7 +1981,12 @@ impl RequestContext{
 				header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
 				(axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
 			})?;
-			if let Ok(mut t)=self.timings.lock(){ t.wait+=wait_start.elapsed(); }
+			self.global_stats.observe_cpu_active(num_cpus::get().max(2)-cpu_sem.available_permits());
+			if let Ok(mut t)=self.timings.lock(){
+				let elapsed=wait_start.elapsed();
+				t.wait+=elapsed;
+				t.cpu_wait+=elapsed;
+			}
 			let mut handle=self;
 			let resp=if let Ok(resp)=tokio::runtime::Handle::current().spawn_blocking(move ||{
 				handle.encode_img()
@@ -1813,6 +2118,72 @@ impl futures::stream::Stream for PreDataStream{
 }
 
 #[cfg(test)]
+mod metrics_tests{
+	use super::*;
+
+	#[test]
+	fn request_metrics_classify_upstream_status_and_keep_interval_maxima(){
+		let stats=GlobalStats::new();
+		for (status,wait_ms) in [(200,3),(302,4),(403,6),(404,8),(410,5),(429,13),(503,2)] {
+			let timings=PhaseTimings{
+				upstream_status:Some(status),
+				dl_wait:Duration::from_millis(wait_ms),
+				cpu_wait:Duration::from_millis(wait_ms/2),
+				..Default::default()
+			};
+			stats.observe_request(&timings,false);
+		}
+		assert_eq!(stats.upstream_2xx.load(Ordering::Relaxed),1);
+		assert_eq!(stats.upstream_3xx.load(Ordering::Relaxed),1);
+		assert_eq!(stats.upstream_other_4xx.load(Ordering::Relaxed),1);
+		assert_eq!(stats.upstream_404.load(Ordering::Relaxed),1);
+		assert_eq!(stats.upstream_410.load(Ordering::Relaxed),1);
+		assert_eq!(stats.upstream_429.load(Ordering::Relaxed),1);
+		assert_eq!(stats.upstream_5xx.load(Ordering::Relaxed),1);
+		assert_eq!(stats.dl_wait_ms.load(Ordering::Relaxed),41);
+		assert_eq!(stats.dl_wait_max_ms.load(Ordering::Relaxed),13);
+		assert_eq!(stats.cpu_wait_ms.load(Ordering::Relaxed),19);
+		assert_eq!(stats.cpu_wait_max_ms.load(Ordering::Relaxed),6);
+		stats.observe_dl_active(7);
+		stats.observe_dl_active(3);
+		stats.observe_cpu_active(2);
+		stats.observe_buf_used(9*1024*1024);
+		assert_eq!(stats.dl_active_max.load(Ordering::Relaxed),7);
+		assert_eq!(stats.cpu_active_max.load(Ordering::Relaxed),2);
+		assert_eq!(stats.buf_used_max_bytes.load(Ordering::Relaxed),9*1024*1024);
+		stats.inc_proxy_error(&PhaseTimings::default(),Some("status:404"));
+		stats.inc_proxy_error(&PhaseTimings::default(),Some("DecodeError_invalid"));
+		stats.inc_proxy_error(&PhaseTimings::default(),Some("EncodeError_failed"));
+		stats.inc_proxy_error(&PhaseTimings::default(),Some("length:20>10"));
+		stats.inc_proxy_error(&PhaseTimings::default(),Some("Blocked address"));
+		assert_eq!(stats.perr_upstream_status.load(Ordering::Relaxed),1);
+		assert_eq!(stats.decode_error.load(Ordering::Relaxed),1);
+		assert_eq!(stats.encode_error.load(Ordering::Relaxed),1);
+		assert_eq!(stats.size_reject.load(Ordering::Relaxed),1);
+		assert_eq!(stats.policy_reject.load(Ordering::Relaxed),1);
+		let fetch_error=PhaseTimings{fetch_err:Some("timeout".to_owned()),..Default::default()};
+		stats.inc_proxy_error(&fetch_error,Some("Send:timeout"));
+		assert_eq!(stats.internal_error.load(Ordering::Relaxed),0);
+		stats.record_processed_output(Some("image/webp"),1000,400);
+		stats.record_processed_output(Some("image/jpeg; charset=binary"),800,500);
+		assert_eq!(stats.output_webp.load(Ordering::Relaxed),1);
+		assert_eq!(stats.output_jpeg.load(Ordering::Relaxed),1);
+		assert_eq!(stats.processed_input_bytes.load(Ordering::Relaxed),1800);
+		assert_eq!(stats.processed_output_bytes.load(Ordering::Relaxed),900);
+		for result in [CacheResult::Hit,CacheResult::Miss,CacheResult::Joined] {
+			stats.observe_request(&PhaseTimings{cache_result:Some(result),..Default::default()},true);
+		}
+		assert_eq!(stats.static_requests.load(Ordering::Relaxed),3);
+		assert_eq!(stats.static_hits.load(Ordering::Relaxed),1);
+		assert_eq!(stats.static_misses.load(Ordering::Relaxed),1);
+		assert_eq!(stats.static_joined.load(Ordering::Relaxed),1);
+		stats.record_static_insertion(1234);
+		assert_eq!(stats.static_cache_insertions.load(Ordering::Relaxed),1);
+		assert_eq!(stats.static_output_bytes.load(Ordering::Relaxed),1234);
+	}
+}
+
+#[cfg(test)]
 mod network_policy_tests{
 	use super::*;
 	fn test_dns_cache(timeout:Duration)->DnsCache{
@@ -1859,6 +2230,14 @@ mod network_policy_tests{
 		value.as_object_mut().unwrap().remove("dns_cache_max_entries");
 		let config:ConfigFile=serde_json::from_value(value).unwrap();
 		assert_eq!(config.dns_cache_max_entries,1024);
+	}
+	#[test]
+	fn dns_retry_counters_reset_as_an_interval(){
+		let cache=test_dns_cache(Duration::from_millis(20));
+		cache.retry_attempts.fetch_add(2,Ordering::Relaxed);
+		cache.retry_saved.fetch_add(1,Ordering::Relaxed);
+		assert_eq!(cache.swap_reset_retries(),(2,1));
+		assert_eq!(cache.swap_reset_retries(),(0,0));
 	}
 	#[test]
 	fn parse_valid_config(){
@@ -1943,6 +2322,13 @@ mod cache_tests{
 		}
 	}
 	#[test]
+	fn fingerprint_is_stable_and_does_not_expose_input(){
+		let fingerprint=fingerprint_bytes(b"abc");
+		assert_eq!(fingerprint,"ba7816bf8f01cfea414140de5dae2223");
+		assert_eq!(fingerprint.len(),32);
+		assert!(!fingerprint.contains("abc"));
+	}
+	#[test]
 	fn cache_hit_after_put(){
 		let cache=test_cache();
 		let key=test_key();
@@ -1991,6 +2377,8 @@ mod cache_tests{
 		// key1 は追い出されているはず
 		assert!(cache.get(&key1).is_none());
 		assert!(cache.get(&key2).is_some());
+		assert_eq!(cache.swap_reset_evictions(),(1,0));
+		assert_eq!(cache.swap_reset_evictions(),(0,0));
 	}
 	#[test]
 	fn cache_skip_oversized_entry(){

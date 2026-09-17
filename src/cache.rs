@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
+use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
 /// キャッシュキー: 正規化URL + 画像系パラメータ + avif 有無。
@@ -16,6 +18,27 @@ pub struct CacheKey {
 	pub preview: bool,
 	pub badge: bool,
 	pub accept_avif: bool,
+}
+impl CacheKey {
+	pub fn fingerprint(&self) -> String {
+		let mut input=Vec::with_capacity(8+self.url.len()+6);
+		input.extend_from_slice(&(self.url.len() as u64).to_be_bytes());
+		input.extend_from_slice(self.url.as_bytes());
+		input.extend_from_slice(&[
+			self.is_static as u8,
+			self.emoji as u8,
+			self.avatar as u8,
+			self.preview as u8,
+			self.badge as u8,
+			self.accept_avif as u8,
+		]);
+		fingerprint_bytes(&input)
+	}
+}
+
+pub fn fingerprint_bytes(value:&[u8])->String{
+	let digest=Sha256::digest(value);
+	digest[..16].iter().map(|byte|format!("{:02x}",byte)).collect()
 }
 
 /// キャッシュに保存するレスポンスの要約。
@@ -89,6 +112,8 @@ pub struct ResponseCache {
 	entries: Mutex<LruInner>,
 	/// singleflight: 処理中のキーに対する broadcast sender。
 	inflight: Mutex<HashMap<CacheKey, broadcast::Sender<Option<CacheEntry>>>>,
+	capacity_evictions: AtomicU64,
+	expired_evictions: AtomicU64,
 }
 
 struct LruInner {
@@ -105,6 +130,8 @@ impl ResponseCache {
 				total_bytes: 0,
 			}),
 			inflight: Mutex::new(HashMap::new()),
+			capacity_evictions: AtomicU64::new(0),
+			expired_evictions: AtomicU64::new(0),
 		}
 	}
 
@@ -129,6 +156,7 @@ impl ResponseCache {
 				let removed = inner.map.shift_remove(key);
 				if let Some(r) = removed {
 					inner.total_bytes = inner.total_bytes.saturating_sub(r.size);
+					self.expired_evictions.fetch_add(1, Ordering::Relaxed);
 				}
 			}
 		}
@@ -153,18 +181,18 @@ impl ResponseCache {
 	}
 
 	/// エントリをキャッシュに格納する。
-	pub fn put(&self, key: CacheKey, entry: CacheEntry) {
+	pub fn put(&self, key: CacheKey, entry: CacheEntry) -> bool {
 		if !self.config.enabled {
-			return;
+			return false;
 		}
 		if entry.status != 200 {
-			return;
+			return false;
 		}
 		if entry.size > self.config.entry_max_bytes {
-			return;
+			return false;
 		}
 		let Ok(mut inner) = self.entries.lock() else {
-			return;
+			return false;
 		};
 		// 既存エントリがあれば削除してサイズ回収
 		if let Some(old) = inner.map.shift_remove(&key) {
@@ -176,6 +204,7 @@ impl ResponseCache {
 			if oldest.created_at.elapsed() > max_age {
 				if let Some((_, evicted)) = inner.map.shift_remove_index(0) {
 					inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
+					self.expired_evictions.fetch_add(1, Ordering::Relaxed);
 				}
 			} else {
 				break;
@@ -185,10 +214,12 @@ impl ResponseCache {
 		while inner.total_bytes + entry.size > self.config.max_bytes && !inner.map.is_empty() {
 			if let Some((_, evicted)) = inner.map.shift_remove_index(0) {
 				inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
+				self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
 			}
 		}
 		inner.total_bytes += entry.size;
 		inner.map.insert(key, entry);
+		true
 	}
 
 	/// singleflight: 同一キーの処理に合流する receiver を取得する。
@@ -224,7 +255,7 @@ impl ResponseCache {
 	/// singleflight: 処理完了を通知し、成功なら結果をキャッシュに格納する。
 	pub fn complete_flight(self: &Arc<Self>, guard: &mut FlightGuard, entry: Option<CacheEntry>) {
 		if let Some(ref e) = entry {
-			self.put(guard.key.clone(), e.clone());
+			let _ = self.put(guard.key.clone(), e.clone());
 		}
 		// broadcast で待機者に通知(受信者がいなくても SendError は無視)
 		let _ = guard.tx.send(entry);
@@ -242,6 +273,13 @@ impl ResponseCache {
 		} else {
 			(0, 0)
 		}
+	}
+
+	pub fn swap_reset_evictions(&self) -> (u64, u64) {
+		(
+			self.capacity_evictions.swap(0, Ordering::Relaxed),
+			self.expired_evictions.swap(0, Ordering::Relaxed),
+		)
 	}
 }
 
