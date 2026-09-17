@@ -1964,6 +1964,9 @@ async fn get_file(
         t.dl_wait += elapsed;
     }
     let send_start = Instant::now();
+    // Direct fetches are revalidated by ValidatingResolver at connection time.
+    // With config.proxy, the proxy resolves the target, so only the URL pre-check
+    // applies and DNS-rebinding TOCTOU remains possible.
     const MAX_REDIRECTS: u8 = 5;
     let mut current_url = reqwest::Url::from_str(&q.url).map_err(|e| {
         (
