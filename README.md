@@ -120,21 +120,19 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 すべての追加項目は `#[serde(default)]` 付きのため、既存の config.json をそのまま使えます。
 
-## Raspberry Pi 5 向けチューニング
+## media-proxy.jiskey.dev 向け運用設定
 
-`example.config.rpi5.json` にRaspberry Pi 5 (aarch64, 4コア, RAM 4GB) 向けの推奨設定を用意しています。主な変更点:
+`config.media-proxy.jiskey.dev.json` にIntel N95 (4コア, RAM 8GB) で稼働するmedia-proxy.jiskey.dev向けの運用設定を用意しています。主な変更点:
 
-- **`webp_method`: 2** — method=4(既定)比で2〜3倍高速。サイズは5〜15%増だが、Pi上ではエンコード時間の短縮効果が大きい
-- **`cache_entry_max_bytes`: 3MB** — 大きなアニメGIF等のキャッシュを抑制
-- **`webp_quality`: 70** / **`jpeg_quality`: 80** — やや品質を下げてエンコード時間を短縮
-- **`slow_log_ms`: 100** — Pi上では処理が遅いため、ログ降格閾値を緩める
+- **`cache_max_bytes`: 1GB** — キャッシュ滞留時間を確保する
+- **`cache_ttl_secs`: 43200** — キャッシュTTLを12時間に延長する
 - **`dns_cache_max_entries`: 4096** — 多数の連合先ホストを保持し、DNSキャッシュの回転を抑える
-- **`max_concurrent_downloads`: 16** — メモリ4GBに合わせて制限
-- **`inflight_buffer_budget_bytes`: 128MB** — メモリ4GBに合わせて半減
+- **`max_concurrent_downloads`: 128** — バースト時のダウンロード同時実行枠を拡大する
+- **`inflight_buffer_budget_bytes`: 512MB** — 同時ダウンロードの合計バイト予算を拡大する
 
 使い方:
 ```bash
-cp example.config.rpi5.json config.json
+cp config.media-proxy.jiskey.dev.json config.json
 ```
 
 ## CHANGELOG
