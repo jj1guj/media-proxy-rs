@@ -126,7 +126,11 @@ impl RequestContext{
 						}
 					},
 					Some(Ok("image/heic"))=> {
-						let decode_options = heic_rs::DecodeOptions::default();
+						let decode_options = heic_rs::DecodeOptions {
+							max_pixels: Some(64 * 1024 * 1024),
+							threads: Some(1),
+							..Default::default()
+						};
 						let decoded_img = heic_rs::decode(&self.src_bytes, &decode_options);
 						let img = match decoded_img {
 							Ok(img) => match image::RgbImage::from_raw(img.width, img.height, img.data) {
