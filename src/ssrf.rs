@@ -86,24 +86,50 @@ mod tests {
     use std::time::Duration;
 
     fn test_policy() -> NetworkPolicy {
+        let (ipv4_blocked_default, _) = NetworkPolicy::parse_ranges(
+            &[
+                "10.0.0.0/8".to_owned(),
+                "172.16.0.0/12".to_owned(),
+                "192.168.0.0/16".to_owned(),
+                "127.0.0.0/8".to_owned(),
+                "169.254.0.0/16".to_owned(),
+                "100.64.0.0/10".to_owned(),
+                "0.0.0.0/8".to_owned(),
+                "192.0.0.0/24".to_owned(),
+                "192.0.2.0/24".to_owned(),
+                "198.18.0.0/15".to_owned(),
+                "198.51.100.0/24".to_owned(),
+                "203.0.113.0/24".to_owned(),
+                "224.0.0.0/4".to_owned(),
+                "240.0.0.0/4".to_owned(),
+            ],
+            "test",
+        )
+        .unwrap();
         NetworkPolicy {
-            ipv4_blocked_default: NetworkPolicy::parse_ranges(
-                &[
-                    "10.0.0.0/8".to_owned(),
-                    "172.16.0.0/12".to_owned(),
-                    "192.168.0.0/16".to_owned(),
-                    "127.0.0.0/8".to_owned(),
-                    "169.254.0.0/16".to_owned(),
-                    "100.64.0.0/10".to_owned(),
-                    "0.0.0.0/8".to_owned(),
-                ],
-                "test",
-            )
-            .unwrap(),
+            ipv4_blocked_default,
             allowed_networks: None,
             blocked_networks: None,
+            allowed_networks_v6: None,
+            blocked_networks_v6: None,
             blocked_hosts: Default::default(),
         }
+    }
+
+    #[test]
+    fn ipv6_transition_ranges_are_checked_against_ipv4_policy() {
+        let policy = test_policy();
+        for ip in [
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "2002:7f00:1::",
+            "2002:a9fe:a9fe::",
+            "2001::1",
+            "::ffff:0:7f00:1",
+        ] {
+            assert!(policy.check_ip(ip.parse().unwrap()).is_err());
+        }
+        assert!(policy.check_ip("2002:808:808::".parse().unwrap()).is_ok());
     }
 
     #[test]

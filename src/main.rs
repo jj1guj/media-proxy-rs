@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
@@ -874,6 +874,8 @@ pub struct NetworkPolicy {
     ipv4_blocked_default: IpRange<Ipv4Net>,
     allowed_networks: Option<IpRange<Ipv4Net>>,
     blocked_networks: Option<IpRange<Ipv4Net>>,
+    allowed_networks_v6: Option<IpRange<Ipv6Net>>,
+    blocked_networks_v6: Option<IpRange<Ipv6Net>>,
     /// 小文字化済みの遮断ホスト集合。
     blocked_hosts: HashSet<String>,
 }
@@ -882,19 +884,31 @@ impl NetworkPolicy {
         host.trim_end_matches('.').to_lowercase()
     }
 
-    fn parse_ranges(list: &[String], label: &str) -> Result<IpRange<Ipv4Net>, String> {
-        let mut range = IpRange::new();
+    fn parse_ranges(
+        list: &[String],
+        label: &str,
+    ) -> Result<(IpRange<Ipv4Net>, IpRange<Ipv6Net>), String> {
+        let mut v4_ranges = IpRange::new();
+        let mut v6_ranges = IpRange::new();
         for s in list {
-            let net: Ipv4Net = s
+            let net: IpNet = s
                 .parse()
                 .map_err(|e| format!("{} の不正な値 {:?}: {}", label, s, e))?;
-            range.add(net);
+            match net {
+                IpNet::V4(net) => {
+                    v4_ranges.add(net);
+                }
+                IpNet::V6(net) => {
+                    v6_ranges.add(net);
+                }
+            }
         }
-        range.simplify();
-        Ok(range)
+        v4_ranges.simplify();
+        v6_ranges.simplify();
+        Ok((v4_ranges, v6_ranges))
     }
     pub fn from_config(config: &ConfigFile) -> Result<Self, String> {
-        let ipv4_blocked_default = Self::parse_ranges(
+        let (ipv4_blocked_default, _) = Self::parse_ranges(
             &[
                 "10.0.0.0/8".to_owned(),
                 "172.16.0.0/12".to_owned(),
@@ -903,16 +917,29 @@ impl NetworkPolicy {
                 "169.254.0.0/16".to_owned(),
                 "100.64.0.0/10".to_owned(),
                 "0.0.0.0/8".to_owned(),
+                "192.0.0.0/24".to_owned(),
+                "192.0.2.0/24".to_owned(),
+                "198.18.0.0/15".to_owned(),
+                "198.51.100.0/24".to_owned(),
+                "203.0.113.0/24".to_owned(),
+                "224.0.0.0/4".to_owned(),
+                "240.0.0.0/4".to_owned(),
             ],
             "builtin blocked range",
         )?;
-        let allowed_networks = match &config.allowed_networks {
-            Some(list) => Some(Self::parse_ranges(list, "allowed_networks")?),
-            None => None,
+        let (allowed_networks, allowed_networks_v6) = match &config.allowed_networks {
+            Some(list) => {
+                let (v4, v6) = Self::parse_ranges(list, "allowed_networks")?;
+                (Some(v4), Some(v6))
+            }
+            None => (None, None),
         };
-        let blocked_networks = match &config.blocked_networks {
-            Some(list) => Some(Self::parse_ranges(list, "blocked_networks")?),
-            None => None,
+        let (blocked_networks, blocked_networks_v6) = match &config.blocked_networks {
+            Some(list) => {
+                let (v4, v6) = Self::parse_ranges(list, "blocked_networks")?;
+                (Some(v4), Some(v6))
+            }
+            None => (None, None),
         };
         let blocked_hosts = config
             .blocked_hosts
@@ -923,6 +950,8 @@ impl NetworkPolicy {
             ipv4_blocked_default,
             allowed_networks,
             blocked_networks,
+            allowed_networks_v6,
+            blocked_networks_v6,
             blocked_hosts,
         })
     }
@@ -958,21 +987,71 @@ impl NetworkPolicy {
         match ip {
             IpAddr::V4(v4) => self.check_ipv4(&v4),
             IpAddr::V6(v6) => {
+                if self
+                    .blocked_networks_v6
+                    .as_ref()
+                    .is_some_and(|ranges| ranges.contains(&v6))
+                {
+                    return Err("Blocked address".to_owned());
+                }
+                let segments = v6.segments();
+                if segments[0] == 0x2001 && segments[1] == 0 {
+                    return Err("Blocked address".to_owned());
+                }
+                if let Some(v4) = ipv6_embedded_ipv4(&v6) {
+                    return self.check_ipv4(&v4);
+                }
                 if v6.is_multicast()
                     || v6.is_unicast_link_local()
                     || v6.is_loopback()
                     || v6.is_unspecified()
                     || v6.is_unique_local()
                 {
+                    if self
+                        .allowed_networks_v6
+                        .as_ref()
+                        .is_some_and(|ranges| ranges.contains(&v6))
+                    {
+                        return Ok(());
+                    }
                     return Err("Blocked address".to_owned());
-                }
-                if let Some(mapped) = v6.to_ipv4_mapped() {
-                    self.check_ipv4(&mapped)?;
                 }
                 Ok(())
             }
         }
     }
+}
+
+fn ipv6_embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4() {
+        return Some(v4);
+    }
+    let segments = v6.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    if segments[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        ));
+    }
+    if segments[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    None
 }
 
 struct DnsCacheEntry {
