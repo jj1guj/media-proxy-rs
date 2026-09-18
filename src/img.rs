@@ -1,9 +1,82 @@
 use axum::response::IntoResponse;
-use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
+use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView, ImageDecoder};
 
 use crate::{Phase, RequestContext};
 
+pub(crate) fn probe_dimensions(src: &[u8]) -> Option<(u32, u32)> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(src))
+        .with_guessed_format()
+        .ok()?;
+    reader.into_dimensions().ok()
+}
+
+pub(crate) fn dimensions_allowed_for(max_decode_pixels: u64, width: u64, height: u64) -> bool {
+    if width == 0 || height == 0 {
+        return false;
+    }
+    const MAX_SIDE: u64 = 32768;
+    if width > MAX_SIDE || height > MAX_SIDE {
+        return false;
+    }
+    width
+        .checked_mul(height)
+        .is_some_and(|pixels| pixels <= max_decode_pixels)
+}
+
+fn le24(bytes: &[u8]) -> u32 {
+    (bytes[0] as u32) | ((bytes[1] as u32) << 8) | ((bytes[2] as u32) << 16)
+}
+
+pub(crate) const ANIMATION_FRAMES_LIMIT: u64 = 1000;
+
+fn webp_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), String> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WEBP" {
+        return Ok(());
+    }
+    let mut offset = 12usize;
+    let mut canvas_pixels = None;
+    let mut frames = 0u64;
+    while offset + 8 <= data.len() {
+        let fourcc = &data[offset..offset + 4];
+        let size = u32::from_le_bytes([
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ]) as usize;
+        let body = offset + 8;
+        if body.checked_add(size).map_or(true, |end| end > data.len()) {
+            break;
+        }
+        if fourcc == b"VP8X" && size >= 10 {
+            let width = 1u64 + le24(&data[body + 4..body + 7]) as u64;
+            let height = 1u64 + le24(&data[body + 7..body + 10]) as u64;
+            canvas_pixels = Some(width.saturating_mul(height));
+        }
+        if fourcc == b"ANMF" && size >= 16 {
+            frames += 1;
+            if frames > ANIMATION_FRAMES_LIMIT {
+                return Err(format!("FramesLimit {}>{}", frames, ANIMATION_FRAMES_LIMIT));
+            }
+            let total = canvas_pixels.unwrap_or(u64::MAX).saturating_mul(frames);
+            if total > max_decode_pixels {
+                return Err(format!("DecodePixels {}>{}", total, max_decode_pixels));
+            }
+        }
+        offset = body + size + (size & 1);
+    }
+    Ok(())
+}
+
 impl RequestContext {
+    fn decode_limit_response(&mut self, width: u64, height: u64) -> axum::response::Response {
+        let message = format!("DecodeDimensions {}x{} over limit", width, height);
+        let value = reqwest::header::HeaderValue::from_bytes(message.as_bytes())
+            .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("DecodeLimit"));
+        self.headers.append("X-Proxy-Error", value);
+        (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+    }
+
     pub(crate) fn image_size_hint(&self) -> (u32, u32) {
         if self.parms.badge.is_some() {
             return (96, 96);
@@ -53,6 +126,14 @@ impl RequestContext {
         resize(img, max_width, max_height, filter)
     }
     pub(crate) fn encode_img(&mut self) -> axum::response::Response {
+        let max_decode_pixels = (self.config.max_size / 4).max(1);
+        if self.codec.is_ok() {
+            if let Some((width, height)) = probe_dimensions(&self.src_bytes) {
+                if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
+                    return self.decode_limit_response(width as u64, height as u64);
+                }
+            }
+        }
         if self.parms.r#static.is_some() {
             return self.encode_single();
         }
@@ -68,20 +149,40 @@ impl RequestContext {
                     .map(|s| std::str::from_utf8(s.as_bytes()))
                 {
                     Some(Ok("image/jxl")) => {
+                        let decoder = match jxl_oxide::integration::JxlDecoder::new(
+                            std::io::Cursor::new(&self.src_bytes),
+                        ) {
+                            Ok(decoder) => decoder,
+                            Err(error) => {
+                                let value = reqwest::header::HeaderValue::from_bytes(
+                                    format!("JpegXL Error:{:?}", error).as_bytes(),
+                                )
+                                .unwrap_or_else(|_| {
+                                    reqwest::header::HeaderValue::from_static("JpegXLError")
+                                });
+                                self.headers.append("X-Proxy-Error", value);
+                                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                                    .into_response();
+                            }
+                        };
+                        let (width, height) = decoder.dimensions();
+                        if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
+                            return self.decode_limit_response(width as u64, height as u64);
+                        }
                         let img = {
                             let _dg = self.phase_guard(Phase::Decode);
-                            let decoder = jxl_oxide::integration::JxlDecoder::new(
-                                std::io::Cursor::new(&self.src_bytes),
-                            );
-                            decoder.map(DynamicImage::from_decoder).unwrap_or_else(Err)
+                            DynamicImage::from_decoder(decoder)
                         };
                         let img = match img {
                             Ok(img) => img,
                             Err(e) => {
-                                self.headers.append(
-                                    "X-Proxy-Error",
-                                    format!("JpegXL Error:{:?}", e).parse().unwrap(),
-                                );
+                                let value = reqwest::header::HeaderValue::from_bytes(
+                                    format!("JpegXL Error:{:?}", e).as_bytes(),
+                                )
+                                .unwrap_or_else(|_| {
+                                    reqwest::header::HeaderValue::from_static("JpegXLError")
+                                });
+                                self.headers.append("X-Proxy-Error", value);
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
                             }
@@ -89,6 +190,18 @@ impl RequestContext {
                         return self.response_img(img);
                     }
                     Some(Ok("image/jp2")) => {
+                        let dimensions = jpeg2k::DumpImage::from_bytes(&self.src_bytes)
+                            .ok()
+                            .map(|dump| (dump.img.width(), dump.img.height()));
+                        if let Some((width, height)) = dimensions {
+                            if !dimensions_allowed_for(
+                                max_decode_pixels,
+                                width as u64,
+                                height as u64,
+                            ) {
+                                return self.decode_limit_response(width as u64, height as u64);
+                            }
+                        }
                         let img = {
                             let _dg = self.phase_guard(Phase::Decode);
                             let img = jpeg2k::Image::from_bytes(&self.src_bytes)
@@ -113,12 +226,23 @@ impl RequestContext {
                     Some(Ok("image/jxr")) => {
                         fn decode_jxr(
                             src_bytes: &[u8],
+                            max_decode_pixels: u64,
                         ) -> Result<Result<DynamicImage, String>, jpegxr::JXRError>
                         {
                             use jpegxr::{ImageDecode, PixelInfo};
                             let mut decoder =
                                 ImageDecode::with_reader(std::io::Cursor::new(src_bytes))?;
                             let (width, height) = decoder.get_size()?;
+                            if !dimensions_allowed_for(
+                                max_decode_pixels,
+                                width as u64,
+                                height as u64,
+                            ) {
+                                return Ok(Err(format!(
+                                    "DecodeDimensions {}x{} over limit",
+                                    width, height
+                                )));
+                            }
                             let info = PixelInfo::from_format(decoder.get_pixel_format()?);
                             let stride = width as usize * info.bits_per_pixel() / 8;
                             let size = stride * height as usize;
@@ -144,7 +268,7 @@ impl RequestContext {
                         }
                         let decoded = {
                             let _dg = self.phase_guard(Phase::Decode);
-                            decode_jxr(&self.src_bytes)
+                            decode_jxr(&self.src_bytes, max_decode_pixels)
                         };
                         match decoded {
                             Ok(Ok(img)) => {
@@ -300,7 +424,7 @@ impl RequestContext {
                     Ok(a) => a,
                     Err(_) => return self.encode_single(),
                 };
-                if !a.is_apng().unwrap() {
+                if !a.is_apng().unwrap_or(false) {
                     return self.encode_single();
                 }
                 match a.apng() {
@@ -328,27 +452,48 @@ impl RequestContext {
                     Err(_) => return self.encode_single(),
                 };
                 if a.has_animation() {
+                    let max_decode_pixels = (self.config.max_size / 4).max(1);
+                    if let Err(e) = webp_animation_within_budget(&self.src_bytes, max_decode_pixels)
+                    {
+                        self.headers
+                            .append("X-Proxy-Error", format!("WebPAnim {}", e).parse().unwrap());
+                        return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                            .into_response();
+                    }
                     let decoder = webp::AnimDecoder::new(&self.src_bytes);
                     if let Ok(mut dec) = decoder.decode() {
                         let mut offset = 0;
                         let mut frames = vec![];
                         dec.sort_by_time_stamp();
                         for frame in dec.into_iter() {
+                            if frames.len() >= ANIMATION_FRAMES_LIMIT as usize {
+                                let mut headers = self.headers.clone();
+                                headers.append(
+                                    "X-Proxy-Error",
+                                    format!("FramesLimit {}", ANIMATION_FRAMES_LIMIT)
+                                        .parse()
+                                        .unwrap(),
+                                );
+                                return (axum::http::StatusCode::BAD_GATEWAY, headers)
+                                    .into_response();
+                            }
                             let img = if frame.get_layout().is_alpha() {
-                                let image = image::ImageBuffer::from_raw(
+                                let Some(image) = image::ImageBuffer::from_raw(
                                     frame.width(),
                                     frame.height(),
                                     frame.get_image().to_owned(),
-                                )
-                                .expect("ImageBuffer couldn't be created");
+                                ) else {
+                                    continue;
+                                };
                                 image
                             } else {
-                                let image = image::ImageBuffer::from_raw(
+                                let Some(image) = image::ImageBuffer::from_raw(
                                     frame.width(),
                                     frame.height(),
                                     frame.get_image().to_owned(),
-                                )
-                                .expect("ImageBuffer couldn't be created");
+                                ) else {
+                                    continue;
+                                };
                                 DynamicImage::ImageRgb8(image).into_rgba8()
                             };
                             let delay = frame.get_time_ms() - offset;
@@ -384,7 +529,7 @@ impl RequestContext {
         let mut err = None;
         {
             let mut timestamp = 0;
-            const FRAMES_LIMIT: u32 = 1000;
+            const FRAMES_LIMIT: u32 = ANIMATION_FRAMES_LIMIT as u32;
             let mut allow_frames = FRAMES_LIMIT;
             for frame in frames {
                 allow_frames -= 1;
@@ -422,11 +567,13 @@ impl RequestContext {
                     }
                     let aframe = image_to_frame(&img, timestamp);
                     if let Ok(aframe) = aframe {
-                        let res = encoder.as_mut().unwrap().add_frame(aframe);
-                        if let Err(e) = res {
-                            err = Some(e);
-                        } else {
-                            available_frames += 1;
+                        if let Some(encoder) = encoder.as_mut() {
+                            let res = encoder.add_frame(aframe);
+                            if let Err(e) = res {
+                                err = Some(e);
+                            } else {
+                                available_frames += 1;
+                            }
                         }
                     }
                 } else {
@@ -743,9 +890,12 @@ fn resize(
         algorithm: fast_image_resize::ResizeAlg::Convolution(filter),
         ..Default::default()
     };
-    resizer
+    if resizer
         .resize(&src_image, &mut dst_image, &options)
-        .unwrap();
+        .is_err()
+    {
+        return None;
+    }
     let rgba =
         image::RgbaImage::from_raw(dst_image.width(), dst_image.height(), dst_image.into_vec());
     Some(DynamicImage::ImageRgba8(rgba?))

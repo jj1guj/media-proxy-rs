@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
-use ipnet::Ipv4Net;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
@@ -18,6 +18,7 @@ mod browsersafe;
 mod cache;
 mod image_test;
 mod img;
+mod ssrf;
 mod svg;
 
 use cache::{CacheKey, CacheResult, ResponseCache};
@@ -571,7 +572,7 @@ fn main() {
 			connect_timeout_ms:default_connect_timeout_ms(),
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 			cache_stale_max_secs:default_cache_stale_max_secs(),
-		};
+        };
         let default_config = serde_json::to_string_pretty(&default_config).unwrap();
         std::fs::File::create(&config_path)
             .expect("create default config.json")
@@ -624,12 +625,28 @@ fn main() {
         .unwrap();
     let client = reqwest::ClientBuilder::new();
     let client = match &config.proxy {
-        Some(url) => client.proxy(reqwest::Proxy::http(url).unwrap()),
+        Some(url) => {
+            tracing::warn!(
+                "プロキシ利用時は接続先に対するSSRF再検証が適用されません。プロキシ側で同等のSSRF対策を行ってください"
+            );
+            let proxy = match reqwest::Proxy::all(url) {
+                Ok(proxy) => proxy,
+                Err(error) => {
+                    tracing::error!(proxy = ?url, %error, "不正なプロキシ設定");
+                    std::process::exit(1);
+                }
+            };
+            client.proxy(proxy)
+        }
         None => client,
     };
     // reqwestのDNS解決をDnsCacheに一本化する。
     // check_urlと実フェッチが同じキャッシュを共有し、1リクエストあたりのDNS解決を実質1回にする。
-    let client = client.dns_resolver(Arc::new(SharedDnsResolver(dns_cache.clone())));
+    let client = client.dns_resolver(Arc::new(ssrf::ValidatingResolver::new(
+        dns_cache.clone(),
+        network_policy.clone(),
+        config.proxy.as_deref(),
+    )));
     let client = client.connect_timeout(Duration::from_millis(config.connect_timeout_ms));
     if config.connect_timeout_ms >= config.timeout {
         tracing::warn!(
@@ -638,7 +655,10 @@ fn main() {
             "connect_timeout_ms >= timeout: リトライの余地がありません"
         );
     }
-    let client = client.build().unwrap();
+    let client = client
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
     let mut fontdb = resvg::usvg::fontdb::Database::new();
     if config.load_system_fonts {
         fontdb.load_system_fonts();
@@ -828,6 +848,10 @@ fn main() {
         let http_addr: SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
         let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
         let app = Router::new();
+        let app = app.route(
+            "/healthz",
+            axum::routing::get(|| async { (axum::http::StatusCode::OK, "ok") }),
+        );
         let arg_tup0 = arg_tup.clone();
         let app = app.route(
             "/",
@@ -841,6 +865,7 @@ fn main() {
                 get_file(Some(path), uri, headers, arg_tup.clone(), parms)
             }),
         );
+        let app = app.layer(tower_http::catch_panic::CatchPanicLayer::new());
         axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -852,58 +877,106 @@ fn main() {
 }
 /// タイムアウト由来のネガティブキャッシュの短いTTL。
 const DNS_TIMEOUT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
+const RESOURCE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// stale-while-error の上限倍率(元TTLのこの倍までstaleエントリを使う)。
 const DNS_STALE_FACTOR: u32 = 10;
 
 /// 起動時に1度だけパースするネットワークポリシー。
 /// check_url には Arc の参照として渡す(リクエストごとの再パースをしない)。
 pub struct NetworkPolicy {
-    /// RFC1918 プライベートレンジ(allowedが無ければ遮断)。
-    ipv4_private_range: IpRange<Ipv4Net>,
+    /// 組み込み遮断レンジ(allowedが無ければ遮断)。
+    ipv4_blocked_default: IpRange<Ipv4Net>,
     allowed_networks: Option<IpRange<Ipv4Net>>,
     blocked_networks: Option<IpRange<Ipv4Net>>,
+    allowed_networks_v6: Option<IpRange<Ipv6Net>>,
+    blocked_networks_v6: Option<IpRange<Ipv6Net>>,
     /// 小文字化済みの遮断ホスト集合。
     blocked_hosts: HashSet<String>,
 }
 impl NetworkPolicy {
-    fn parse_ranges(list: &[String], label: &str) -> Result<IpRange<Ipv4Net>, String> {
-        let mut range = IpRange::new();
+    fn normalize_host(host: &str) -> String {
+        host.trim_end_matches('.').to_lowercase()
+    }
+
+    fn parse_ranges(
+        list: &[String],
+        label: &str,
+    ) -> Result<(IpRange<Ipv4Net>, IpRange<Ipv6Net>), String> {
+        let mut v4_ranges = IpRange::new();
+        let mut v6_ranges = IpRange::new();
         for s in list {
-            let net: Ipv4Net = s
+            let net: IpNet = s
                 .parse()
                 .map_err(|e| format!("{} の不正な値 {:?}: {}", label, s, e))?;
-            range.add(net);
+            match net {
+                IpNet::V4(net) => {
+                    v4_ranges.add(net);
+                }
+                IpNet::V6(net) => {
+                    v6_ranges.add(net);
+                }
+            }
         }
-        range.simplify();
-        Ok(range)
+        v4_ranges.simplify();
+        v6_ranges.simplify();
+        Ok((v4_ranges, v6_ranges))
     }
     pub fn from_config(config: &ConfigFile) -> Result<Self, String> {
-        let ipv4_private_range = Self::parse_ranges(
+        let (ipv4_blocked_default, _) = Self::parse_ranges(
             &[
                 "10.0.0.0/8".to_owned(),
                 "172.16.0.0/12".to_owned(),
                 "192.168.0.0/16".to_owned(),
+                "127.0.0.0/8".to_owned(),
+                "169.254.0.0/16".to_owned(),
+                "100.64.0.0/10".to_owned(),
+                "0.0.0.0/8".to_owned(),
+                "192.0.0.0/24".to_owned(),
+                "192.0.2.0/24".to_owned(),
+                "198.18.0.0/15".to_owned(),
+                "198.51.100.0/24".to_owned(),
+                "203.0.113.0/24".to_owned(),
+                "224.0.0.0/4".to_owned(),
+                "240.0.0.0/4".to_owned(),
             ],
-            "builtin private range",
+            "builtin blocked range",
         )?;
-        let allowed_networks = match &config.allowed_networks {
-            Some(list) => Some(Self::parse_ranges(list, "allowed_networks")?),
-            None => None,
+        let (allowed_networks, allowed_networks_v6) = match &config.allowed_networks {
+            Some(list) => {
+                let (v4, v6) = Self::parse_ranges(list, "allowed_networks")?;
+                (Some(v4), Some(v6))
+            }
+            None => (None, None),
         };
-        let blocked_networks = match &config.blocked_networks {
-            Some(list) => Some(Self::parse_ranges(list, "blocked_networks")?),
-            None => None,
+        let (blocked_networks, blocked_networks_v6) = match &config.blocked_networks {
+            Some(list) => {
+                let (v4, v6) = Self::parse_ranges(list, "blocked_networks")?;
+                (Some(v4), Some(v6))
+            }
+            None => (None, None),
         };
         let blocked_hosts = config
             .blocked_hosts
             .as_ref()
-            .map(|hosts| hosts.iter().map(|h| h.to_lowercase()).collect())
+            .map(|hosts| hosts.iter().map(|h| Self::normalize_host(h)).collect())
             .unwrap_or_default();
         Ok(Self {
-            ipv4_private_range,
+            ipv4_blocked_default,
             allowed_networks,
             blocked_networks,
+            allowed_networks_v6,
+            blocked_networks_v6,
             blocked_hosts,
+        })
+    }
+    pub(crate) fn is_host_blocked(&self, host: &str) -> bool {
+        let host = Self::normalize_host(host);
+        self.blocked_hosts.iter().any(|entry| {
+            if let Some(suffix) = entry.strip_prefix('.') {
+                host.ends_with(&format!(".{}", suffix))
+            } else {
+                host == *entry || host.ends_with(&format!(".{}", entry))
+            }
         })
     }
     /// IPv4アドレスの遮断判定。allowed_networks は遮断より優先。
@@ -913,7 +986,7 @@ impl NetworkPolicy {
                 return Err("Blocked address".to_owned());
             }
         }
-        if self.ipv4_private_range.contains(ip) {
+        if self.ipv4_blocked_default.contains(ip) {
             let allow = self
                 .allowed_networks
                 .as_ref()
@@ -924,6 +997,75 @@ impl NetworkPolicy {
         }
         Ok(())
     }
+    pub(crate) fn check_ip(&self, ip: IpAddr) -> Result<(), String> {
+        match ip {
+            IpAddr::V4(v4) => self.check_ipv4(&v4),
+            IpAddr::V6(v6) => {
+                if self
+                    .blocked_networks_v6
+                    .as_ref()
+                    .is_some_and(|ranges| ranges.contains(&v6))
+                {
+                    return Err("Blocked address".to_owned());
+                }
+                let segments = v6.segments();
+                if segments[0] == 0x2001 && segments[1] == 0 {
+                    return Err("Blocked address".to_owned());
+                }
+                if let Some(v4) = ipv6_embedded_ipv4(&v6) {
+                    return self.check_ipv4(&v4);
+                }
+                if v6.is_multicast()
+                    || v6.is_unicast_link_local()
+                    || v6.is_loopback()
+                    || v6.is_unspecified()
+                    || v6.is_unique_local()
+                {
+                    if self
+                        .allowed_networks_v6
+                        .as_ref()
+                        .is_some_and(|ranges| ranges.contains(&v6))
+                    {
+                        return Ok(());
+                    }
+                    return Err("Blocked address".to_owned());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn ipv6_embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4() {
+        return Some(v4);
+    }
+    let segments = v6.segments();
+    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    if segments[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[1] >> 8) as u8,
+            segments[1] as u8,
+            (segments[2] >> 8) as u8,
+            segments[2] as u8,
+        ));
+    }
+    if segments[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        return Some(std::net::Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            segments[6] as u8,
+            (segments[7] >> 8) as u8,
+            segments[7] as u8,
+        ));
+    }
+    None
 }
 
 struct DnsCacheEntry {
@@ -965,6 +1107,7 @@ pub struct DnsCache {
     max_entries: usize,
     /// singleflight: 進行中のDNS解決。同一ホストへの並列lookup_hostを1本に束ねる。
     inflight: Mutex<HashMap<String, tokio::sync::broadcast::Sender<DnsResult>>>,
+    lookup_semaphore: Semaphore,
     retry_attempts: AtomicU64,
     retry_saved: AtomicU64,
 }
@@ -1015,6 +1158,7 @@ impl DnsCache {
             dns_timeout,
             max_entries,
             inflight: Mutex::new(HashMap::new()),
+            lookup_semaphore: Semaphore::new(128),
             retry_attempts: AtomicU64::new(0),
             retry_saved: AtomicU64::new(0),
         }
@@ -1157,6 +1301,11 @@ impl DnsCache {
 
     /// 1回のlookup_host実行(タイムアウト付き)。
     async fn do_lookup(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+        let _permit = self
+            .lookup_semaphore
+            .acquire()
+            .await
+            .map_err(|_| "dns semaphore closed".to_owned())?;
         let host_port = format!("{}:{}", host, port);
         match tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host(host_port)).await {
             Ok(Ok(iter)) => {
@@ -1232,30 +1381,6 @@ impl DnsCache {
         Err(err)
     }
 }
-/// reqwest::dns::Resolve の実装ラッパー。Arc<DnsCache> を保持し、
-/// check_url と実フェッチの DNS 解決を一本化する。
-struct SharedDnsResolver(Arc<DnsCache>);
-impl reqwest::dns::Resolve for SharedDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        let cache = self.0.clone();
-        let host = name.as_str().to_owned();
-        Box::pin(async move {
-            let result = cache.resolve(&host, 0).await;
-            match result {
-                Ok((ips, _hit)) => {
-                    let addrs: Vec<std::net::SocketAddr> = ips
-                        .into_iter()
-                        .map(|ip| std::net::SocketAddr::new(ip, 0))
-                        .collect();
-                    let addrs: reqwest::dns::Addrs = Box::new(addrs.into_iter());
-                    Ok(addrs)
-                }
-                Err(e) => Err(std::io::Error::other(e).into()),
-            }
-        })
-    }
-}
-
 async fn check_url(
     policy: &NetworkPolicy,
     dns_cache: &DnsCache,
@@ -1267,14 +1392,15 @@ async fn check_url(
         scheme => return Err(format!("scheme: {}", scheme)),
     }
     let host = u.host_str().ok_or_else(|| "no host".to_owned())?;
-    if policy.blocked_hosts.contains(&host.to_lowercase()) {
+    if policy.is_host_blocked(host) {
         return Err("Blocked address".to_owned());
     }
+    let host = NetworkPolicy::normalize_host(host);
     let port = u
         .port_or_known_default()
         .ok_or_else(|| "no port".to_owned())?;
     // 同期DNS(to_socket_addrs)を廃止し、非同期解決+独自タイムアウトに置き換え。
-    let (ips, dns_cache_hit) = dns_cache.resolve(host, port).await?;
+    let (ips, dns_cache_hit) = dns_cache.resolve(&host, port).await?;
     let mut v4_count: u16 = 0;
     let mut v6_count: u16 = 0;
     for ip in &ips {
@@ -1287,17 +1413,11 @@ async fn check_url(
             }
         }
     }
+    if ips.is_empty() {
+        return Err("Blocked address".to_owned());
+    }
     for ip in ips {
-        match ip {
-            IpAddr::V4(v4) => {
-                policy.check_ipv4(&v4)?;
-            }
-            IpAddr::V6(v6) => {
-                if v6.is_multicast() || v6.is_unicast_link_local() {
-                    return Err("Blocked address".to_owned());
-                }
-            }
-        }
+        policy.check_ip(ip)?;
     }
     Ok((dns_cache_hit, v4_count, v6_count))
 }
@@ -1567,6 +1687,7 @@ fn build_stale_response(
     }
     headers.append("Cache-Control", "max-age=300".parse().unwrap());
     headers.append("X-Proxy-Stale", "1".parse().unwrap());
+    headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
     if config.encode_avif {
         headers.append("Vary", "Accept,Range".parse().unwrap());
     }
@@ -1640,6 +1761,7 @@ async fn get_file(
                 t.cache_result = Some(CacheResult::Hit);
             }
             let mut headers = HeaderMap::new();
+            headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
             if let Some(ct) = &cached.content_type {
                 if let Ok(v) = ct.parse() {
                     headers.append("Content-Type", v);
@@ -1696,6 +1818,7 @@ async fn get_file(
             match rx.recv().await {
                 Ok(Some(cached)) => {
                     let mut headers = HeaderMap::new();
+                    headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
                     if let Some(ct) = &cached.content_type {
                         if let Ok(v) = ct.parse() {
                             headers.append("Content-Type", v);
@@ -1844,15 +1967,19 @@ async fn get_file(
 
     // --- ダウンロードpermit取得(取得順序: DL permit → バイト予算 → CPU permit) ---
     let wait_start = Instant::now();
-    let dl_permit = download_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| {
+    let dl_permit = match tokio::time::timeout(
+        RESOURCE_WAIT_TIMEOUT,
+        download_semaphore.clone().acquire_owned(),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        _ => {
             let mut h = HeaderMap::new();
             h.append("X-Proxy-Error", "DownloadSemaphoreError".parse().unwrap());
-            (axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
-        })?;
+            return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
+        }
+    };
     global_stats.observe_dl_active(
         config.max_concurrent_downloads - download_semaphore.available_permits(),
     );
@@ -1862,146 +1989,212 @@ async fn get_file(
         t.dl_wait += elapsed;
     }
     let send_start = Instant::now();
-    let build_req = || {
-        let req = client.get(&q.url);
-        let remaining = config
-            .timeout
-            .saturating_sub(send_start.elapsed().as_millis() as u64);
-        let req = req.timeout(Duration::from_millis(remaining.max(1)));
-        let req = req.header("User-Agent", config.user_agent.clone());
-        if let Some(range) = client_headers.get("Range") {
-            req.header("Range", range.as_bytes())
-        } else {
-            req
-        }
-    };
-    let resp = match build_req().send().await {
-        Ok(resp) => {
-            if let Ok(mut t) = timings.lock() {
-                t.ttfb = send_start.elapsed();
-            }
-            resp
-        }
-        Err(e) => {
-            let first_err = classify_reqwest_error(&e);
-            let is_connect_phase = e.is_connect() || e.is_timeout();
-            // 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
-            let remaining_ms = config
+    // Direct fetches are revalidated by ValidatingResolver at connection time.
+    // With config.proxy, the proxy resolves the target, so only the URL pre-check
+    // applies and DNS-rebinding TOCTOU remains possible.
+    const MAX_REDIRECTS: u8 = 5;
+    let mut current_url = reqwest::Url::from_str(&q.url).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            headers.clone(),
+            format!("{:?}", e),
+        )
+            .into_response()
+    })?;
+    let mut redirects = 0;
+    let resp = loop {
+        let build_req = || {
+            let req = client.get(current_url.as_str());
+            let remaining = config
                 .timeout
                 .saturating_sub(send_start.elapsed().as_millis() as u64);
-            if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
-                global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
-                match build_req().send().await {
-                    Ok(resp) => {
-                        if let Ok(mut t) = timings.lock() {
-                            t.ttfb = send_start.elapsed();
-                            t.retried = true;
-                        }
-                        resp
-                    }
-                    Err(e2) => {
-                        let fetch_err = classify_reqwest_error(&e2);
-                        let is_fallback = q.fallback.is_some();
-                        if let Ok(mut t) = timings.lock() {
-                            t.ttfb = send_start.elapsed();
-                            t.fetch_err = Some(fetch_err.clone());
-                            t.retried = true;
-                        }
-                        headers.append(
-                            "X-Proxy-Error",
-                            format!("Send:{}", fetch_err)
-                                .parse()
-                                .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
-                        );
-                        // stale-if-error
-                        if !has_range {
-                            if let Some(stale) = response_cache.get_stale(&cache_key) {
-                                let resp = build_stale_response(&stale, &config, &timings);
-                                if let Ok(t) = timings.lock() {
-                                    emit_summary(
-                                        &config,
-                                        &summary,
-                                        &t,
-                                        200,
-                                        true,
-                                        None,
-                                        &global_stats,
-                                    );
-                                }
-                                return Err(resp);
-                            }
-                        }
-                        if let Ok(t) = timings.lock() {
-                            emit_summary(
-                                &config,
-                                &summary,
-                                &t,
-                                if is_fallback { 200 } else { 400 },
-                                true,
-                                Some(&fetch_err),
-                                &global_stats,
-                            );
-                        }
-                        if is_fallback {
-                            headers.append("Cache-Control", "no-store".parse().unwrap());
-                            headers.append("Content-Type", "image/png".parse().unwrap());
-                            return Err((
-                                axum::http::StatusCode::OK,
-                                headers,
-                                (*dummy_img).clone(),
-                            )
-                                .into_response());
-                        }
-                        headers.append("Cache-Control", "no-store".parse().unwrap());
-                        return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
-                    }
-                }
+            let req = req.timeout(Duration::from_millis(remaining.max(1)));
+            let req = req.header("User-Agent", config.user_agent.clone());
+            if let Some(range) = client_headers.get("Range") {
+                req.header("Range", range.as_bytes())
             } else {
-                // リトライ不可(接続段階以外 or 残り時間不足 or Rangeリクエスト)
-                let is_fallback = q.fallback.is_some();
+                req
+            }
+        };
+        let resp = match build_req().send().await {
+            Ok(resp) => {
                 if let Ok(mut t) = timings.lock() {
                     t.ttfb = send_start.elapsed();
-                    t.fetch_err = Some(first_err.clone());
                 }
-                headers.append(
-                    "X-Proxy-Error",
-                    format!("Send:{}", first_err)
-                        .parse()
-                        .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
-                );
-                // stale-if-error
-                if !has_range {
-                    if let Some(stale) = response_cache.get_stale(&cache_key) {
-                        let resp = build_stale_response(&stale, &config, &timings);
-                        if let Ok(t) = timings.lock() {
-                            emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+                resp
+            }
+            Err(e) => {
+                let first_err = classify_reqwest_error(&e);
+                let is_connect_phase = e.is_connect() || e.is_timeout();
+                // 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
+                let remaining_ms = config
+                    .timeout
+                    .saturating_sub(send_start.elapsed().as_millis() as u64);
+                if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
+                    global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
+                    match build_req().send().await {
+                        Ok(resp) => {
+                            if let Ok(mut t) = timings.lock() {
+                                t.ttfb = send_start.elapsed();
+                                t.retried = true;
+                            }
+                            resp
                         }
-                        return Err(resp);
+                        Err(e2) => {
+                            let fetch_err = classify_reqwest_error(&e2);
+                            let is_fallback = q.fallback.is_some();
+                            if let Ok(mut t) = timings.lock() {
+                                t.ttfb = send_start.elapsed();
+                                t.fetch_err = Some(fetch_err.clone());
+                                t.retried = true;
+                            }
+                            headers.append(
+                                "X-Proxy-Error",
+                                format!("Send:{}", fetch_err)
+                                    .parse()
+                                    .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
+                            );
+                            // stale-if-error
+                            if !has_range {
+                                if let Some(stale) = response_cache.get_stale(&cache_key) {
+                                    let resp = build_stale_response(&stale, &config, &timings);
+                                    if let Ok(t) = timings.lock() {
+                                        emit_summary(
+                                            &config,
+                                            &summary,
+                                            &t,
+                                            200,
+                                            true,
+                                            None,
+                                            &global_stats,
+                                        );
+                                    }
+                                    return Err(resp);
+                                }
+                            }
+                            if let Ok(t) = timings.lock() {
+                                emit_summary(
+                                    &config,
+                                    &summary,
+                                    &t,
+                                    if is_fallback { 200 } else { 400 },
+                                    true,
+                                    Some(&fetch_err),
+                                    &global_stats,
+                                );
+                            }
+                            if is_fallback {
+                                headers.append("Cache-Control", "no-store".parse().unwrap());
+                                headers.append("Content-Type", "image/png".parse().unwrap());
+                                return Err((
+                                    axum::http::StatusCode::OK,
+                                    headers,
+                                    (*dummy_img).clone(),
+                                )
+                                    .into_response());
+                            }
+                            headers.append("Cache-Control", "no-store".parse().unwrap());
+                            return Err(
+                                (axum::http::StatusCode::BAD_REQUEST, headers).into_response()
+                            );
+                        }
                     }
-                }
-                if let Ok(t) = timings.lock() {
-                    emit_summary(
-                        &config,
-                        &summary,
-                        &t,
-                        if is_fallback { 200 } else { 400 },
-                        true,
-                        Some(&first_err),
-                        &global_stats,
+                } else {
+                    // リトライ不可(接続段階以外 or 残り時間不足 or Rangeリクエスト)
+                    let is_fallback = q.fallback.is_some();
+                    if let Ok(mut t) = timings.lock() {
+                        t.ttfb = send_start.elapsed();
+                        t.fetch_err = Some(first_err.clone());
+                    }
+                    headers.append(
+                        "X-Proxy-Error",
+                        format!("Send:{}", first_err)
+                            .parse()
+                            .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
                     );
-                }
-                if is_fallback {
+                    // stale-if-error
+                    if !has_range {
+                        if let Some(stale) = response_cache.get_stale(&cache_key) {
+                            let resp = build_stale_response(&stale, &config, &timings);
+                            if let Ok(t) = timings.lock() {
+                                emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+                            }
+                            return Err(resp);
+                        }
+                    }
+                    if let Ok(t) = timings.lock() {
+                        emit_summary(
+                            &config,
+                            &summary,
+                            &t,
+                            if is_fallback { 200 } else { 400 },
+                            true,
+                            Some(&first_err),
+                            &global_stats,
+                        );
+                    }
+                    if is_fallback {
+                        headers.append("Cache-Control", "no-store".parse().unwrap());
+                        headers.append("Content-Type", "image/png".parse().unwrap());
+                        return Err((axum::http::StatusCode::OK, headers, (*dummy_img).clone())
+                            .into_response());
+                    }
                     headers.append("Cache-Control", "no-store".parse().unwrap());
-                    headers.append("Content-Type", "image/png".parse().unwrap());
-                    return Err(
-                        (axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
-                    );
+                    return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
                 }
-                headers.append("Cache-Control", "no-store".parse().unwrap());
+            }
+        };
+        if !resp.status().is_redirection() {
+            break resp;
+        }
+        if redirects >= MAX_REDIRECTS {
+            headers.append("X-Proxy-Error", "TooManyRedirects".parse().unwrap());
+            return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
+        }
+        let Some(location) = resp
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+        else {
+            break resp;
+        };
+        let next_url = current_url.join(location).map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                headers.clone(),
+                format!("{:?}", e),
+            )
+                .into_response()
+        })?;
+        const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
+        let mut stream = resp.bytes_stream();
+        let mut drained = 0;
+        while let Some(Ok(chunk)) = stream.next().await {
+            drained += chunk.len();
+            if drained >= MAX_REDIRECT_DRAIN {
+                break;
+            }
+        }
+        drop(stream);
+        let check_start = Instant::now();
+        match check_url(&network_policy, &dns_cache, next_url.as_str()).await {
+            Ok((_hit, v4_count, v6_count)) => {
+                if let Ok(mut t) = timings.lock() {
+                    t.check += check_start.elapsed();
+                    t.dns_v4 = t.dns_v4.saturating_add(v4_count);
+                    t.dns_v6 = t.dns_v6.saturating_add(v6_count);
+                }
+            }
+            Err(s) => {
+                if let Ok(value) = s.parse() {
+                    headers.append("X-Proxy-Error", value);
+                }
                 return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
             }
         }
+        current_url = next_url;
+        redirects += 1;
     };
     fn add_remote_header(
         key: &'static str,
@@ -2009,7 +2202,9 @@ async fn get_file(
         remote_headers: &reqwest::header::HeaderMap,
     ) {
         for v in remote_headers.get_all(key) {
-            headers.append(key, String::from_utf8_lossy(v.as_bytes()).parse().unwrap());
+            if let Ok(value) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
+                headers.append(key, value);
+            }
         }
     }
     // HTTPバージョンを記録
@@ -2051,6 +2246,7 @@ async fn get_file(
         add_remote_header("Accept-Ranges", &mut headers, remote_headers);
     }
     headers.append("Cache-Control", "no-store".parse().unwrap());
+    headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
     for line in config.append_headers.iter() {
         if let Some(idx) = line.find(":") {
             if idx + 1 >= line.len() {
@@ -2241,7 +2437,9 @@ impl RequestContext {
                 let content_disposition =
                     format!("inline; filename=\"{}\";filename*=UTF-8''{};", name, name);
                 headers.remove(k);
-                headers.append(k, content_disposition.parse().unwrap());
+                if let Ok(value) = content_disposition.parse() {
+                    headers.append(k, value);
+                }
             }
         }
     }
@@ -2323,11 +2521,19 @@ impl RequestContext {
             let budget_bytes = 8 * 1024 * 1024_u32;
             let budget_sem = self.buffer_budget.clone();
             let wait_start = Instant::now();
-            let _budget_permit = budget_sem.acquire_many(budget_bytes).await.map_err(|_| {
-                let mut h = self.headers.clone();
-                h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
-            })?;
+            let _budget_permit = match tokio::time::timeout(
+                RESOURCE_WAIT_TIMEOUT,
+                budget_sem.acquire_many(budget_bytes),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    let mut h = self.headers.clone();
+                    h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
+                    return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
+                }
+            };
             self.global_stats.observe_buf_used(
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
@@ -2339,11 +2545,16 @@ impl RequestContext {
                                          // CPU permit を取得してエンコード
             let cpu_sem = self.encode_semaphore.clone();
             let wait_start = Instant::now();
-            let _cpu_permit = cpu_sem.acquire().await.map_err(|_| {
-                let mut h = self.headers.clone();
-                h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response()
-            })?;
+            let _cpu_permit = match tokio::time::timeout(RESOURCE_WAIT_TIMEOUT, cpu_sem.acquire())
+                .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    let mut h = self.headers.clone();
+                    h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
+                    return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
+                }
+            };
             self.global_stats
                 .observe_cpu_active(num_cpus::get().max(2) - cpu_sem.available_permits());
             if let Ok(mut t) = self.timings.lock() {
@@ -2351,7 +2562,21 @@ impl RequestContext {
                 t.wait += elapsed;
                 t.cpu_wait += elapsed;
             }
-            if let Ok(img) = self.encode_svg(self.fontdb.clone()) {
+            let _decode_guard = self.phase_guard(Phase::Decode);
+            let src_bytes = std::mem::take(&mut self.src_bytes);
+            let fontdb = self.fontdb.clone();
+            let size_hint = self.image_size_hint();
+            let max_decode_pixels = (self.config.max_size / 4).max(1);
+            let timeout_ms = self.config.timeout;
+            if let Ok(img) = crate::svg::render_svg_blocking(
+                src_bytes,
+                fontdb,
+                size_hint,
+                max_decode_pixels,
+                timeout_ms,
+            )
+            .await
+            {
                 self.headers.remove("Content-Length");
                 self.headers.remove("Content-Range");
                 self.headers.remove("Accept-Ranges");
@@ -2362,12 +2587,25 @@ impl RequestContext {
                 );
                 return Err(self.response_img(img));
             } else {
-                return Err((
-                    axum::http::StatusCode::OK,
-                    self.headers.clone(),
-                    self.src_bytes.clone(),
-                )
-                    .into_response());
+                self.headers.remove("Content-Type");
+                self.headers.remove("Content-Length");
+                self.headers.remove("Content-Range");
+                self.headers.remove("Accept-Ranges");
+                if self.parms.fallback.is_some() {
+                    self.headers
+                        .append("Content-Type", "image/png".parse().unwrap());
+                    return Err((
+                        axum::http::StatusCode::OK,
+                        self.headers.clone(),
+                        (*self.dummy_img).clone(),
+                    )
+                        .into_response());
+                }
+                self.headers
+                    .append("X-Proxy-Error", "SvgEncodeError".parse().unwrap());
+                return Err(
+                    (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+                );
             }
         } else if is_img || self.codec.is_ok() {
             self.headers.remove("Content-Length");
@@ -2381,10 +2619,21 @@ impl RequestContext {
             let budget_bytes = (budget_hint.min(self.config.max_size) as u32).max(1);
             let budget_sem = self.buffer_budget.clone();
             let wait_start = Instant::now();
-            let _budget_permit = budget_sem.acquire_many(budget_bytes).await.map_err(|_| {
-                header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
-            })?;
+            let _budget_permit = match tokio::time::timeout(
+                RESOURCE_WAIT_TIMEOUT,
+                budget_sem.acquire_many(budget_bytes),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => {
+                    header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
+                    return Err(
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
+                            .into_response(),
+                    );
+                }
+            };
             self.global_stats.observe_buf_used(
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
@@ -2449,10 +2698,19 @@ impl RequestContext {
             // CPU permit を取得してからエンコード
             let cpu_sem = self.encode_semaphore.clone();
             let wait_start = Instant::now();
-            let _cpu_permit = cpu_sem.acquire().await.map_err(|_| {
-                header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
-                (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone()).into_response()
-            })?;
+            let cpu_permit =
+                match tokio::time::timeout(RESOURCE_WAIT_TIMEOUT, cpu_sem.clone().acquire_owned())
+                    .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    _ => {
+                        header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
+                        return Err(
+                            (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
+                                .into_response(),
+                        );
+                    }
+                };
             self.global_stats
                 .observe_cpu_active(num_cpus::get().max(2) - cpu_sem.available_permits());
             if let Ok(mut t) = self.timings.lock() {
@@ -2460,21 +2718,41 @@ impl RequestContext {
                 t.wait += elapsed;
                 t.cpu_wait += elapsed;
             }
+            let timeout_ms = self.config.timeout;
             let mut handle = self;
-            let resp = if let Ok(resp) = tokio::runtime::Handle::current()
-                .spawn_blocking(move || handle.encode_img())
-                .await
+            let task = tokio::runtime::Handle::current().spawn_blocking(move || {
+                let _cpu_permit = cpu_permit;
+                handle.encode_img()
+            });
+            let abort_handle = task.abort_handle();
+            let resp = match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms.max(1)),
+                task,
+            )
+            .await
             {
-                resp
-            } else {
-                header.append("X-Proxy-Error", "ImageEncodeThread".parse().unwrap());
-                return Err(if is_fallback {
-                    header.remove("Content-Type");
-                    header.append("Content-Type", "image/png".parse().unwrap());
-                    (axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
-                } else {
-                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, header).into_response()
-                });
+                Ok(Ok(resp)) => resp,
+                Ok(Err(_)) => {
+                    header.append("X-Proxy-Error", "ImageEncodeThread".parse().unwrap());
+                    return Err(if is_fallback {
+                        header.remove("Content-Type");
+                        header.append("Content-Type", "image/png".parse().unwrap());
+                        (axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
+                    } else {
+                        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, header).into_response()
+                    });
+                }
+                Err(_) => {
+                    abort_handle.abort();
+                    header.append("X-Proxy-Error", "ImageEncodeTimeout".parse().unwrap());
+                    return Err(if is_fallback {
+                        header.remove("Content-Type");
+                        header.append("Content-Type", "image/png".parse().unwrap());
+                        (axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
+                    } else {
+                        (axum::http::StatusCode::GATEWAY_TIMEOUT, header).into_response()
+                    });
+                }
             };
             if is_fallback {
                 return Err(if resp.status() == axum::http::StatusCode::OK {
@@ -2487,15 +2765,25 @@ impl RequestContext {
             }
             return Err(resp);
         }
-        if let Some(media) = self.headers.get("Content-Type") {
-            let s = String::from_utf8_lossy(media.as_bytes());
-            if crate::browsersafe::FILE_TYPE_BROWSERSAFE.contains(&s.as_ref()) {
-            } else {
-                self.headers.remove("Content-Type");
-                self.headers
-                    .append("Content-Type", "octet-stream".parse().unwrap());
-                Self::disposition_ext(&mut self.headers, ".unknown");
-            }
+        let is_browsersafe = self.headers.get("Content-Type").is_some_and(|media| {
+            let content_type = String::from_utf8_lossy(media.as_bytes());
+            crate::browsersafe::FILE_TYPE_BROWSERSAFE.contains(&content_type.as_ref())
+        });
+        if !is_browsersafe {
+            self.headers.remove("Content-Type");
+            self.headers.remove("Content-Length");
+            self.headers.remove("Content-Range");
+            self.headers.remove("Accept-Ranges");
+            self.headers
+                .append("Content-Type", "image/png".parse().unwrap());
+            self.headers
+                .append("X-Proxy-Error", "NonBrowsersafeType".parse().unwrap());
+            return Err((
+                axum::http::StatusCode::OK,
+                self.headers.clone(),
+                (*self.dummy_img).clone(),
+            )
+                .into_response());
         }
         let body = axum::body::Body::from_stream(resp);
         if status.is_success() {
@@ -2558,10 +2846,11 @@ impl RequestContext {
             );
             return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response());
         }
-        // with_capacity の初期確保を min(len_hint, 8MB) に抑える。
-        // 虚偽の巨大 Content-Length による即時巨大アロケーションを防ぐ。
-        const INITIAL_CAP_LIMIT: usize = 8 * 1024 * 1024;
-        let mut response_bytes = Vec::with_capacity((len_hint as usize).min(INITIAL_CAP_LIMIT));
+        // Never trust the remote Content-Length hint for pre-allocation
+        // (finding #5): cap the initial reservation and let the buffer grow
+        // as bytes actually arrive (still bounded by max_size below).
+        const INITIAL_CAP: u64 = 16 * 1024;
+        let mut response_bytes = Vec::with_capacity(len_hint.min(INITIAL_CAP) as usize);
         let body_start = Instant::now();
         while let Some(x) = resp.next().await {
             match x {
