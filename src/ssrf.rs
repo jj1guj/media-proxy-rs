@@ -33,6 +33,12 @@ pub(crate) struct ValidatingResolver {
     proxy_host: Option<String>,
 }
 
+fn parse_proxy_url(url: &str) -> Option<reqwest::Url> {
+    reqwest::Url::parse(url)
+        .ok()
+        .or_else(|| reqwest::Url::parse(&format!("http://{}", url)).ok())
+}
+
 impl ValidatingResolver {
     pub(crate) fn new(
         cache: Arc<DnsCache>,
@@ -40,7 +46,7 @@ impl ValidatingResolver {
         proxy: Option<&str>,
     ) -> Self {
         let proxy_host = proxy
-            .and_then(|url| reqwest::Url::parse(url).ok())
+            .and_then(parse_proxy_url)
             .and_then(|url| url.host_str().map(NetworkPolicy::normalize_host));
         Self {
             cache,
@@ -157,6 +163,34 @@ mod tests {
         rt.block_on(async {
             let name: reqwest::dns::Name = "localhost".parse().unwrap();
             assert!(r.resolve(name).await.is_err());
+        });
+    }
+
+    #[test]
+    fn proxy_url_accepts_schemeless_value() {
+        let url = parse_proxy_url("10.0.0.5:3128").expect("schemeless proxy should parse");
+        assert_eq!(url.host_str(), Some("10.0.0.5"));
+        let url = parse_proxy_url("http://10.0.0.5:3128").expect("proxy URL should parse");
+        assert_eq!(url.host_str(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn resolver_treats_schemeless_proxy_host_as_proxy() {
+        let cache = Arc::new(DnsCache::new(
+            Duration::from_secs(300),
+            Duration::from_secs(10),
+            Duration::from_secs(4),
+            16,
+        ));
+        let policy = Arc::new(test_policy());
+        let resolver = ValidatingResolver::new(cache, policy, Some("127.0.0.1:1"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let name: reqwest::dns::Name = "127.0.0.1".parse().unwrap();
+            assert!(resolver.resolve(name).await.is_ok());
         });
     }
 }

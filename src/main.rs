@@ -1099,6 +1099,7 @@ pub struct DnsCache {
     max_entries: usize,
     /// singleflight: 進行中のDNS解決。同一ホストへの並列lookup_hostを1本に束ねる。
     inflight: Mutex<HashMap<String, tokio::sync::broadcast::Sender<DnsResult>>>,
+    lookup_semaphore: Semaphore,
     retry_attempts: AtomicU64,
     retry_saved: AtomicU64,
 }
@@ -1149,6 +1150,7 @@ impl DnsCache {
             dns_timeout,
             max_entries,
             inflight: Mutex::new(HashMap::new()),
+            lookup_semaphore: Semaphore::new(128),
             retry_attempts: AtomicU64::new(0),
             retry_saved: AtomicU64::new(0),
         }
@@ -1291,6 +1293,11 @@ impl DnsCache {
 
     /// 1回のlookup_host実行(タイムアウト付き)。
     async fn do_lookup(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+        let _permit = self
+            .lookup_semaphore
+            .acquire()
+            .await
+            .map_err(|_| "dns semaphore closed".to_owned())?;
         let host_port = format!("{}:{}", host, port);
         match tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host(host_port)).await {
             Ok(Ok(iter)) => {
