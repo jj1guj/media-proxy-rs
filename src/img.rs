@@ -1,5 +1,5 @@
 use axum::response::IntoResponse;
-use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView, ImageDecoder};
+use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
 
 use crate::{Phase, RequestContext};
 
@@ -193,72 +193,7 @@ impl RequestContext {
                     .map(|s| std::str::from_utf8(s.as_bytes()))
                 {
                     Some(Ok("image/jxl")) => {
-                        let animation = {
-                            let _dg = self.phase_guard(Phase::Decode);
-                            crate::jxl_animation::decode_animation(
-                                &self.src_bytes,
-                                max_decode_pixels,
-                                ANIMATION_FRAMES_LIMIT,
-                            )
-                        };
-                        match animation {
-                            Ok(Some((frames, loop_count))) => {
-                                let frames =
-                                    image::Frames::new(Box::new(frames.into_iter().map(Ok)));
-                                return self.encode_anim(frames, loop_count);
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                let value = reqwest::header::HeaderValue::from_bytes(
-                                    format!("JpegXL Error:{error}").as_bytes(),
-                                )
-                                .unwrap_or_else(|_| {
-                                    reqwest::header::HeaderValue::from_static("JpegXLError")
-                                });
-                                self.headers.append("X-Proxy-Error", value);
-                                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
-                                    .into_response();
-                            }
-                        }
-                        let decoder = match jxl_oxide::integration::JxlDecoder::new(
-                            std::io::Cursor::new(&self.src_bytes),
-                        ) {
-                            Ok(decoder) => decoder,
-                            Err(error) => {
-                                let value = reqwest::header::HeaderValue::from_bytes(
-                                    format!("JpegXL Error:{:?}", error).as_bytes(),
-                                )
-                                .unwrap_or_else(|_| {
-                                    reqwest::header::HeaderValue::from_static("JpegXLError")
-                                });
-                                self.headers.append("X-Proxy-Error", value);
-                                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
-                                    .into_response();
-                            }
-                        };
-                        let (width, height) = decoder.dimensions();
-                        if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
-                            return self.decode_limit_response(width as u64, height as u64);
-                        }
-                        let img = {
-                            let _dg = self.phase_guard(Phase::Decode);
-                            DynamicImage::from_decoder(decoder)
-                        };
-                        let img = match img {
-                            Ok(img) => img,
-                            Err(e) => {
-                                let value = reqwest::header::HeaderValue::from_bytes(
-                                    format!("JpegXL Error:{:?}", e).as_bytes(),
-                                )
-                                .unwrap_or_else(|_| {
-                                    reqwest::header::HeaderValue::from_static("JpegXLError")
-                                });
-                                self.headers.append("X-Proxy-Error", value);
-                                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
-                                    .into_response();
-                            }
-                        };
-                        return self.response_img(img);
+                        return self.encode_jxl(max_decode_pixels);
                     }
                     Some(Ok("image/jp2")) => {
                         let dimensions = jpeg2k::DumpImage::from_bytes(&self.src_bytes)
@@ -588,6 +523,151 @@ impl RequestContext {
             }
             _ => self.encode_single(),
         }
+    }
+    fn encode_jxl(&mut self, max_decode_pixels: u64) -> axum::response::Response {
+        let image = {
+            let _dg = self.phase_guard(Phase::Decode);
+            jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(&self.src_bytes))
+        };
+        let mut image = match image {
+            Ok(image) => image,
+            Err(e) => {
+                self.headers.append("X-Proxy-Error", jxl_error_value(e));
+                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+            }
+        };
+
+        if image.pixel_format().has_black() {
+            image.request_color_encoding(jxl_oxide::EnumColourEncoding::srgb(
+                jxl_oxide::RenderingIntent::Relative,
+            ));
+        }
+
+        let (width, height) = (image.width(), image.height());
+        if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
+            return self.decode_limit_response(width as u64, height as u64);
+        }
+
+        let keyframes = image.num_loaded_keyframes();
+        let animated = image.image_header().metadata.animation.is_some() && keyframes > 1;
+        if animated && !image.is_loading_done() {
+            self.headers
+                .append("X-Proxy-Error", "JpegXLTruncated".parse().unwrap());
+            return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+        }
+
+        if !animated {
+            let render = {
+                let _dg = self.phase_guard(Phase::Decode);
+                image.render_frame(0)
+            };
+            let render = match render {
+                Ok(render) => render,
+                Err(e) => {
+                    self.headers.append("X-Proxy-Error", jxl_error_value(e));
+                    return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                        .into_response();
+                }
+            };
+            let img = match jxl_render_to_image(&render) {
+                Some(img) => img,
+                None => {
+                    self.headers.append(
+                        "X-Proxy-Error",
+                        "JpegXLUnsupportedPixelFormat".parse().unwrap(),
+                    );
+                    return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                        .into_response();
+                }
+            };
+            return self.response_img(img);
+        }
+
+        let canvas_pixels = (width as u64).saturating_mul(height as u64);
+        let frame_count = keyframes as u64;
+        if frame_count > ANIMATION_FRAMES_LIMIT {
+            self.headers.append(
+                "X-Proxy-Error",
+                format!("FramesLimit {}>{}", frame_count, ANIMATION_FRAMES_LIMIT)
+                    .parse()
+                    .unwrap(),
+            );
+            return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+        }
+        let total_pixels = canvas_pixels.saturating_mul(frame_count);
+        if total_pixels > max_decode_pixels {
+            self.headers.append(
+                "X-Proxy-Error",
+                format!("DecodePixels {}>{}", total_pixels, max_decode_pixels)
+                    .parse()
+                    .unwrap(),
+            );
+            return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+        }
+
+        let anim = image.image_header().metadata.animation.as_ref().unwrap();
+        let tps_num = (anim.tps_numerator as u64).max(1);
+        let tps_den = anim.tps_denominator as u64;
+        let loop_count = anim.num_loops;
+        let mut collected: Vec<Result<image::Frame, image::ImageError>> =
+            Vec::with_capacity(keyframes.min(ANIMATION_FRAMES_LIMIT as usize));
+        let mut cumulative_ticks = 0u64;
+        let mut emitted_ms = 0u64;
+
+        for keyframe in 0..keyframes {
+            if collected.len() >= ANIMATION_FRAMES_LIMIT as usize {
+                self.headers.append(
+                    "X-Proxy-Error",
+                    format!("FramesLimit {}", ANIMATION_FRAMES_LIMIT)
+                        .parse()
+                        .unwrap(),
+                );
+                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+            }
+
+            let render = {
+                let _dg = self.phase_guard(Phase::Decode);
+                image.render_frame(keyframe)
+            };
+            let render = match render {
+                Ok(render) => render,
+                Err(e) => {
+                    self.headers.append("X-Proxy-Error", jxl_error_value(e));
+                    return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                        .into_response();
+                }
+            };
+            let img = match jxl_render_to_image(&render) {
+                Some(img) => img,
+                None => {
+                    self.headers.append(
+                        "X-Proxy-Error",
+                        "JpegXLUnsupportedPixelFormat".parse().unwrap(),
+                    );
+                    return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                        .into_response();
+                }
+            };
+            cumulative_ticks = cumulative_ticks.saturating_add(render.duration() as u64);
+            let cumulative_ms = cumulative_ticks
+                .saturating_mul(tps_den)
+                .saturating_mul(1000)
+                / tps_num;
+            let dur_ms = cumulative_ms.saturating_sub(emitted_ms);
+            emitted_ms = cumulative_ms;
+            let delay =
+                image::Delay::from_saturating_duration(std::time::Duration::from_millis(dur_ms));
+            collected.push(Ok(image::Frame::from_parts(img.into_rgba8(), 0, 0, delay)));
+        }
+
+        if collected.is_empty() {
+            self.headers
+                .append("X-Proxy-Error", "NoAvailableFrames".parse().unwrap());
+            return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
+        }
+
+        let frames = image::Frames::new(Box::new(collected.into_iter()));
+        self.encode_anim(frames, loop_count)
     }
     fn encode_anim(&self, frames: image::Frames, loop_count: u32) -> axum::response::Response {
         let _g = self.phase_guard(Phase::Encode);
@@ -935,6 +1015,31 @@ pub fn image_to_frame(
         _ => Err("Unimplemented"),
     }
 }
+
+fn jxl_error_value(e: impl std::fmt::Debug) -> reqwest::header::HeaderValue {
+    reqwest::header::HeaderValue::from_bytes(format!("JpegXL Error:{:?}", e).as_bytes())
+        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("JpegXLError"))
+}
+
+fn jxl_render_to_image(render: &jxl_oxide::Render) -> Option<DynamicImage> {
+    let mut stream = render.stream();
+    let width = stream.width();
+    let height = stream.height();
+    let channels = stream.channels() as usize;
+    let len = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(channels)?;
+    let mut buf = vec![0u8; len];
+    stream.write_to_buffer(&mut buf);
+    match channels {
+        1 => image::ImageBuffer::from_raw(width, height, buf).map(DynamicImage::ImageLuma8),
+        2 => image::ImageBuffer::from_raw(width, height, buf).map(DynamicImage::ImageLumaA8),
+        3 => image::ImageBuffer::from_raw(width, height, buf).map(DynamicImage::ImageRgb8),
+        4 => image::ImageBuffer::from_raw(width, height, buf).map(DynamicImage::ImageRgba8),
+        _ => None,
+    }
+}
+
 fn resize(
     img: DynamicImage,
     max_width: u32,

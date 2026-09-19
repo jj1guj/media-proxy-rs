@@ -22,7 +22,6 @@ mod browsersafe;
 mod cache;
 mod image_test;
 mod img;
-mod jxl_animation;
 mod ssrf;
 mod svg;
 
