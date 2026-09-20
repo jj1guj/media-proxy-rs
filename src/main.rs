@@ -22,6 +22,7 @@ mod browsersafe;
 mod cache;
 mod image_test;
 mod img;
+mod mng;
 mod ssrf;
 mod svg;
 
@@ -3236,7 +3237,7 @@ impl RequestContext {
                     if libvips_dep::is_vips(head) {
                         is_img = true;
                     }
-                    if imagemagick_dep::is_mng(head) {
+                    if head.starts_with(&crate::mng::SIGNATURE) {
                         is_img = true;
                         self.headers.remove("Content-Type");
                         self.headers

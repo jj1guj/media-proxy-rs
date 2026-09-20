@@ -18,11 +18,6 @@ RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && meson build --p
 RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build"
 RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build install"
 
-FROM public.ecr.aws/docker/library/alpine:latest AS imagemagick
-RUN apk add --no-cache bash build-base git pkgconf
-COPY crossfiles /app/crossfiles
-RUN IMAGEMAGICK_PREFIX=/imagemagick bash /app/crossfiles/build-imagemagick.sh
-
 FROM --platform=$TARGETPLATFORM public.ecr.aws/docker/library/alpine:latest AS vips
 RUN apk add --no-cache bash build-base expat-dev git glib-dev meson ninja pkgconf python3
 COPY crossfiles /app/crossfiles
@@ -37,15 +32,12 @@ ENV PKG_CONFIG_LIBDIR=/dav1d/lib/pkgconfig:/lcms2/lib/pkgconfig
 ENV PKG_CONFIG_PATH=/dav1d/lib/pkgconfig:/lcms2/lib/pkgconfig
 ENV LIBVIPS_PREFIX=/vips
 ENV GLIB_LIB_DIR=/vips-system-lib
-ENV IMAGEMAGICK_PREFIX=/imagemagick
 WORKDIR /app
 COPY avif-decoder_dep ./avif-decoder_dep
-COPY imagemagick_dep ./imagemagick_dep
 COPY libvips_dep ./libvips_dep
 COPY .gitmodules ./.gitmodules
 COPY --from=dav1d /dav1d /dav1d
 COPY --from=lcms2 /lcms2 /lcms2
-COPY --from=imagemagick /imagemagick /imagemagick
 COPY --from=vips /vips /vips
 COPY --from=vips /usr/lib /vips-system-lib
 ENV LD_LIBRARY_PATH=/dav1d/lib:/lcms2/lib
