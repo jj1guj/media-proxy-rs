@@ -127,6 +127,24 @@ impl RequestContext {
     }
     pub(crate) fn encode_img(&mut self) -> axum::response::Response {
         let max_decode_pixels = (self.config.max_size / 4).max(1);
+        if self.codec.is_err() && libvips_dep::is_vips(&self.src_bytes) {
+            let decoded = {
+                let _dg = self.phase_guard(Phase::Decode);
+                libvips_dep::decode(&self.src_bytes, max_decode_pixels)
+            };
+            return match decoded {
+                Ok(img) => self.response_img(img),
+                Err(error) => {
+                    self.headers.append(
+                        "X-Proxy-Error",
+                        format!("VIPS Error:{error}")
+                            .parse()
+                            .unwrap_or_else(|_| "VIPSError".parse().unwrap()),
+                    );
+                    (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+                }
+            };
+        }
         if self.codec.is_ok() {
             if let Some((width, height)) = probe_dimensions(&self.src_bytes) {
                 if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {

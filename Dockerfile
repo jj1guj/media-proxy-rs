@@ -18,6 +18,11 @@ RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && meson build --p
 RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build"
 RUN cd /lcms2_src && bash -c "source /app/crossfiles/meson.sh && ninja -C build install"
 
+FROM --platform=$TARGETPLATFORM public.ecr.aws/docker/library/alpine:latest AS vips
+RUN apk add --no-cache bash build-base expat-dev git glib-dev meson ninja pkgconf python3
+COPY crossfiles /app/crossfiles
+RUN LIBVIPS_PREFIX=/vips bash /app/crossfiles/build-libvips.sh
+
 FROM --platform=$BUILDPLATFORM cross_build AS build_app
 ENV CARGO_HOME=/var/cache/cargo
 ENV SYSTEM_DEPS_LINK=static
@@ -25,11 +30,16 @@ ENV TURBOJPEG_SOURCE=vendor
 ENV PKG_CONFIG_ALLOW_CROSS=1
 ENV PKG_CONFIG_LIBDIR=/dav1d/lib/pkgconfig:/lcms2/lib/pkgconfig
 ENV PKG_CONFIG_PATH=/dav1d/lib/pkgconfig:/lcms2/lib/pkgconfig
+ENV LIBVIPS_PREFIX=/vips
+ENV GLIB_LIB_DIR=/vips-system-lib
 WORKDIR /app
 COPY avif-decoder_dep ./avif-decoder_dep
+COPY libvips_dep ./libvips_dep
 COPY .gitmodules ./.gitmodules
 COPY --from=dav1d /dav1d /dav1d
 COPY --from=lcms2 /lcms2 /lcms2
+COPY --from=vips /vips /vips
+COPY --from=vips /usr/lib /vips-system-lib
 ENV LD_LIBRARY_PATH=/dav1d/lib:/lcms2/lib
 COPY src ./src
 COPY Cargo.toml ./Cargo.toml
@@ -40,8 +50,10 @@ RUN --mount=type=cache,target=/var/cache/cargo --mount=type=cache,target=/app/ta
 FROM public.ecr.aws/docker/library/alpine:latest
 ARG UID="852"
 ARG GID="852"
-RUN addgroup -g "${GID}" proxy && adduser -u "${UID}" -G proxy -D -h /media-proxy-rs -s /bin/sh proxy
+RUN apk add --no-cache expat glib libgcc && addgroup -g "${GID}" proxy && adduser -u "${UID}" -G proxy -D -h /media-proxy-rs -s /bin/sh proxy
 WORKDIR /media-proxy-rs
+COPY --from=vips /vips/lib/ /usr/local/lib/
+ENV LD_LIBRARY_PATH=/usr/local/lib
 USER proxy
 COPY --from=build_app /app/media-proxy-rs ./media-proxy-rs
 COPY --from=build_app /app/healthcheck ./healthcheck
