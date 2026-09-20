@@ -32,6 +32,9 @@ fn main() {
     }
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=dylib=vips");
+    println!("cargo:rustc-link-lib=dylib=gobject-2.0");
+    println!("cargo:rustc-link-lib=dylib=glib-2.0");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
     if let Some(glib_lib_dir) = env::var_os("GLIB_LIB_DIR") {
         println!(
