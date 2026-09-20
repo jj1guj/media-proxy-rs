@@ -57,7 +57,6 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 USER proxy
 COPY --from=build_app /app/media-proxy-rs ./media-proxy-rs
 COPY --from=build_app /app/healthcheck ./healthcheck
-RUN sh -c "./media-proxy-rs&" && ./healthcheck http://127.0.0.1:12766/healthz
 HEALTHCHECK --interval=30s --timeout=3s CMD ./healthcheck http://127.0.0.1:12766/healthz || exit 1
 EXPOSE 12766
 CMD ["./media-proxy-rs"]
