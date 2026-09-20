@@ -3925,7 +3925,6 @@ dependencies = [
  "anyhow",
  "cmake",
  "libc",
- "pkg-config",
 ]
 
 [[package]]
