@@ -2513,6 +2513,9 @@ impl RequestContext {
                         self.headers
                             .append("Content-Type", "application/pdf".parse().unwrap());
                     }
+                    if libvips_dep::is_vips(head) {
+                        is_img = true;
+                    }
                 }
             }
         }

@@ -3,6 +3,10 @@ name = "media-proxy-rs"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = ["avif-decoder_dep", "libvips_dep"]
+resolver = "2"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [features]
 default = ["avif-decoder"]
@@ -48,7 +52,10 @@ mailparse = "0.17.0"
 iprange = "0.6.7"
 ipnet = "2"
 num_cpus = "1.17.0"
-turbojpeg = { version = "1.4", features = ["image"] }
+turbojpeg = { version = "1.4", default-features = false, features = [
+    "cmake",
+    "image",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indexmap = "2"
@@ -56,6 +63,7 @@ sha2 = "0.10"
 heic-rs = { version = "0.1.1", default-features = false }
 hayro = { version = "0.7.1", default-features = false }
 tower-http = { version = "0.7", features = ["catch-panic"] }
+libvips_dep = { path = "./libvips_dep" }
 
 [profile.release]
 strip = true
