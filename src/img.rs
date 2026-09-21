@@ -3,6 +3,25 @@ use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
 
 use crate::{Phase, RequestContext};
 
+/// 依存クレート/外部データ由来のエラーメッセージから `X-Proxy-Error` の値を組み立てる。
+/// zune-core の `Debug` 実装 (`writeln!` で末尾に改行を付与) のように、依存クレートの
+/// 手書き `Debug`/`Display` は `HeaderValue` が拒否する制御文字を含み得るため、
+/// 生成した文字列を直接 `.parse().unwrap()` してはならない (P-01)。
+pub(crate) fn error_header_value(msg: impl AsRef<str>) -> reqwest::header::HeaderValue {
+	error_header_value_or(msg, "DecodeError")
+}
+
+/// `error_header_value` の、フォールバック静的トークンを指定できる版。
+pub(crate) fn error_header_value_or(
+	msg: impl AsRef<str>,
+	fallback: &'static str,
+) -> reqwest::header::HeaderValue {
+	reqwest::header::HeaderValue::from_bytes(msg.as_ref().as_bytes())
+		.unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(fallback))
+}
+
+/// Header-only dimension probe (no pixel allocation). Returns None for
+/// formats the `image` crate cannot guess (JXL/JP2/JXR have per-path checks).
 pub(crate) fn probe_dimensions(src: &[u8]) -> Option<(u32, u32)> {
     let reader = image::ImageReader::new(std::io::Cursor::new(src))
         .with_guessed_format()
@@ -124,15 +143,14 @@ fn png_apng_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), Str
 	Ok(())
 }
 
-/// GIF事前スキャン(`frames*canvas_pixels`予算、`webp_animation_within_budget`と同じ
-/// 考え方):GIFには事前のフレーム数が無いため、ブロック構造(拡張ブロックと画像
-/// ディスクリプタ)を走査してピクセルデータをデコードせずにフレームを数える。
+/// GIF事前スキャン:画像ディスクリプタの矩形合計をデコーダが実際に確保する
+/// ピクセル数とみなし、論理画面を超える矩形は仕様上不正なので即座に拒否する
+/// (`gif`/`image` クレートは `check_frame_consistency` の既定が false で矩形を検証しない)。
+/// `webp_animation_within_budget` / `png_apng_within_budget` と同じ考え方。
 fn gif_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), String> {
 	if data.len() < 13 || !(data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
 		return Ok(());
 	}
-	let canvas_pixels = (u16::from_le_bytes([data[6], data[7]]) as u64)
-		.saturating_mul(u16::from_le_bytes([data[8], data[9]]) as u64);
 	let packed = data[10];
 	let mut off = 13usize;
 	if packed & 0x80 != 0 {
@@ -143,6 +161,8 @@ fn gif_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<()
 		};
 	}
 	let mut frames = 0u64;
+	// 実際にデコーダが確保する量(image descriptor 矩形面積の総和)。
+	let mut decoded_pixels = 0u64;
 	loop {
 		let Some(&tag) = data.get(off) else {
 			return Ok(());
@@ -172,12 +192,33 @@ fn gif_animation_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<()
 				if frames > ANIMATION_FRAMES_LIMIT {
 					return Err(format!("FramesLimit {}>{}", frames, ANIMATION_FRAMES_LIMIT));
 				}
-				let total = canvas_pixels.saturating_mul(frames);
-				if total > max_decode_pixels {
-					return Err(format!("DecodePixels {}>{}", total, max_decode_pixels));
-				}
 				if off + 10 > data.len() {
 					return Ok(());
+				}
+				// Image Descriptor: tag(1) + Left(2) + Top(2) + Width(2) + Height(2) + Packed(1)。
+				// gif/image クレートは矩形が論理画面内であることを検証しない
+				// (check_frame_consistency の既定は false) ため、ここで明示的に拒否する。
+				let rect_w = u16::from_le_bytes([data[off + 5], data[off + 6]]) as u64;
+				let rect_h = u16::from_le_bytes([data[off + 7], data[off + 8]]) as u64;
+				let (screen_w, screen_h) = (
+					u16::from_le_bytes([data[6], data[7]]) as u64,
+					u16::from_le_bytes([data[8], data[9]]) as u64,
+				);
+				if rect_w > screen_w || rect_h > screen_h {
+					return Err(format!(
+						"FrameRect {}x{} exceeds screen {}x{}",
+						rect_w, rect_h, screen_w, screen_h
+					));
+				}
+				// デコーダは各フレームでこの矩形サイズのバッファを確保し、
+				// encode_anim がフレーム数上限まで蓄積するため、総和で予算判定する
+				// (webp/png の予算と同じ考え方)。
+				decoded_pixels = decoded_pixels.saturating_add(rect_w.saturating_mul(rect_h));
+				if decoded_pixels > max_decode_pixels {
+					return Err(format!(
+						"DecodePixels {}>{}",
+						decoded_pixels, max_decode_pixels
+					));
 				}
 				let local_packed = data[off + 9];
 				off += 10;
@@ -219,6 +260,7 @@ impl RequestContext {
     }
 
     pub(crate) fn image_size_hint(&self) -> (u32, u32) {
+		const WEBP_MAX_DIMENSION: u32 = 16383;
         if self.parms.badge.is_some() {
             return (96, 96);
         }
@@ -226,13 +268,13 @@ impl RequestContext {
             return (498, 422);
         }
         if self.parms.emoji.is_some() {
-            return (u32::MAX, 128);
+			return (WEBP_MAX_DIMENSION, 128);
         }
         if self.parms.preview.is_some() {
             return (200, 200);
         }
         if self.parms.avatar.is_some() {
-            return (u32::MAX, 320);
+			return (WEBP_MAX_DIMENSION, 320);
         }
         (self.config.max_pixels, self.config.max_pixels)
     }
@@ -281,16 +323,19 @@ impl RequestContext {
                 Err(error) => {
                     self.headers.append(
                         "X-Proxy-Error",
-                        format!("VIPS Error:{error}")
-                            .parse()
-                            .unwrap_or_else(|_| "VIPSError".parse().unwrap()),
+						error_header_value_or(format!("VIPS Error:{error}"), "VIPSError"),
                     );
                     (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
                 }
             };
         }
-        if self.codec.is_ok() {
-            if let Some((width, height)) = probe_dimensions(&self.src_bytes) {
+        if let Ok(codec) = self.codec {
+            if let Ok((width, height)) = image::ImageReader::with_format(
+                std::io::Cursor::new(&self.src_bytes),
+                codec,
+            )
+            .into_dimensions()
+            {
                 if !dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
                     return self.decode_limit_response(width as u64, height as u64);
                 }
@@ -339,7 +384,7 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-                                    format!("Jpeg2000 Error:{:?}", e).parse().unwrap(),
+									error_header_value(format!("Jpeg2000 Error:{:?}", e)),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -401,7 +446,7 @@ impl RequestContext {
                             Ok(Err(e)) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-                                    format!("JpegXR decode pixels {:?}", e).parse().unwrap(),
+									error_header_value(format!("JpegXR decode pixels {:?}", e)),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -409,7 +454,7 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-                                    format!("JpegXR decode bytes {:?}", e).parse().unwrap(),
+									error_header_value(format!("JpegXR decode bytes {:?}", e)),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -452,7 +497,7 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-                                    format!("HEIC Error:{:?}", e).parse().unwrap(),
+									error_header_value(format!("HEIC Error:{:?}", e)),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -512,7 +557,7 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-                                    format!("PDF Error:{:?}", e).parse().unwrap(),
+									error_header_value(format!("PDF Error:{:?}", e)),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -522,7 +567,7 @@ impl RequestContext {
                     _ => {
                         self.headers.append(
                             "X-Proxy-Error",
-                            format!("CodecError:{:?}", e).parse().unwrap(),
+							error_header_value(format!("CodecError:{:?}", e)),
                         );
                         return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                             .into_response();
@@ -552,8 +597,10 @@ impl RequestContext {
                     return self.encode_single();
                 }
                 if let Err(e) = png_apng_within_budget(&self.src_bytes, max_decode_pixels) {
-                    self.headers
-                        .append("X-Proxy-Error", format!("ApngAnim {}", e).parse().unwrap());
+					self.headers.append(
+						"X-Proxy-Error",
+						error_header_value_or(format!("ApngAnim {}", e), "ApngAnim"),
+					);
                     return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                         .into_response();
                 }
@@ -567,8 +614,10 @@ impl RequestContext {
             }
             image::ImageFormat::Gif => {
                 if let Err(e) = gif_animation_within_budget(&self.src_bytes, max_decode_pixels) {
-                    self.headers
-                        .append("X-Proxy-Error", format!("GifAnim {}", e).parse().unwrap());
+					self.headers.append(
+						"X-Proxy-Error",
+						error_header_value_or(format!("GifAnim {}", e), "GifAnim"),
+					);
                     return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                         .into_response();
                 }
@@ -591,8 +640,10 @@ impl RequestContext {
                     let max_decode_pixels = (self.config.max_size / 4).max(1);
                     if let Err(e) = webp_animation_within_budget(&self.src_bytes, max_decode_pixels)
                     {
-                        self.headers
-                            .append("X-Proxy-Error", format!("WebPAnim {}", e).parse().unwrap());
+						self.headers.append(
+							"X-Proxy-Error",
+							error_header_value_or(format!("WebPAnim {}", e), "WebPAnim"),
+						);
                         return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                             .into_response();
                     }
@@ -815,7 +866,7 @@ impl RequestContext {
 			Err(error) => {
 				self.headers.append(
 					"X-Proxy-Error",
-					error_header_value(format!("MngAnim {}", error), "MngError"),
+					error_header_value_or(format!("MngAnim {}", error), "MngError"),
 				);
 				return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 					.into_response();
@@ -827,7 +878,7 @@ impl RequestContext {
 			}
 			self.headers.append(
 				"X-Proxy-Error",
-				error_header_value("NoAvailableFrames".to_owned(), "MngError"),
+				error_header_value_or("NoAvailableFrames", "MngError"),
 			);
 			return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
 		}
@@ -936,9 +987,18 @@ impl RequestContext {
     fn encode_single(&mut self) -> axum::response::Response {
         let img = {
             let _dg = self.phase_guard(Phase::Decode);
+			let max_alloc = (self.config.max_size / 4).max(1).saturating_mul(4);
             let img = match &self.codec {
-                Ok(codec) => image::load_from_memory_with_format(&self.src_bytes, *codec)
-                    .map_err(|e| format!("{:?}", e)),
+				Ok(codec) => {
+					let mut reader = image::ImageReader::with_format(
+						std::io::Cursor::new(&self.src_bytes),
+						*codec,
+					);
+					let mut limits = image::Limits::default();
+					limits.max_alloc = Some(max_alloc);
+					reader.limits(limits);
+					reader.decode().map_err(|e| format!("{:?}", e))
+				}
                 Err(Some(e)) => Err(format!("{:?}", e)),
                 _ => {
                     self.headers
@@ -952,7 +1012,7 @@ impl RequestContext {
                 Err(e) => {
                     self.headers.append(
                         "X-Proxy-Error",
-                        format!("DecodeError_{}", e).parse().unwrap(),
+						error_header_value(format!("DecodeError_{}", e)),
                     );
                     return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                         .into_response();
@@ -1011,7 +1071,7 @@ impl RequestContext {
                         Err(e) => {
                             self.headers.append(
                                 "X-Proxy-Error",
-                                format!("EncodeError_{:?}", e).parse().unwrap(),
+								error_header_value(format!("EncodeError_{:?}", e)),
                             );
                             (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                 .into_response()
@@ -1040,7 +1100,7 @@ impl RequestContext {
                         Err(e) => {
                             self.headers.append(
                                 "X-Proxy-Error",
-                                format!("EncodeError_{:?}", e).parse().unwrap(),
+                                error_header_value(format!("EncodeError_{:?}", e)),
                             );
                             (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                 .into_response()
@@ -1062,7 +1122,7 @@ impl RequestContext {
             Err(e) => {
                 self.headers.append(
                     "X-Proxy-Error",
-                    format!("EncodeError_{:?}", e).parse().unwrap(),
+					error_header_value(format!("EncodeError_{:?}", e)),
                 );
                 (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
             }
@@ -1182,14 +1242,8 @@ pub fn image_to_frame(
     }
 }
 
-fn error_header_value(msg: String, fallback: &'static str) -> reqwest::header::HeaderValue {
-    reqwest::header::HeaderValue::from_bytes(msg.as_bytes())
-        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(fallback))
-}
-
 fn jxl_error_value(e: impl std::fmt::Debug) -> reqwest::header::HeaderValue {
-    reqwest::header::HeaderValue::from_bytes(format!("JpegXL Error:{:?}", e).as_bytes())
-        .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("JpegXLError"))
+	error_header_value_or(format!("JpegXL Error:{:?}", e), "JpegXLError")
 }
 
 fn jxl_render_to_image(render: &jxl_oxide::Render) -> Option<DynamicImage> {
@@ -1397,9 +1451,20 @@ mod tests {
 	}
 	#[test]
 	fn gif_decode_pixels_over_budget_is_err() {
-		let data = build_gif(65000, 65000, &[gif_frame(1, 1)]);
+		// 修正後の予算は「矩形面積の総和」(G-01)。矩形は論理画面内に収まるが
+		// 総和が予算を超えるケースで DecodePixels となる。
+		let data = build_gif(100, 100, &[gif_frame(100, 100)]);
 		let err = gif_animation_within_budget(&data, 1_000).unwrap_err();
 		assert!(err.contains("DecodePixels"), "{}", err);
+	}
+	#[test]
+	fn gif_frame_rect_exceeding_screen_is_err() {
+		// G-01 の実 PoC: 論理画面 1x1 に対して矩形 65535x65535 は画面外。
+		// 旧予算 (canvas*frames = 1*1*1 = 1) はこれを迂回していたため、矩形が
+		// 論理画面を超える場合は FrameRect として事前拒否する。
+		let data = build_gif(1, 1, &[gif_frame(65535, 65535)]);
+		let err = gif_animation_within_budget(&data, 1_000).unwrap_err();
+		assert!(err.contains("FrameRect"), "{}", err);
 	}
 	#[test]
 	fn gif_extension_blocks_are_not_counted_as_frames() {

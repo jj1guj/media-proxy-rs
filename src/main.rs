@@ -1155,7 +1155,9 @@ fn main() {
         network_policy.clone(),
         config.proxy.as_deref(),
     )));
-    let client = client.connect_timeout(Duration::from_millis(config.connect_timeout_ms));
+    let client = client
+        .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
+        .read_timeout(Duration::from_millis(config.timeout));
     if config.connect_timeout_ms >= config.timeout {
         tracing::warn!(
             connect_timeout_ms = config.connect_timeout_ms,
@@ -1388,7 +1390,13 @@ fn main() {
                 }
             });
         }
-        let http_addr: SocketAddr = arg_tup.1.bind_addr.parse().unwrap();
+        let http_addr: SocketAddr = match arg_tup.1.bind_addr.parse() {
+            Ok(address) => address,
+            Err(error) => {
+                tracing::error!(bind_addr = ?arg_tup.1.bind_addr, %error, "不正なbind_addr設定");
+                std::process::exit(1);
+            }
+        };
         let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
         let app = Router::new();
         let app = app.route(
@@ -1443,7 +1451,12 @@ pub struct NetworkPolicy {
 }
 impl NetworkPolicy {
     fn normalize_host(host: &str) -> String {
-        host.trim_end_matches('.').to_lowercase()
+        let host = host.trim_end_matches('.');
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
+        host.to_lowercase()
     }
 
     fn parse_ranges(
@@ -1613,6 +1626,14 @@ fn ipv6_embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
             segments[7] as u8,
         ));
     }
+	if (segments[4] == 0 || segments[4] == 0x0200) && segments[5] == 0x5efe {
+		return Some(std::net::Ipv4Addr::new(
+			(segments[6] >> 8) as u8,
+			segments[6] as u8,
+			(segments[7] >> 8) as u8,
+			segments[7] as u8,
+		));
+	}
     None
 }
 
@@ -1655,7 +1676,7 @@ pub struct DnsCache {
     max_entries: usize,
     /// singleflight: 進行中のDNS解決。同一ホストへの並列lookup_hostを1本に束ねる。
     inflight: Mutex<HashMap<String, tokio::sync::broadcast::Sender<DnsResult>>>,
-    lookup_semaphore: Semaphore,
+    lookup_semaphore: Arc<Semaphore>,
     retry_attempts: AtomicU64,
     retry_saved: AtomicU64,
     retry_attempts_total: AtomicU64,
@@ -1708,7 +1729,7 @@ impl DnsCache {
             dns_timeout,
             max_entries,
             inflight: Mutex::new(HashMap::new()),
-            lookup_semaphore: Semaphore::new(128),
+            lookup_semaphore: Arc::new(Semaphore::new(128)),
             retry_attempts: AtomicU64::new(0),
             retry_saved: AtomicU64::new(0),
             retry_attempts_total: AtomicU64::new(0),
@@ -1861,14 +1882,20 @@ impl DnsCache {
 
     /// 1回のlookup_host実行(タイムアウト付き)。
     async fn do_lookup(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
-        let _permit = self
+        let permit = self
             .lookup_semaphore
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .map_err(|_| "dns semaphore closed".to_owned())?;
         let host_port = format!("{}:{}", host, port);
-        match tokio::time::timeout(self.dns_timeout, tokio::net::lookup_host(host_port)).await {
-            Ok(Ok(iter)) => {
+        let mut lookup_task = tokio::spawn(tokio::net::lookup_host(host_port));
+        let outcome = tokio::select! {
+            result = &mut lookup_task => Some(result),
+            _ = tokio::time::sleep(self.dns_timeout) => None,
+        };
+        match outcome {
+            Some(Ok(Ok(iter))) => {
                 let addrs: Vec<_> = iter.map(|sa| sa.ip()).collect();
                 if addrs.is_empty() {
                     Err("dns lookup: no address".to_owned())
@@ -1876,8 +1903,15 @@ impl DnsCache {
                     Ok(addrs)
                 }
             }
-            Ok(Err(e)) => Err(format!("dns lookup error: {}", e)),
-            Err(_) => Err("dns lookup timeout".to_owned()),
+            Some(Ok(Err(error))) => Err(format!("dns lookup error: {}", error)),
+            Some(Err(_)) => Err("dns lookup task failed".to_owned()),
+            None => {
+                tokio::spawn(async move {
+                    let _ = lookup_task.await;
+                    drop(permit);
+                });
+                Err("dns lookup timeout".to_owned())
+            }
         }
     }
 
@@ -1941,26 +1975,65 @@ impl DnsCache {
         Err(err)
     }
 }
+enum CheckUrlError {
+    InvalidUrl(String),
+    UnsupportedScheme(String),
+    PolicyDenied(String),
+    ResolveFailed(String),
+}
+impl CheckUrlError {
+    fn as_header(&self) -> &'static str {
+        match self {
+            Self::InvalidUrl(_) => "InvalidUrl",
+            Self::UnsupportedScheme(_) => "UnsupportedScheme",
+            Self::PolicyDenied(_) => "PolicyDenied",
+            Self::ResolveFailed(_) => "ResolveFailed",
+        }
+    }
+    fn detail(&self) -> &str {
+        match self {
+            Self::InvalidUrl(detail)
+            | Self::UnsupportedScheme(detail)
+            | Self::PolicyDenied(detail)
+            | Self::ResolveFailed(detail) => detail,
+        }
+    }
+    fn is_resolve_failed(&self) -> bool {
+        matches!(self, Self::ResolveFailed(_))
+    }
+}
+
 async fn check_url(
     policy: &NetworkPolicy,
     dns_cache: &DnsCache,
     url: impl AsRef<str>,
-) -> Result<(DnsHitStatus, u16, u16), String> {
-    let u = reqwest::Url::from_str(url.as_ref()).map_err(|e| format!("{:?}", e))?;
+) -> Result<(DnsHitStatus, u16, u16), CheckUrlError> {
+    let u = reqwest::Url::from_str(url.as_ref()).map_err(|error| {
+        tracing::warn!(url = ?url.as_ref(), %error, "URL validation failed");
+        CheckUrlError::InvalidUrl(error.to_string())
+    })?;
     match u.scheme().to_lowercase().as_str() {
         "http" | "https" => {}
-        scheme => return Err(format!("scheme: {}", scheme)),
+        scheme => {
+            tracing::warn!(url = ?url.as_ref(), scheme, "unsupported URL scheme");
+            return Err(CheckUrlError::UnsupportedScheme(scheme.to_owned()));
+        }
     }
-    let host = u.host_str().ok_or_else(|| "no host".to_owned())?;
+    let host = u
+        .host_str()
+        .ok_or_else(|| CheckUrlError::InvalidUrl("no host".to_owned()))?;
     if policy.is_host_blocked(host) {
-        return Err("Blocked address".to_owned());
+        return Err(CheckUrlError::PolicyDenied("Blocked address".to_owned()));
     }
     let host = NetworkPolicy::normalize_host(host);
     let port = u
         .port_or_known_default()
-        .ok_or_else(|| "no port".to_owned())?;
+        .ok_or_else(|| CheckUrlError::InvalidUrl("no port".to_owned()))?;
     // 同期DNS(to_socket_addrs)を廃止し、非同期解決+独自タイムアウトに置き換え。
-    let (ips, dns_cache_hit) = dns_cache.resolve(&host, port).await?;
+    let (ips, dns_cache_hit) = dns_cache
+        .resolve(&host, port)
+        .await
+        .map_err(CheckUrlError::ResolveFailed)?;
     let mut v4_count: u16 = 0;
     let mut v6_count: u16 = 0;
     for ip in &ips {
@@ -1974,10 +2047,10 @@ async fn check_url(
         }
     }
     if ips.is_empty() {
-        return Err("Blocked address".to_owned());
+        return Err(CheckUrlError::PolicyDenied("Blocked address".to_owned()));
     }
     for ip in ips {
-        policy.check_ip(ip)?;
+        policy.check_ip(ip).map_err(CheckUrlError::PolicyDenied)?;
     }
     Ok((dns_cache_hit, v4_count, v6_count))
 }
@@ -2309,9 +2382,14 @@ fn build_stale_response(
     headers.append("Cache-Control", "max-age=300".parse().unwrap());
     headers.append("X-Proxy-Stale", "1".parse().unwrap());
     headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
-    if config.encode_avif {
-        headers.append("Vary", "Accept,Range".parse().unwrap());
-    }
+    headers.append(
+        "Vary",
+        if config.encode_avif {
+            "Accept,Range".parse().unwrap()
+        } else {
+            "Range".parse().unwrap()
+        },
+    );
     for line in config.append_headers.iter() {
         if let Some(idx) = line.find(':') {
             if idx + 1 >= line.len() {
@@ -2443,9 +2521,14 @@ async fn get_file_inner(
                     headers.append("Cache-Control", v);
                 }
             }
-            if config.encode_avif {
-                headers.append("Vary", "Accept,Range".parse().unwrap());
-            }
+            headers.append(
+                "Vary",
+                if config.encode_avif {
+                    "Accept,Range".parse().unwrap()
+                } else {
+                    "Range".parse().unwrap()
+                },
+            );
             for line in config.append_headers.iter() {
                 if let Some(idx) = line.find(":") {
                     if idx + 1 >= line.len() {
@@ -2500,9 +2583,14 @@ async fn get_file_inner(
                             headers.append("Cache-Control", v);
                         }
                     }
-                    if config.encode_avif {
-                        headers.append("Vary", "Accept,Range".parse().unwrap());
-                    }
+                    headers.append(
+                        "Vary",
+                        if config.encode_avif {
+                            "Accept,Range".parse().unwrap()
+                        } else {
+                            "Range".parse().unwrap()
+                        },
+                    );
                     for line in config.append_headers.iter() {
                         if let Some(idx) = line.find(":") {
                             if idx + 1 >= line.len() {
@@ -2565,9 +2653,14 @@ async fn get_file_inner(
     if let Ok(url) = q.url.parse() {
         headers.append("X-Remote-Url", url);
     }
-    if config.encode_avif {
-        headers.append("Vary", "Accept,Range".parse().unwrap());
-    }
+    headers.append(
+        "Vary",
+        if config.encode_avif {
+            "Accept,Range".parse().unwrap()
+        } else {
+            "Range".parse().unwrap()
+        },
+    );
     let check_start = Instant::now();
     match check_url(&network_policy, &dns_cache, &q.url).await {
         Ok((hit, v4_count, v6_count)) => {
@@ -2578,31 +2671,26 @@ async fn get_file_inner(
                 t.dns_v6 = v6_count;
             }
         }
-        Err(s) => {
+        Err(error) => {
             if let Ok(mut t) = timings.lock() {
                 t.check = check_start.elapsed();
-                // DNS解決失敗の場合のみ fetch_err に記録(ポリシー拒否は除外)
-                if proxy_error_category(Some(&s)) != Some("policy") {
-                    t.fetch_err = Some(format!("dns:{}", s.chars().take(60).collect::<String>()));
+                if error.is_resolve_failed() {
+                    t.fetch_err = Some(format!(
+                        "dns:{}",
+                        error.detail().chars().take(60).collect::<String>()
+                    ));
                 }
             }
-            let has_error = if let Ok(v) = s.parse() {
-                headers.append("X-Proxy-Error", v);
-                true
-            } else {
-                false
-            };
+            headers.append(
+                "X-Proxy-Error",
+                reqwest::header::HeaderValue::from_static(error.as_header()),
+            );
             // stale-if-error: DNS失敗(ポリシー拒否以外)ならstaleを試みる
-            let is_dns_err = timings
-                .lock()
-                .ok()
-                .map(|t| t.fetch_err.is_some())
-                .unwrap_or(false);
-            if is_dns_err && !has_range {
+            if error.is_resolve_failed() && !has_range {
                 if let Some(stale) = response_cache.get_stale(&cache_key) {
                     let resp = build_stale_response(&stale, &config, &timings);
                     if let Ok(t) = timings.lock() {
-                        emit_summary(&config, &summary, &t, 200, has_error, None, &global_stats);
+                        emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
                     }
                     return Err(resp);
                 }
@@ -2614,8 +2702,8 @@ async fn get_file_inner(
                     &summary,
                     &t,
                     if is_fallback { 200 } else { 400 },
-                    has_error,
-                    Some(&s),
+                    true,
+                    Some(error.detail()),
                     &global_stats,
                 );
             }
@@ -2675,24 +2763,23 @@ async fn get_file_inner(
     // With config.proxy, the proxy resolves the target, so only the URL pre-check
     // applies and DNS-rebinding TOCTOU remains possible.
     const MAX_REDIRECTS: u8 = 5;
-    let mut current_url = reqwest::Url::from_str(&q.url).map_err(|e| {
-        (
-            axum::http::StatusCode::BAD_REQUEST,
-            headers.clone(),
-            format!("{:?}", e),
-        )
-            .into_response()
-    })?;
+    let mut current_url = match reqwest::Url::from_str(&q.url) {
+        Ok(url) => url,
+        Err(error) => {
+            tracing::warn!(url = ?q.url, %error, "URL parsing failed after validation");
+            headers.append("X-Proxy-Error", "InvalidUrl".parse().unwrap());
+            return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+        }
+    };
     let mut redirects = 0;
+    let mut forward_range = has_range;
+    let mut partial_image_response = None;
     let resp = loop {
         let build_req = || {
             let req = client.get(current_url.as_str());
-            let remaining = config
-                .timeout
-                .saturating_sub(send_start.elapsed().as_millis() as u64);
-            let req = req.timeout(Duration::from_millis(remaining.max(1)));
             let req = req.header("User-Agent", config.user_agent.clone());
-            if let Some(range) = client_headers.get("Range") {
+            if forward_range {
+                let range = client_headers.get("Range").expect("range header");
                 req.header("Range", range.as_bytes())
             } else {
                 req
@@ -2704,6 +2791,10 @@ async fn get_file_inner(
                     t.ttfb = send_start.elapsed();
                 }
                 resp
+            }
+            Err(e) if !forward_range && partial_image_response.is_some() => {
+                tracing::warn!(url = %current_url, %e, "full image refetch failed; using original partial response");
+                partial_image_response.take().unwrap()
             }
             Err(e) => {
                 let first_err = classify_reqwest_error(&e);
@@ -2735,12 +2826,7 @@ async fn get_file_inner(
                                 t.fetch_err = Some(fetch_err.clone());
                                 t.retried = true;
                             }
-                            headers.append(
-                                "X-Proxy-Error",
-                                format!("Send:{}", fetch_err)
-                                    .parse()
-                                    .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
-                            );
+                            headers.append("X-Proxy-Error", "FetchFailed".parse().unwrap());
                             // stale-if-error
                             if !has_range {
                                 if let Some(stale) = response_cache.get_stale(&cache_key) {
@@ -2793,12 +2879,7 @@ async fn get_file_inner(
                         t.ttfb = send_start.elapsed();
                         t.fetch_err = Some(first_err.clone());
                     }
-                    headers.append(
-                        "X-Proxy-Error",
-                        format!("Send:{}", first_err)
-                            .parse()
-                            .unwrap_or_else(|_| "Send:unknown".parse().unwrap()),
-                    );
+                    headers.append("X-Proxy-Error", "FetchFailed".parse().unwrap());
                     // stale-if-error
                     if !has_range {
                         if let Some(stale) = response_cache.get_stale(&cache_key) {
@@ -2831,6 +2912,20 @@ async fn get_file_inner(
                 }
             }
         };
+        let is_image_response = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|media_type| media_type.trim().to_ascii_lowercase().starts_with("image/"));
+        if forward_range
+            && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+            && is_image_response
+        {
+            forward_range = false;
+            partial_image_response = Some(resp);
+            continue;
+        }
         if !resp.status().is_redirection() {
             break resp;
         }
@@ -2859,19 +2954,30 @@ async fn get_file_inner(
         let next_url = match current_url.join(location) {
             Ok(url) => url,
             Err(error) => {
-                let detail = format!("RedirectUrl:{error:?}");
+                tracing::warn!(location, %error, "invalid redirect URL");
                 if let Ok(t) = timings.lock() {
                     emit_summary(
                         &config,
                         &summary,
                         &t,
-                        400,
+                        if q.fallback.is_some() { 200 } else { 400 },
                         true,
-                        Some(&detail),
+                        Some("InvalidRedirect"),
                         &global_stats,
                     );
                 }
-                return Err((axum::http::StatusCode::BAD_REQUEST, headers, detail).into_response());
+                headers.append("X-Proxy-Error", "InvalidRedirect".parse().unwrap());
+                headers.append("Cache-Control", "no-store".parse().unwrap());
+                if q.fallback.is_some() {
+                    headers.append("Content-Type", "image/png".parse().unwrap());
+                    return Err((
+                        axum::http::StatusCode::OK,
+                        headers,
+                        (*dummy_img).clone(),
+                    )
+                        .into_response());
+                }
+                return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
             }
         };
         summary.final_target_domain = domain_from_url(next_url.as_str(), "invalid");
@@ -2894,19 +3000,40 @@ async fn get_file_inner(
                     t.dns_v6 = t.dns_v6.saturating_add(v6_count);
                 }
             }
-            Err(s) => {
+            Err(error) => {
                 if let Ok(mut t) = timings.lock() {
                     t.check += check_start.elapsed();
-                    if proxy_error_category(Some(&s)) != Some("policy") {
-                        t.fetch_err =
-                            Some(format!("dns:{}", s.chars().take(60).collect::<String>()));
+                    if error.is_resolve_failed() {
+                        t.fetch_err = Some(format!(
+                            "dns:{}",
+                            error.detail().chars().take(60).collect::<String>()
+                        ));
                     }
                 }
-                if let Ok(value) = s.parse() {
-                    headers.append("X-Proxy-Error", value);
-                }
+                headers.append(
+                    "X-Proxy-Error",
+                    reqwest::header::HeaderValue::from_static(error.as_header()),
+                );
                 if let Ok(t) = timings.lock() {
-                    emit_summary(&config, &summary, &t, 400, true, Some(&s), &global_stats);
+                    emit_summary(
+                        &config,
+                        &summary,
+                        &t,
+                        if q.fallback.is_some() { 200 } else { 400 },
+                        true,
+                        Some(error.detail()),
+                        &global_stats,
+                    );
+                }
+                headers.append("Cache-Control", "no-store".parse().unwrap());
+                if q.fallback.is_some() {
+                    headers.append("Content-Type", "image/png".parse().unwrap());
+                    return Err((
+                        axum::http::StatusCode::OK,
+                        headers,
+                        (*dummy_img).clone(),
+                    )
+                        .into_response());
                 }
                 return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
             }
@@ -2914,11 +3041,20 @@ async fn get_file_inner(
         current_url = next_url;
         redirects += 1;
     };
+    drop(partial_image_response);
     fn add_remote_header(
         key: &'static str,
         headers: &mut HeaderMap,
         remote_headers: &reqwest::header::HeaderMap,
     ) {
+        if key.eq_ignore_ascii_case("Content-Type") {
+            if let Some(v) = remote_headers.get(key) {
+                if let Ok(value) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
+                    headers.append(key, value);
+                }
+            }
+            return;
+        }
         for v in remote_headers.get_all(key) {
             if let Ok(value) = reqwest::header::HeaderValue::from_bytes(v.as_bytes()) {
                 headers.append(key, value);
@@ -3124,8 +3260,9 @@ impl RequestContext {
                 let cd_utf8 = cd.params.get("filename*");
                 let mut name = None;
                 if let Some(cd_utf8) = cd_utf8 {
-                    let cd_utf8 = cd_utf8.to_uppercase();
-                    if cd_utf8.starts_with("UTF-8''") && cd_utf8.len() > 7 {
+                    if cd_utf8.len() > 7
+                        && cd_utf8.as_bytes()[..7].eq_ignore_ascii_case(b"UTF-8''")
+                    {
                         name = urlencoding::decode(&cd_utf8[7..])
                             .map(|s| s.to_string())
                             .ok();
@@ -3173,7 +3310,11 @@ impl RequestContext {
         let mut content_type = None;
         if let Some(media) = self.headers.get("Content-Type") {
             let s = String::from_utf8_lossy(media.as_bytes());
-            if s.as_ref() == "image/svg+xml" {
+            if s
+                .split(';')
+                .next()
+                .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("image/svg+xml"))
+            {
                 is_svg = true;
             } else {
                 content_type = Some(s);
@@ -3596,12 +3737,8 @@ impl RequestContext {
             .content_length
             .unwrap_or(2048.min(self.config.max_size));
         if len_hint > self.config.max_size {
-            self.headers.append(
-                "X-Proxy-Error",
-                format!("lengthHint:{}>{}", len_hint, self.config.max_size)
-                    .parse()
-                    .unwrap(),
-            );
+            self.headers
+                .append("X-Proxy-Error", "ResponseTooLarge".parse().unwrap());
             return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response());
         }
         // Never trust the remote Content-Length hint for pre-allocation
@@ -3614,16 +3751,8 @@ impl RequestContext {
             match x {
                 Ok(b) => {
                     if response_bytes.len() + b.len() > self.config.max_size as usize {
-                        self.headers.append(
-                            "X-Proxy-Error",
-                            format!(
-                                "length:{}>{}",
-                                response_bytes.len() + b.len(),
-                                self.config.max_size
-                            )
-                            .parse()
-                            .unwrap(),
-                        );
+                        self.headers
+                            .append("X-Proxy-Error", "ResponseTooLarge".parse().unwrap());
                         return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                             .into_response());
                     }
@@ -3634,12 +3763,8 @@ impl RequestContext {
                     if let Ok(mut t) = self.timings.lock() {
                         t.fetch_err = Some(fetch_err.clone());
                     }
-                    self.headers.append(
-                        "X-Proxy-Error",
-                        format!("Body:{}", fetch_err)
-                            .parse()
-                            .unwrap_or_else(|_| "Body:unknown".parse().unwrap()),
-                    );
+                    self.headers
+                        .append("X-Proxy-Error", "BodyReadFailed".parse().unwrap());
                     return Err(
                         (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
                     );
@@ -4129,6 +4254,41 @@ mod network_policy_tests {
         let mut c = base_config();
         c.blocked_networks = Some(vec!["not-a-cidr".to_owned()]);
         assert!(NetworkPolicy::from_config(&c).is_err());
+    }
+    #[test]
+    fn check_url_error_headers_do_not_expose_details() {
+        let errors = [
+            CheckUrlError::InvalidUrl("attacker\r\nvalue".to_owned()),
+            CheckUrlError::UnsupportedScheme("internal-scheme".to_owned()),
+            CheckUrlError::PolicyDenied("10.0.0.1".to_owned()),
+            CheckUrlError::ResolveFailed("private-dns-error".to_owned()),
+        ];
+        assert_eq!(
+            errors.map(|error| error.as_header()),
+            [
+                "InvalidUrl",
+                "UnsupportedScheme",
+                "PolicyDenied",
+                "ResolveFailed"
+            ]
+        );
+    }
+    #[test]
+    fn disposition_filename_star_preserves_original_case() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Content-Disposition",
+            "attachment; filename*=UTF-8''Mixed%20Case.PNG"
+                .parse()
+                .unwrap(),
+        );
+        RequestContext::disposition_ext(&mut headers, ".webp");
+        let disposition = headers
+            .get("Content-Disposition")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.contains("Mixed%20Case.webp"));
     }
     #[test]
     fn private_ipv4_blocked_without_allow() {

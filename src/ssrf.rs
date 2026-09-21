@@ -139,10 +139,15 @@ mod tests {
             "2002:a9fe:a9fe::",
             "2001::1",
             "::ffff:0:7f00:1",
+			"2001:db8::5efe:7f00:1",
+			"2001:db8::200:5efe:a9fe:a9fe",
         ] {
             assert!(policy.check_ip(ip.parse().unwrap()).is_err());
         }
         assert!(policy.check_ip("2002:808:808::".parse().unwrap()).is_ok());
+		assert!(policy
+			.check_ip("2001:db8::5efe:808:808".parse().unwrap())
+			.is_ok());
     }
 
     #[test]
@@ -172,6 +177,16 @@ mod tests {
         assert_eq!(url.host_str(), Some("10.0.0.5"));
         let url = parse_proxy_url("http://10.0.0.5:3128").expect("proxy URL should parse");
         assert_eq!(url.host_str(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn normalize_host_strips_ipv6_brackets() {
+        assert_eq!(NetworkPolicy::normalize_host("[::1]"), "::1");
+        assert_eq!(
+            NetworkPolicy::normalize_host("[2001:db8::1]"),
+            "2001:db8::1"
+        );
+        assert_eq!(NetworkPolicy::normalize_host("EXAMPLE.COM."), "example.com");
     }
 
     #[test]
