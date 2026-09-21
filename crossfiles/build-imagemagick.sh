@@ -66,6 +66,7 @@ LDFLAGS="-L${prefix}/lib" \
     --prefix="${prefix}" \
     --enable-static \
     --disable-shared \
+    --disable-docs \
     --disable-modules \
     --disable-openmp \
     --without-x \
