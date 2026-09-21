@@ -341,6 +341,10 @@ impl RequestContext {
                     Some(Ok("image/jxl")) => {
                         return self.encode_jxl(max_decode_pixels);
                     }
+                    #[cfg(feature = "avif-decoder")]
+                    Some(Ok("image/avif")) => {
+                        return self.encode_avif_seq(max_decode_pixels);
+                    }
                     Some(Ok("image/jp2")) => {
                         let dimensions = jpeg2k::DumpImage::from_bytes(&self.src_bytes)
                             .ok()
@@ -694,6 +698,8 @@ impl RequestContext {
                     self.encode_single()
                 }
             }
+            #[cfg(feature = "avif-decoder")]
+            image::ImageFormat::Avif => self.encode_avif_seq(max_decode_pixels),
             _ => self.encode_single(),
         }
     }
@@ -841,6 +847,71 @@ impl RequestContext {
 
         let frames = image::Frames::new(Box::new(collected.into_iter()));
         self.encode_anim(frames, loop_count)
+    }
+    #[cfg(feature = "avif-decoder")]
+    fn encode_avif_seq(&mut self, max_decode_pixels: u64) -> axum::response::Response {
+        let first_frame_only = self.parms.r#static.is_some() || self.parms.badge.is_some();
+        let seq = {
+            let _dg = self.phase_guard(Phase::Decode);
+            crate::avif_seq::decode(
+                &self.src_bytes,
+                max_decode_pixels,
+                ANIMATION_FRAMES_LIMIT,
+                first_frame_only,
+            )
+        };
+        let seq = match seq {
+            Ok(Some(seq)) => seq,
+            Ok(None) => {
+                let decoded = {
+                    let _dg = self.phase_guard(Phase::Decode);
+                    image::load_from_memory_with_format(
+                        &self.src_bytes,
+                        image::ImageFormat::Avif,
+                    )
+                };
+                return match decoded {
+                    Ok(img) => self.response_img(img),
+                    Err(error) => {
+                        self.headers.append(
+                            "X-Proxy-Error",
+                            error_header_value(
+                                format!("DecodeError_{:?}", error),
+                                "AvifError",
+                            ),
+                        );
+                        (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                            .into_response()
+                    }
+                };
+            }
+            Err(error) => {
+                self.headers.append(
+                    "X-Proxy-Error",
+                    error_header_value(format!("AvifSeq {}", error), "AvifError"),
+                );
+                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                    .into_response();
+            }
+        };
+        if first_frame_only || seq.frames.len() == 1 {
+            let Some(frame) = seq.frames.into_iter().next() else {
+                self.headers.append(
+                    "X-Proxy-Error",
+                    error_header_value("NoAvailableFrames", "AvifError"),
+                );
+                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                    .into_response();
+            };
+            return self.response_img(DynamicImage::ImageRgba8(frame.image));
+        }
+        let frames = seq.frames.into_iter().map(|frame| {
+            let delay = image::Delay::from_saturating_duration(
+                std::time::Duration::from_millis(frame.duration_ms),
+            );
+            Ok(image::Frame::from_parts(frame.image, 0, 0, delay))
+        });
+        self.encode_anim(image::Frames::new(Box::new(frames)), 0)
     }
 	fn encode_mng(&mut self, max_decode_pixels: u64) -> axum::response::Response {
 		let first_frame_only = self.parms.r#static.is_some() || self.parms.badge.is_some();
