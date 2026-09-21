@@ -1,24 +1,7 @@
 use axum::response::IntoResponse;
 use image::{AnimationDecoder, DynamicImage, GenericImage, GenericImageView};
 
-use crate::{Phase, RequestContext};
-
-/// 依存クレート/外部データ由来のエラーメッセージから `X-Proxy-Error` の値を組み立てる。
-/// zune-core の `Debug` 実装 (`writeln!` で末尾に改行を付与) のように、依存クレートの
-/// 手書き `Debug`/`Display` は `HeaderValue` が拒否する制御文字を含み得るため、
-/// 生成した文字列を直接 `.parse().unwrap()` してはならない (P-01)。
-pub(crate) fn error_header_value(msg: impl AsRef<str>) -> reqwest::header::HeaderValue {
-	error_header_value_or(msg, "DecodeError")
-}
-
-/// `error_header_value` の、フォールバック静的トークンを指定できる版。
-pub(crate) fn error_header_value_or(
-	msg: impl AsRef<str>,
-	fallback: &'static str,
-) -> reqwest::header::HeaderValue {
-	reqwest::header::HeaderValue::from_bytes(msg.as_ref().as_bytes())
-		.unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(fallback))
-}
+use crate::{error_header_value, Phase, RequestContext};
 
 /// Header-only dimension probe (no pixel allocation). Returns None for
 /// formats the `image` crate cannot guess (JXL/JP2/JXR have per-path checks).
@@ -323,7 +306,7 @@ impl RequestContext {
                 Err(error) => {
                     self.headers.append(
                         "X-Proxy-Error",
-						error_header_value_or(format!("VIPS Error:{error}"), "VIPSError"),
+                        error_header_value(format!("VIPS Error:{error}"), "VIPSError"),
                     );
                     (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
                 }
@@ -384,7 +367,10 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-									error_header_value(format!("Jpeg2000 Error:{:?}", e)),
+                                    error_header_value(
+                                        format!("Jpeg2000 Error:{:?}", e),
+                                        "Jpeg2000 Error",
+                                    ),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -446,7 +432,10 @@ impl RequestContext {
                             Ok(Err(e)) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-									error_header_value(format!("JpegXR decode pixels {:?}", e)),
+                                    error_header_value(
+                                        format!("JpegXR decode pixels {:?}", e),
+                                        "JpegXR decode pixels",
+                                    ),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -454,7 +443,10 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-									error_header_value(format!("JpegXR decode bytes {:?}", e)),
+                                    error_header_value(
+                                        format!("JpegXR decode bytes {:?}", e),
+                                        "JpegXR decode bytes",
+                                    ),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -497,7 +489,7 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-									error_header_value(format!("HEIC Error:{:?}", e)),
+                                    error_header_value(format!("HEIC Error:{:?}", e), "HEIC Error"),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -557,7 +549,7 @@ impl RequestContext {
                             Err(e) => {
                                 self.headers.append(
                                     "X-Proxy-Error",
-									error_header_value(format!("PDF Error:{:?}", e)),
+                                    error_header_value(format!("PDF Error:{:?}", e), "PDF Error"),
                                 );
                                 return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                     .into_response();
@@ -567,7 +559,7 @@ impl RequestContext {
                     _ => {
                         self.headers.append(
                             "X-Proxy-Error",
-							error_header_value(format!("CodecError:{:?}", e)),
+                                error_header_value(format!("CodecError:{:?}", e), "CodecError"),
                         );
                         return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                             .into_response();
@@ -599,7 +591,7 @@ impl RequestContext {
                 if let Err(e) = png_apng_within_budget(&self.src_bytes, max_decode_pixels) {
 					self.headers.append(
 						"X-Proxy-Error",
-						error_header_value_or(format!("ApngAnim {}", e), "ApngAnim"),
+                        error_header_value(format!("ApngAnim {}", e), "ApngAnim"),
 					);
                     return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                         .into_response();
@@ -616,7 +608,7 @@ impl RequestContext {
                 if let Err(e) = gif_animation_within_budget(&self.src_bytes, max_decode_pixels) {
 					self.headers.append(
 						"X-Proxy-Error",
-						error_header_value_or(format!("GifAnim {}", e), "GifAnim"),
+                        error_header_value(format!("GifAnim {}", e), "GifAnim"),
 					);
                     return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                         .into_response();
@@ -642,7 +634,7 @@ impl RequestContext {
                     {
 						self.headers.append(
 							"X-Proxy-Error",
-							error_header_value_or(format!("WebPAnim {}", e), "WebPAnim"),
+                            error_header_value(format!("WebPAnim {}", e), "WebPAnim"),
 						);
                         return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                             .into_response();
@@ -866,7 +858,7 @@ impl RequestContext {
 			Err(error) => {
 				self.headers.append(
 					"X-Proxy-Error",
-					error_header_value_or(format!("MngAnim {}", error), "MngError"),
+                    error_header_value(format!("MngAnim {}", error), "MngError"),
 				);
 				return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 					.into_response();
@@ -878,7 +870,7 @@ impl RequestContext {
 			}
 			self.headers.append(
 				"X-Proxy-Error",
-				error_header_value_or("NoAvailableFrames", "MngError"),
+                error_header_value("NoAvailableFrames", "MngError"),
 			);
 			return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response();
 		}
@@ -970,9 +962,13 @@ impl RequestContext {
         headers.append("Content-Type", "image/webp".parse().unwrap());
         headers.remove("Cache-Control");
         if let Some(e) = err {
-            if let Ok(value) = format!("{:?}", e).parse() {
-                headers.append("X-Proxy-Error", value);
-            }
+            headers.append(
+                "X-Proxy-Error",
+                error_header_value(
+                    format!("WebPAnimEncodeError:{:?}", e),
+                    "WebPAnimEncodeError",
+                ),
+            );
         } else {
             headers.append(
                 "Cache-Control",
@@ -1012,7 +1008,7 @@ impl RequestContext {
                 Err(e) => {
                     self.headers.append(
                         "X-Proxy-Error",
-						error_header_value(format!("DecodeError_{}", e)),
+                        error_header_value(format!("DecodeError_{}", e), "DecodeError"),
                     );
                     return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                         .into_response();
@@ -1071,7 +1067,7 @@ impl RequestContext {
                         Err(e) => {
                             self.headers.append(
                                 "X-Proxy-Error",
-								error_header_value(format!("EncodeError_{:?}", e)),
+                                error_header_value(format!("EncodeError_{:?}", e), "EncodeError"),
                             );
                             (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                 .into_response()
@@ -1100,7 +1096,7 @@ impl RequestContext {
                         Err(e) => {
                             self.headers.append(
                                 "X-Proxy-Error",
-                                error_header_value(format!("EncodeError_{:?}", e)),
+                                error_header_value(format!("EncodeError_{:?}", e), "EncodeError"),
                             );
                             (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
                                 .into_response()
@@ -1122,7 +1118,7 @@ impl RequestContext {
             Err(e) => {
                 self.headers.append(
                     "X-Proxy-Error",
-					error_header_value(format!("EncodeError_{:?}", e)),
+                    error_header_value(format!("EncodeError_{:?}", e), "EncodeError"),
                 );
                 (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
             }
@@ -1243,7 +1239,7 @@ pub fn image_to_frame(
 }
 
 fn jxl_error_value(e: impl std::fmt::Debug) -> reqwest::header::HeaderValue {
-	error_header_value_or(format!("JpegXL Error:{:?}", e), "JpegXLError")
+    error_header_value(format!("JpegXL Error:{:?}", e), "JpegXLError")
 }
 
 fn jxl_render_to_image(render: &jxl_oxide::Render) -> Option<DynamicImage> {
@@ -1594,4 +1590,12 @@ mod tests {
 			err
 		);
 	}
+    #[test]
+    fn image_error_header_uses_format_specific_fallback() {
+        let detail = error_header_value("HEIC Error:invalid data", "HEIC Error");
+        assert_eq!(detail.to_str().unwrap(), "HEIC Error:invalid data");
+
+        let fallback = error_header_value("HEIC Error:invalid\r\ndata", "HEIC Error");
+        assert_eq!(fallback.to_str().unwrap(), "HEIC Error");
+    }
 }

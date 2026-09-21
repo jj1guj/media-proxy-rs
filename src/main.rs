@@ -4494,3 +4494,14 @@ mod cache_tests {
         assert!(cache.get(&key).is_none());
     }
 }
+
+/// 外部由来バイトを含むエラーの`X-Proxy-Error`値を生成
+///
+/// ヘッダ不正文字を含む場合があり、unwrapしてはならない(finding #3)
+fn error_header_value(
+    msg: impl AsRef<str>,
+    fallback: &'static str,
+) -> reqwest::header::HeaderValue {
+    reqwest::header::HeaderValue::from_bytes(msg.as_ref().as_bytes())
+		.unwrap_or_else(|_| reqwest::header::HeaderValue::from_static(fallback))
+}
