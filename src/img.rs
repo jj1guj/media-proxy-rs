@@ -193,6 +193,33 @@ impl RequestContext {
                     .map(|s| std::str::from_utf8(s.as_bytes()))
                 {
                     Some(Ok("image/jxl")) => {
+                        let animation = {
+                            let _dg = self.phase_guard(Phase::Decode);
+                            crate::jxl_animation::decode_animation(
+                                &self.src_bytes,
+                                max_decode_pixels,
+                                ANIMATION_FRAMES_LIMIT,
+                            )
+                        };
+                        match animation {
+                            Ok(Some((frames, loop_count))) => {
+                                let frames =
+                                    image::Frames::new(Box::new(frames.into_iter().map(Ok)));
+                                return self.encode_anim(frames, loop_count);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let value = reqwest::header::HeaderValue::from_bytes(
+                                    format!("JpegXL Error:{error}").as_bytes(),
+                                )
+                                .unwrap_or_else(|_| {
+                                    reqwest::header::HeaderValue::from_static("JpegXLError")
+                                });
+                                self.headers.append("X-Proxy-Error", value);
+                                return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+                                    .into_response();
+                            }
+                        }
                         let decoder = match jxl_oxide::integration::JxlDecoder::new(
                             std::io::Cursor::new(&self.src_bytes),
                         ) {
