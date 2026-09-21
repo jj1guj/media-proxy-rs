@@ -2516,6 +2516,12 @@ impl RequestContext {
                     if libvips_dep::is_vips(head) {
                         is_img = true;
                     }
+                    if imagemagick_dep::is_mng(head) {
+                        is_img = true;
+                        self.headers.remove("Content-Type");
+                        self.headers
+                            .append("Content-Type", "image/x-mng".parse().unwrap());
+                    }
                 }
             }
         }

@@ -61,10 +61,11 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 この方法では`x86_64-unknown-linux-gnu`向けにビルドします  
 すべてを静的に組み込むmusl系とは異なる共有ライブラリを必要とする場合があります
 1. https://www.rust-lang.org/ja/tools/install に従ってrustをインストール
-1. `apt-get install -y meson ninja-build pkg-config nasm git python3 libglib2.0-dev`
-2. `git clone https://github.com/yojo-art/media-proxy-rs && cd media-proxy-rs`
-3. `bash scripts/build-libvips.sh`
-4. `cargo build --release`
+2. `apt-get install -y build-essential meson ninja-build pkg-config nasm git python3 libglib2.0-dev`
+3. `git clone https://github.com/yojo-art/media-proxy-rs && cd media-proxy-rs`
+4. `bash crossfiles/build-imagemagick.sh`
+5. `bash crossfiles/build-libvips.sh`
+6. `cargo build --release`
 
 ## 対応する画像形式
 - AVIF(dav1d)
@@ -86,6 +87,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 - JPEG 2000(openjp2)
 - JPEG XR(jxrlib)
 - HEIC
+- MNG
 - PDF
 - VIPSネイティブ形式
 
