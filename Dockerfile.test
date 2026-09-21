@@ -11,6 +11,9 @@
 FROM rust:latest
 RUN rustup component add clippy
 RUN apt-get update && apt-get install -y \
-      clang pkg-config nasm cmake git meson ninja-build \
+  build-essential clang pkg-config nasm cmake git meson ninja-build \
     && rm -rf /var/lib/apt/lists/*
+COPY crossfiles/build-imagemagick.sh /tmp/crossfiles/build-imagemagick.sh
+RUN IMAGEMAGICK_PREFIX=/opt/imagemagick bash /tmp/crossfiles/build-imagemagick.sh
+ENV IMAGEMAGICK_PREFIX=/opt/imagemagick
 WORKDIR /app

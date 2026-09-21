@@ -127,6 +127,32 @@ impl RequestContext {
     }
     pub(crate) fn encode_img(&mut self) -> axum::response::Response {
         let max_decode_pixels = (self.config.max_size / 4).max(1);
+        if self.codec.is_err() && imagemagick_dep::is_mng(&self.src_bytes) {
+            let decoded = {
+                let _dg = self.phase_guard(Phase::Decode);
+                imagemagick_dep::decode(&self.src_bytes, max_decode_pixels, ANIMATION_FRAMES_LIMIT)
+            };
+            return match decoded {
+                Ok((mut frames, _))
+                    if self.parms.r#static.is_some() || self.parms.badge.is_some() =>
+                {
+                    self.response_img(DynamicImage::ImageRgba8(frames.remove(0).into_buffer()))
+                }
+                Ok((frames, loop_count)) => {
+                    let frames = image::Frames::new(Box::new(frames.into_iter().map(Ok)));
+                    self.encode_anim(frames, loop_count)
+                }
+                Err(error) => {
+                    self.headers.append(
+                        "X-Proxy-Error",
+                        format!("MNG Error:{error}")
+                            .parse()
+                            .unwrap_or_else(|_| "MNGError".parse().unwrap()),
+                    );
+                    (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
+                }
+            };
+        }
         if self.codec.is_err() && libvips_dep::is_vips(&self.src_bytes) {
             let decoded = {
                 let _dg = self.phase_guard(Phase::Decode);
