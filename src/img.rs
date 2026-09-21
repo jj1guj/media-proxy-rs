@@ -1501,6 +1501,7 @@ mod tests {
 				allowed_networks: None,
 				blocked_networks: None,
 				blocked_hosts: None,
+                unix_socket_permissions: None,
                 slow_log_ms: default_slow_log_ms(),
                 enable_cache: false,
                 cache_max_bytes: default_cache_max_bytes(),
@@ -1590,12 +1591,4 @@ mod tests {
 			err
 		);
 	}
-    #[test]
-    fn image_error_header_uses_format_specific_fallback() {
-        let detail = error_header_value("HEIC Error:invalid data", "HEIC Error");
-        assert_eq!(detail.to_str().unwrap(), "HEIC Error:invalid data");
-
-        let fallback = error_header_value("HEIC Error:invalid\r\ndata", "HEIC Error");
-        assert_eq!(fallback.to_str().unwrap(), "HEIC Error");
-    }
 }

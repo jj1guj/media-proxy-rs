@@ -1,5 +1,6 @@
 {
   "bind_addr": "0.0.0.0:12766",
+  "// bind_addr(unix socket)": "unix:///run/media-proxy/proxy.sock",
   "timeout": 10000,
   "user_agent": "https://github.com/yojo-art/media-proxy-rs",
   "max_size": 33554432,
@@ -32,5 +33,6 @@
   "cache_stale_max_secs": 86400,
   "otlp_metrics_endpoint": null,
   "otlp_export_interval_ms": 5000,
-  "otlp_service_name": "media-proxy-rs"
+  "otlp_service_name": "media-proxy-rs",
+  "unix_socket_permissions": "0666"
 }

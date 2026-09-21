@@ -2,6 +2,7 @@ use core::str;
 use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -780,6 +781,9 @@ pub struct ConfigFile {
     allowed_networks: Option<Vec<String>>,
     blocked_networks: Option<Vec<String>>,
     blocked_hosts: Option<Vec<String>>,
+    /// Octal permission bits for a Unix-domain `bind_addr`, e.g. "0660".
+    #[serde(default)]
+    unix_socket_permissions: Option<String>,
     /// 正常完了かつ全フェーズ合計がこのms未満のリクエストは、
     /// アクセスログを INFO ではなく DEBUG に落とす(ヘルスチェック等でログが埋まるのを防ぐ)。
     #[serde(default = "default_slow_log_ms")]
@@ -1044,6 +1048,7 @@ fn main() {
 			allowed_networks:None,
 			blocked_networks:None,
 			blocked_hosts:None,
+            unix_socket_permissions:None,
 			slow_log_ms:default_slow_log_ms(),
 			enable_cache:default_true(),
 			cache_max_bytes:default_cache_max_bytes(),
@@ -1120,6 +1125,16 @@ fn main() {
             tracing::error!("設定エラー(network): {}", e);
             std::process::exit(1);
         }
+    };
+    let unix_socket_mode = match &config.unix_socket_permissions {
+        Some(value) => match parse_unix_socket_mode(value) {
+            Ok(mode) => mode,
+            Err(error) => {
+                tracing::error!(%error, "不正なunix_socket_permissions設定");
+                std::process::exit(1);
+            }
+        },
+        None => 0o666,
     };
     let dns_cache = Arc::new(DnsCache::new(
         Duration::from_secs(config.dns_ttl_secs),
@@ -1390,14 +1405,7 @@ fn main() {
                 }
             });
         }
-        let http_addr: SocketAddr = match arg_tup.1.bind_addr.parse() {
-            Ok(address) => address,
-            Err(error) => {
-                tracing::error!(bind_addr = ?arg_tup.1.bind_addr, %error, "不正なbind_addr設定");
-                std::process::exit(1);
-            }
-        };
-        let listener = tokio::net::TcpListener::bind(http_addr).await.unwrap();
+        let bind_addr = arg_tup.1.bind_addr.clone();
         let app = Router::new();
         let app = app.route(
             "/healthz",
@@ -1417,19 +1425,129 @@ fn main() {
             }),
         );
         let app = app.layer(tower_http::catch_panic::CatchPanicLayer::new());
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .unwrap();
+        match parse_bind_addr(&bind_addr) {
+            Ok(BindTarget::Tcp(address)) => {
+                let listener = match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => listener,
+                    Err(error) => {
+                        tracing::error!(%address, %error, "TCPソケットのbindに失敗");
+                        std::process::exit(1);
+                    }
+                };
+                tracing::info!(%address, "listening");
+                axum::serve(listener, app.into_make_service())
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await
+                    .unwrap();
+            }
+            Ok(BindTarget::Unix(path)) => {
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    tracing::error!("Unix domain socketはUnix環境でのみ利用できます");
+                    std::process::exit(1);
+                }
+                #[cfg(unix)]
+                serve_on_unix_socket(app, &path, unix_socket_mode).await;
+            }
+            Err(error) => {
+                tracing::error!(%error, "不正なbind_addr設定");
+                std::process::exit(1);
+            }
+        }
     });
     if let Some(provider) = meter_provider {
         if let Err(error) = provider.shutdown_with_timeout(Duration::from_secs(3)) {
             tracing::warn!(%error, "OTLP metrics exporter shutdown failed");
         }
     }
+}
+
+enum BindTarget {
+    Tcp(SocketAddr),
+    Unix(PathBuf),
+}
+
+fn parse_bind_addr(value: &str) -> Result<BindTarget, String> {
+    let value = value.trim();
+    if let Some(path) = value.strip_prefix("unix://") {
+        if path.is_empty() {
+            return Err(format!("invalid bind_addr {value:?}: empty socket path"));
+        }
+        return Ok(BindTarget::Unix(PathBuf::from(path)));
+    }
+    if let Some(path) = value.strip_prefix("unix:") {
+        if path.is_empty() {
+            return Err(format!("invalid bind_addr {value:?}: empty socket path"));
+        }
+        return Ok(BindTarget::Unix(PathBuf::from(path)));
+    }
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Ok(BindTarget::Tcp(address));
+    }
+    if value.contains('/') || value.ends_with(".sock") {
+        tracing::warn!(bind_addr = ?value, "schemeなしのbind_addrをUnix domain socketとして扱います。unix://を指定してください");
+        return Ok(BindTarget::Unix(PathBuf::from(value)));
+    }
+    Err(format!(
+        "invalid bind_addr {value:?}: expected \"IP:port\" or \"unix:///path/to.sock\""
+    ))
+}
+
+fn parse_unix_socket_mode(value: &str) -> Result<u32, String> {
+    let value = value.trim();
+    let digits = value.strip_prefix("0o").unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+        return Err(format!("{value:?}: expected octal permission bits"));
+    }
+    let mode = u32::from_str_radix(digits, 8).map_err(|error| format!("{value:?}: {error}"))?;
+    if mode > 0o777 {
+        return Err(format!("{value:?}: out of range (expected 0..=0777)"));
+    }
+    Ok(mode)
+}
+
+#[cfg(unix)]
+async fn serve_on_unix_socket(app: Router, path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(error) = tokio::fs::create_dir_all(parent).await {
+                tracing::error!(path = %parent.display(), %error, "Unix socketディレクトリの作成に失敗");
+                std::process::exit(1);
+            }
+        }
+    }
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => {
+            if let Err(error) = tokio::fs::remove_file(path).await {
+                tracing::error!(path = %path.display(), %error, "既存Unix socketの削除に失敗");
+                std::process::exit(1);
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::error!(path = %path.display(), %error, "Unix socketパスの確認に失敗");
+            std::process::exit(1);
+        }
+    }
+    let listener = match tokio::net::UnixListener::bind(path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(path = %path.display(), %error, "Unix socketのbindに失敗");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        tracing::error!(path = %path.display(), mode = format_args!("{mode:o}"), %error, "Unix socketの権限設定に失敗");
+        std::process::exit(1);
+    }
+    tracing::info!(path = %path.display(), "listening on Unix domain socket");
+    axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
 }
 /// タイムアウト由来のネガティブキャッシュの短いTTL。
 const DNS_TIMEOUT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
@@ -4161,6 +4279,7 @@ mod network_policy_tests {
             allowed_networks: None,
             blocked_networks: None,
             blocked_hosts: None,
+            unix_socket_permissions: None,
             slow_log_ms: default_slow_log_ms(),
             enable_cache: false,
             cache_max_bytes: default_cache_max_bytes(),
