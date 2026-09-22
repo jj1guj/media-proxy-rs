@@ -78,6 +78,12 @@ tower-http = { version = "0.7", features = ["catch-panic"] }
 libvips_dep = { path = "./libvips_dep" }
 imagemagick_dep = { path = "./imagemagick_dep" }
 
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+    "metrics",
+    "testing",
+] }
+
 [profile.release]
 strip = true
 opt-level = 3

@@ -10,6 +10,8 @@ use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
+use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _, UpDownCounter};
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
@@ -26,9 +28,107 @@ mod svg;
 
 use cache::{CacheKey, CacheResult, ResponseCache};
 
+struct OtlpMetrics {
+    requests: Counter<u64>,
+    errors: Counter<u64>,
+    requests_active: UpDownCounter<i64>,
+    upstream_responses: Counter<u64>,
+    request_duration: Histogram<f64>,
+    url_check_duration: Histogram<f64>,
+    download_wait_duration: Histogram<f64>,
+    upstream_ttfb_duration: Histogram<f64>,
+    upstream_body_duration: Histogram<f64>,
+    cpu_wait_duration: Histogram<f64>,
+    decode_duration: Histogram<f64>,
+    encode_duration: Histogram<f64>,
+}
+impl OtlpMetrics {
+    fn new(provider: &SdkMeterProvider) -> Self {
+        let meter = provider.meter(env!("CARGO_PKG_NAME"));
+        Self {
+            requests: meter.u64_counter("media_proxy_requests_total").build(),
+            errors: meter.u64_counter("media_proxy_errors_total").build(),
+            requests_active: meter
+                .i64_up_down_counter("media_proxy_requests_active")
+                .build(),
+            upstream_responses: meter
+                .u64_counter("media_proxy_upstream_responses_total")
+                .build(),
+            request_duration: duration_histogram(&meter, "media_proxy_request_duration"),
+            url_check_duration: duration_histogram(&meter, "media_proxy_url_check_duration"),
+            download_wait_duration: duration_histogram(
+                &meter,
+                "media_proxy_download_wait_duration",
+            ),
+            upstream_ttfb_duration: duration_histogram(
+                &meter,
+                "media_proxy_upstream_ttfb_duration",
+            ),
+            upstream_body_duration: duration_histogram(
+                &meter,
+                "media_proxy_upstream_body_duration",
+            ),
+            cpu_wait_duration: duration_histogram(&meter, "media_proxy_cpu_wait_duration"),
+            decode_duration: duration_histogram(&meter, "media_proxy_decode_duration"),
+            encode_duration: duration_histogram(&meter, "media_proxy_encode_duration"),
+        }
+    }
+
+    fn record_completion(&self, status: u16, has_error: bool, total_duration: Duration) {
+        let final_status_class = KeyValue::new("status_class", status_class(status));
+        self.requests
+            .add(1, std::slice::from_ref(&final_status_class));
+        if status >= 400 || has_error {
+            self.errors
+                .add(1, std::slice::from_ref(&final_status_class));
+        }
+        self.request_duration
+            .record(total_duration.as_secs_f64(), &[]);
+    }
+
+    fn record_phases(&self, timings: &PhaseTimings) {
+        if let Some(upstream_status) = timings.upstream_status {
+            self.upstream_responses.add(
+                1,
+                &[KeyValue::new("status_class", status_class(upstream_status))],
+            );
+        }
+        self.url_check_duration
+            .record(timings.check.as_secs_f64(), &[]);
+        self.download_wait_duration
+            .record(timings.dl_wait.as_secs_f64(), &[]);
+        self.upstream_ttfb_duration
+            .record(timings.ttfb.as_secs_f64(), &[]);
+        self.upstream_body_duration
+            .record(timings.body.as_secs_f64(), &[]);
+        self.cpu_wait_duration
+            .record(timings.cpu_wait.as_secs_f64(), &[]);
+        self.decode_duration
+            .record(timings.decode.as_secs_f64(), &[]);
+        self.encode_duration
+            .record(timings.encode.as_secs_f64(), &[]);
+    }
+}
+
+fn duration_histogram(meter: &opentelemetry::metrics::Meter, name: &'static str) -> Histogram<f64> {
+    meter.f64_histogram(name).with_unit("s").build()
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
 /// 定期統計ログ用のグローバルカウンタ。
 /// emit_summary でインクリメントし、60秒ごとにリセット＋ログ出力する。
 struct GlobalStats {
+    otlp: Option<Arc<OtlpMetrics>>,
     requests: AtomicU64,
     errors: AtomicU64,
     cache_hits: AtomicU64,
@@ -86,6 +186,7 @@ struct GlobalStats {
 impl GlobalStats {
     fn new() -> Self {
         Self {
+            otlp: None,
             requests: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
@@ -140,6 +241,11 @@ impl GlobalStats {
             static_cache_insertions: AtomicU64::new(0),
             static_output_bytes: AtomicU64::new(0),
         }
+    }
+    fn with_otlp(provider: Option<&SdkMeterProvider>) -> Self {
+        let mut stats = Self::new();
+        stats.otlp = provider.map(|provider| Arc::new(OtlpMetrics::new(provider)));
+        stats
     }
     /// カウンタをリセットし、リセット前の値を返す。
     fn swap_reset(&self) -> (u64, u64, u64, u64) {
@@ -759,7 +865,7 @@ fn main() {
         ttl: Duration::from_secs(config.cache_ttl_secs),
         stale_max: Duration::from_secs(config.cache_stale_max_secs),
     }));
-    let global_stats = Arc::new(GlobalStats::new());
+    let global_stats = Arc::new(GlobalStats::with_otlp(meter_provider.as_ref()));
     let arg_tup = (
         client,
         config,
@@ -1649,6 +1755,9 @@ fn emit_summary(
     error_detail: Option<&str>,
     stats: &GlobalStats,
 ) {
+    if let Some(metrics) = &stats.otlp {
+        metrics.record_phases(t);
+    }
     stats.requests.fetch_add(1, Ordering::Relaxed);
     stats.observe_request(t, s.is_static_path);
     if status >= 400 || has_error {
@@ -1783,7 +1892,52 @@ fn build_stale_response(
     }
     (axum::http::StatusCode::OK, headers, cached.body.clone()).into_response()
 }
+struct ActiveRequestGuard {
+    metrics: Arc<OtlpMetrics>,
+    started: Instant,
+}
+impl ActiveRequestGuard {
+    fn new(metrics: Arc<OtlpMetrics>) -> Self {
+        metrics.requests_active.add(1, &[]);
+        Self {
+            metrics,
+            started: Instant::now(),
+        }
+    }
+    fn record_completion(&self, status: u16, has_error: bool) {
+        self.metrics
+            .record_completion(status, has_error, self.started.elapsed());
+    }
+}
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.metrics.requests_active.add(-1, &[]);
+    }
+}
+
 async fn get_file(
+    path: Option<axum::extract::Path<String>>,
+    original_uri: axum::extract::OriginalUri,
+    client_headers: axum::http::HeaderMap,
+    state: AppState,
+    query: axum::extract::Query<RequestParams>,
+) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+    let active_request = state.10.otlp.clone().map(ActiveRequestGuard::new);
+    let result = get_file_inner(path, original_uri, client_headers, state, query).await;
+    if let Some(active_request) = &active_request {
+        let (status, has_error) = match &result {
+            Ok((status, headers, _)) => (status.as_u16(), headers.contains_key("X-Proxy-Error")),
+            Err(response) => (
+                response.status().as_u16(),
+                response.headers().contains_key("X-Proxy-Error"),
+            ),
+        };
+        active_request.record_completion(status, has_error);
+    }
+    result
+}
+
+async fn get_file_inner(
     _path: Option<axum::extract::Path<String>>,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     client_headers: axum::http::HeaderMap,
@@ -3021,6 +3175,8 @@ impl futures::stream::Stream for PreDataStream {
 #[cfg(test)]
 mod metrics_tests {
     use super::*;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
 
     #[test]
     fn request_metrics_classify_upstream_status_and_keep_interval_maxima() {
@@ -3101,6 +3257,101 @@ mod metrics_tests {
         stats.record_static_insertion(1234);
         assert_eq!(stats.static_cache_insertions.load(Ordering::Relaxed), 1);
         assert_eq!(stats.static_output_bytes.load(Ordering::Relaxed), 1234);
+    }
+
+    #[test]
+    fn otlp_metrics_are_cumulative_across_periodic_stats_reset() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let stats = Arc::new(GlobalStats::with_otlp(Some(&provider)));
+        let timings = PhaseTimings {
+            upstream_status: Some(503),
+            check: Duration::from_millis(1),
+            dl_wait: Duration::from_millis(2),
+            ttfb: Duration::from_millis(3),
+            body: Duration::from_millis(4),
+            cpu_wait: Duration::from_millis(5),
+            decode: Duration::from_millis(6),
+            encode: Duration::from_millis(7),
+            ..Default::default()
+        };
+
+        stats.requests.fetch_add(1, Ordering::Relaxed);
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_completion(200, false, Duration::from_millis(20));
+        assert_eq!(stats.swap_reset(), (1, 0, 0, 0));
+        stats.requests.fetch_add(1, Ordering::Relaxed);
+        stats.errors.fetch_add(1, Ordering::Relaxed);
+        stats.otlp.as_ref().unwrap().record_phases(&timings);
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_completion(503, true, Duration::from_millis(30));
+        {
+            let _active = ActiveRequestGuard::new(stats.otlp.as_ref().unwrap().clone());
+        }
+        assert_eq!(stats.swap_reset(), (1, 1, 0, 0));
+
+        provider.force_flush().expect("metrics should flush");
+        let exports = exporter
+            .get_finished_metrics()
+            .expect("metrics should be exported");
+        let metrics = exports
+            .last()
+            .expect("one metrics export")
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .collect::<Vec<_>>();
+        let names = metrics
+            .iter()
+            .map(|metric| metric.name())
+            .collect::<HashSet<_>>();
+        for name in [
+            "media_proxy_requests_total",
+            "media_proxy_errors_total",
+            "media_proxy_requests_active",
+            "media_proxy_upstream_responses_total",
+            "media_proxy_request_duration",
+            "media_proxy_url_check_duration",
+            "media_proxy_download_wait_duration",
+            "media_proxy_upstream_ttfb_duration",
+            "media_proxy_upstream_body_duration",
+            "media_proxy_cpu_wait_duration",
+            "media_proxy_decode_duration",
+            "media_proxy_encode_duration",
+        ] {
+            assert!(names.contains(name), "missing metric: {name}");
+        }
+        let requests = metrics
+            .iter()
+            .find(|metric| metric.name() == "media_proxy_requests_total")
+            .expect("request counter");
+        let AggregatedMetrics::U64(MetricData::Sum(requests)) = requests.data() else {
+            panic!("request counter should export as a u64 sum");
+        };
+        assert_eq!(
+            requests
+                .data_points()
+                .map(|data_point| data_point.value())
+                .sum::<u64>(),
+            2
+        );
+        drop(stats);
+        provider.shutdown().expect("provider should shut down");
+    }
+
+    #[test]
+    fn status_classes_are_low_cardinality() {
+        assert_eq!(status_class(200), "2xx");
+        assert_eq!(status_class(404), "4xx");
+        assert_eq!(status_class(503), "5xx");
+        assert_eq!(status_class(999), "other");
     }
 }
 
