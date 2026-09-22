@@ -56,6 +56,22 @@ struct OtlpMetrics {
     buffer_used_bytes: Gauge<u64>,
     buffer_limit_bytes: Gauge<u64>,
     buffer_wait_duration: Histogram<f64>,
+    outputs: Counter<u64>,
+    input_bytes: Counter<u64>,
+    output_bytes: Counter<u64>,
+    passthrough: Counter<u64>,
+    processing_errors: Counter<u64>,
+    fetch_errors: Counter<u64>,
+    fetch_retry_attempts: Counter<u64>,
+    fetch_retry_successes: Counter<u64>,
+    dns_retry_attempts: Counter<u64>,
+    dns_retry_successes: Counter<u64>,
+    stale_served: Counter<u64>,
+    animations: Counter<u64>,
+    animation_frames: Counter<u64>,
+    animation_input_bytes: Counter<u64>,
+    animation_output_bytes: Counter<u64>,
+    uptime: Gauge<f64>,
 }
 impl OtlpMetrics {
     fn new(provider: &SdkMeterProvider) -> Self {
@@ -109,6 +125,38 @@ impl OtlpMetrics {
             buffer_used_bytes: meter.u64_gauge("media_proxy_buffer_used_bytes").build(),
             buffer_limit_bytes: meter.u64_gauge("media_proxy_buffer_limit_bytes").build(),
             buffer_wait_duration: duration_histogram(&meter, "media_proxy_buffer_wait_duration"),
+            outputs: meter.u64_counter("media_proxy_outputs_total").build(),
+            input_bytes: meter.u64_counter("media_proxy_input_bytes_total").build(),
+            output_bytes: meter.u64_counter("media_proxy_output_bytes_total").build(),
+            passthrough: meter.u64_counter("media_proxy_passthrough_total").build(),
+            processing_errors: meter
+                .u64_counter("media_proxy_processing_errors_total")
+                .build(),
+            fetch_errors: meter.u64_counter("media_proxy_fetch_errors_total").build(),
+            fetch_retry_attempts: meter
+                .u64_counter("media_proxy_fetch_retry_attempts_total")
+                .build(),
+            fetch_retry_successes: meter
+                .u64_counter("media_proxy_fetch_retry_successes_total")
+                .build(),
+            dns_retry_attempts: meter
+                .u64_counter("media_proxy_dns_retry_attempts_total")
+                .build(),
+            dns_retry_successes: meter
+                .u64_counter("media_proxy_dns_retry_successes_total")
+                .build(),
+            stale_served: meter.u64_counter("media_proxy_stale_served_total").build(),
+            animations: meter.u64_counter("media_proxy_animations_total").build(),
+            animation_frames: meter
+                .u64_counter("media_proxy_animation_frames_total")
+                .build(),
+            animation_input_bytes: meter
+                .u64_counter("media_proxy_animation_input_bytes_total")
+                .build(),
+            animation_output_bytes: meter
+                .u64_counter("media_proxy_animation_output_bytes_total")
+                .build(),
+            uptime: meter.f64_gauge("media_proxy_uptime").with_unit("s").build(),
         }
     }
 
@@ -156,7 +204,61 @@ impl OtlpMetrics {
             .record(timings.encode.as_secs_f64(), &[]);
     }
 
-    fn record_resource_snapshot(&self, snapshot: ResourceSnapshot, eviction_deltas: (u64, u64)) {
+    fn record_outcome(
+        &self,
+        timings: &PhaseTimings,
+        status: u16,
+        has_error: bool,
+        error_detail: Option<&str>,
+    ) {
+        if timings.passthrough {
+            self.passthrough.add(1, &[]);
+        }
+        if matches!(timings.cache_result, Some(CacheResult::Stale)) {
+            self.stale_served.add(1, &[]);
+        }
+        if let Some(fetch_error) = timings.fetch_err.as_deref() {
+            self.fetch_errors.add(
+                1,
+                &[KeyValue::new("category", fetch_error_category(fetch_error))],
+            );
+        } else if status >= 400 || has_error {
+            if let Some(category) = proxy_error_category(error_detail) {
+                self.processing_errors
+                    .add(1, &[KeyValue::new("category", category)]);
+            }
+        }
+        if timings.fetch_retry_succeeded {
+            self.fetch_retry_successes.add(1, &[]);
+        }
+        if timings.anim {
+            self.animations.add(1, &[]);
+            self.animation_frames.add(timings.anim_frames as u64, &[]);
+            self.animation_input_bytes
+                .add(timings.anim_in_bytes as u64, &[]);
+            self.animation_output_bytes
+                .add(timings.anim_out_bytes as u64, &[]);
+        }
+    }
+
+    fn record_processed_output(
+        &self,
+        content_type: Option<&str>,
+        input_bytes: usize,
+        output_bytes: usize,
+    ) {
+        self.outputs
+            .add(1, &[KeyValue::new("format", output_format(content_type))]);
+        self.input_bytes.add(input_bytes as u64, &[]);
+        self.output_bytes.add(output_bytes as u64, &[]);
+    }
+
+    fn record_resource_snapshot(
+        &self,
+        snapshot: ResourceSnapshot,
+        eviction_deltas: (u64, u64),
+        dns_retry_deltas: (u64, u64),
+    ) {
         self.cache_entries.record(snapshot.cache_entries, &[]);
         self.cache_bytes.record(snapshot.cache_bytes, &[]);
         self.cache_capacity_bytes
@@ -173,6 +275,25 @@ impl OtlpMetrics {
             .record(snapshot.buffer_used_bytes, &[]);
         self.buffer_limit_bytes
             .record(snapshot.buffer_limit_bytes, &[]);
+        self.dns_retry_attempts.add(dns_retry_deltas.0, &[]);
+        self.dns_retry_successes.add(dns_retry_deltas.1, &[]);
+        self.uptime.record(snapshot.uptime_seconds, &[]);
+    }
+}
+
+fn output_format(content_type: Option<&str>) -> &'static str {
+    match content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+    {
+        "image/jpeg" => "jpeg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        _ => "other",
     }
 }
 
@@ -187,11 +308,13 @@ struct ResourceSnapshot {
     cpu_limit: u64,
     buffer_used_bytes: u64,
     buffer_limit_bytes: u64,
+    uptime_seconds: f64,
 }
 
 fn record_resource_metrics(
     metrics: &OtlpMetrics,
     response_cache: &ResponseCache,
+    dns_cache: &DnsCache,
     download_semaphore: &Semaphore,
     download_limit: usize,
     cpu_semaphore: &Semaphore,
@@ -199,7 +322,9 @@ fn record_resource_metrics(
     buffer_budget: &Semaphore,
     buffer_limit: usize,
     cache_capacity_bytes: u64,
+    process_started: Instant,
     previous_evictions: &mut (u64, u64),
+    previous_dns_retries: &mut (u64, u64),
 ) {
     let (cache_entries, cache_bytes) = response_cache.stats();
     let cumulative_evictions = response_cache.cumulative_evictions();
@@ -208,6 +333,16 @@ fn record_resource_metrics(
         cumulative_evictions.1.saturating_sub(previous_evictions.1),
     );
     *previous_evictions = cumulative_evictions;
+    let cumulative_dns_retries = dns_cache.cumulative_retries();
+    let dns_retry_deltas = (
+        cumulative_dns_retries
+            .0
+            .saturating_sub(previous_dns_retries.0),
+        cumulative_dns_retries
+            .1
+            .saturating_sub(previous_dns_retries.1),
+    );
+    *previous_dns_retries = cumulative_dns_retries;
     metrics.record_resource_snapshot(
         ResourceSnapshot {
             cache_entries: cache_entries as u64,
@@ -222,8 +357,10 @@ fn record_resource_metrics(
             buffer_used_bytes: buffer_limit.saturating_sub(buffer_budget.available_permits())
                 as u64,
             buffer_limit_bytes: buffer_limit as u64,
+            uptime_seconds: process_started.elapsed().as_secs_f64(),
         },
         eviction_deltas,
+        dns_retry_deltas,
     );
 }
 
@@ -238,6 +375,45 @@ fn status_class(status: u16) -> &'static str {
         300..=399 => "3xx",
         400..=499 => "4xx",
         500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+fn proxy_error_category(detail: Option<&str>) -> Option<&'static str> {
+    let detail = detail.unwrap_or_default().to_ascii_lowercase();
+    if detail.starts_with("status:") {
+        None
+    } else if detail.contains("decode") || detail.contains("unknown format") {
+        Some("decode")
+    } else if detail.contains("encode") || detail.contains("cpusemaphore") {
+        Some("encode")
+    } else if detail.contains("length") || detail.contains("bufferbudget") {
+        Some("size")
+    } else if detail.contains("blocked")
+        || detail.contains("private")
+        || detail.contains("loopback")
+        || detail.starts_with("scheme:")
+        || detail == "no host"
+        || detail == "no port"
+        || detail.contains("relativeurlwithoutbase")
+        || detail.contains("emptyhost")
+        || detail.contains("invalidport")
+        || detail.contains("invalidipv")
+        || detail.contains("idna")
+    {
+        Some("policy")
+    } else {
+        Some("internal")
+    }
+}
+
+fn fetch_error_category(detail: &str) -> &'static str {
+    match detail.split(':').next().unwrap_or("other") {
+        "dns" => "dns",
+        "connect" => "connect",
+        "timeout" => "timeout",
+        "reset" => "reset",
+        "body" => "body",
         _ => "other",
     }
 }
@@ -485,25 +661,20 @@ impl GlobalStats {
         if timings.fetch_err.is_some() {
             return;
         }
-        let detail = detail.unwrap_or_default().to_ascii_lowercase();
-        let counter = if detail.starts_with("status:") {
-            &self.perr_upstream_status
-        } else if detail.contains("decode") || detail.contains("unknown format") {
-            &self.decode_error
-        } else if detail.contains("encode") || detail.contains("cpusemaphore") {
-            &self.encode_error
-        } else if detail.contains("length") || detail.contains("bufferbudget") {
-            &self.size_reject
-        } else if detail.contains("blocked")
-            || detail.contains("private")
-            || detail.contains("loopback")
-            || detail.starts_with("scheme:")
-            || detail == "no host"
-            || detail == "no port"
+        if detail
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .starts_with("status:")
         {
-            &self.policy_reject
-        } else {
-            &self.internal_error
+            self.perr_upstream_status.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let counter = match proxy_error_category(detail) {
+            Some("decode") => &self.decode_error,
+            Some("encode") => &self.encode_error,
+            Some("size") => &self.size_reject,
+            Some("policy") => &self.policy_reject,
+            _ => &self.internal_error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -513,6 +684,9 @@ impl GlobalStats {
         input_bytes: usize,
         output_bytes: usize,
     ) {
+        if let Some(metrics) = &self.otlp {
+            metrics.record_processed_output(content_type, input_bytes, output_bytes);
+        }
         let counter = match content_type
             .unwrap_or_default()
             .split(';')
@@ -797,6 +971,7 @@ fn init_otlp_metrics(config: &ConfigFile) -> Result<Option<SdkMeterProvider>, St
     Ok(Some(provider))
 }
 fn main() {
+    let process_started = Instant::now();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -999,6 +1174,7 @@ fn main() {
     rt.block_on(async {
         if let Some(metrics) = arg_tup.10.otlp.clone() {
             let response_cache = arg_tup.7.clone();
+            let dns_cache = arg_tup.6.clone();
             let download_semaphore = arg_tup.8.clone();
             let cpu_semaphore = arg_tup.4.clone();
             let buffer_budget = arg_tup.9.clone();
@@ -1009,12 +1185,14 @@ fn main() {
             let interval_ms = arg_tup.1.otlp_export_interval_ms;
             tokio::spawn(async move {
                 let mut previous_evictions = (0, 0);
+                let mut previous_dns_retries = (0, 0);
                 let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
                 loop {
                     interval.tick().await;
                     record_resource_metrics(
                         &metrics,
                         &response_cache,
+                        &dns_cache,
                         &download_semaphore,
                         download_limit,
                         &cpu_semaphore,
@@ -1022,7 +1200,9 @@ fn main() {
                         &buffer_budget,
                         buffer_limit,
                         cache_capacity_bytes,
+                        process_started,
                         &mut previous_evictions,
+                        &mut previous_dns_retries,
                     );
                 }
             });
@@ -1441,6 +1621,8 @@ pub struct DnsCache {
     lookup_semaphore: Semaphore,
     retry_attempts: AtomicU64,
     retry_saved: AtomicU64,
+    retry_attempts_total: AtomicU64,
+    retry_saved_total: AtomicU64,
 }
 
 struct DnsFlightGuard<'a> {
@@ -1492,6 +1674,8 @@ impl DnsCache {
             lookup_semaphore: Semaphore::new(128),
             retry_attempts: AtomicU64::new(0),
             retry_saved: AtomicU64::new(0),
+            retry_attempts_total: AtomicU64::new(0),
+            retry_saved_total: AtomicU64::new(0),
         }
     }
     /// エントリのTTLを返す。タイムアウト由来の失敗は短いTTL(2秒)、確定的失敗はnegative_ttl。
@@ -1520,6 +1704,12 @@ impl DnsCache {
         (
             self.retry_attempts.swap(0, Ordering::Relaxed),
             self.retry_saved.swap(0, Ordering::Relaxed),
+        )
+    }
+    pub(crate) fn cumulative_retries(&self) -> (u64, u64) {
+        (
+            self.retry_attempts_total.load(Ordering::Relaxed),
+            self.retry_saved_total.load(Ordering::Relaxed),
         )
     }
 
@@ -1583,9 +1773,11 @@ impl DnsCache {
             Err(e) if e.contains("timeout") => {
                 // タイムアウト→1回リトライ
                 self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                self.retry_attempts_total.fetch_add(1, Ordering::Relaxed);
                 let retry = self.do_lookup(host, port).await;
                 if retry.is_ok() {
                     self.retry_saved.fetch_add(1, Ordering::Relaxed);
+                    self.retry_saved_total.fetch_add(1, Ordering::Relaxed);
                 }
                 retry
             }
@@ -1786,6 +1978,8 @@ struct PhaseTimings {
     dns_v6: u16,
     /// 接続リトライが実行された。
     retried: bool,
+    /// 接続リトライ後の上流sendが成功した。
+    fetch_retry_succeeded: bool,
     /// レスポンスのHTTPバージョン(例: "1.1", "2")。
     http_version: Option<&'static str>,
     /// 上流が返したHTTPステータス。上流応答前の失敗ではNone。
@@ -1906,6 +2100,7 @@ fn emit_summary(
 ) {
     if let Some(metrics) = &stats.otlp {
         metrics.record_phases(t, s.is_static_path);
+        metrics.record_outcome(t, status, has_error, error_detail);
     }
     stats.requests.fetch_add(1, Ordering::Relaxed);
     stats.observe_request(t, s.is_static_path);
@@ -2297,7 +2492,7 @@ async fn get_file_inner(
             if let Ok(mut t) = timings.lock() {
                 t.check = check_start.elapsed();
                 // DNS解決失敗の場合のみ fetch_err に記録(ポリシー拒否は除外)
-                if !s.contains("Blocked") && !s.contains("Private") && !s.contains("Loopback") {
+                if proxy_error_category(Some(&s)) != Some("policy") {
                     t.fetch_err = Some(format!("dns:{}", s.chars().take(60).collect::<String>()));
                 }
             }
@@ -2429,12 +2624,16 @@ async fn get_file_inner(
                     .saturating_sub(send_start.elapsed().as_millis() as u64);
                 if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
                     global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                    if let Some(metrics) = &global_stats.otlp {
+                        metrics.fetch_retry_attempts.add(1, &[]);
+                    }
                     tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
                     match build_req().send().await {
                         Ok(resp) => {
                             if let Ok(mut t) = timings.lock() {
                                 t.ttfb = send_start.elapsed();
                                 t.retried = true;
+                                t.fetch_retry_succeeded = true;
                             }
                             resp
                         }
@@ -2547,6 +2746,17 @@ async fn get_file_inner(
         }
         if redirects >= MAX_REDIRECTS {
             headers.append("X-Proxy-Error", "TooManyRedirects".parse().unwrap());
+            if let Ok(t) = timings.lock() {
+                emit_summary(
+                    &config,
+                    &summary,
+                    &t,
+                    502,
+                    true,
+                    Some("TooManyRedirects"),
+                    &global_stats,
+                );
+            }
             return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
         }
         let Some(location) = resp
@@ -2556,14 +2766,24 @@ async fn get_file_inner(
         else {
             break resp;
         };
-        let next_url = current_url.join(location).map_err(|e| {
-            (
-                axum::http::StatusCode::BAD_REQUEST,
-                headers.clone(),
-                format!("{:?}", e),
-            )
-                .into_response()
-        })?;
+        let next_url = match current_url.join(location) {
+            Ok(url) => url,
+            Err(error) => {
+                let detail = format!("RedirectUrl:{error:?}");
+                if let Ok(t) = timings.lock() {
+                    emit_summary(
+                        &config,
+                        &summary,
+                        &t,
+                        400,
+                        true,
+                        Some(&detail),
+                        &global_stats,
+                    );
+                }
+                return Err((axum::http::StatusCode::BAD_REQUEST, headers, detail).into_response());
+            }
+        };
         const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
         let mut stream = resp.bytes_stream();
         let mut drained = 0;
@@ -2584,8 +2804,18 @@ async fn get_file_inner(
                 }
             }
             Err(s) => {
+                if let Ok(mut t) = timings.lock() {
+                    t.check += check_start.elapsed();
+                    if proxy_error_category(Some(&s)) != Some("policy") {
+                        t.fetch_err =
+                            Some(format!("dns:{}", s.chars().take(60).collect::<String>()));
+                    }
+                }
                 if let Ok(value) = s.parse() {
                     headers.append("X-Proxy-Error", value);
+                }
+                if let Ok(t) = timings.lock() {
+                    emit_summary(&config, &summary, &t, 400, true, Some(&s), &global_stats);
                 }
                 return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
             }
@@ -3107,8 +3337,8 @@ impl RequestContext {
                                     _ => ".bin",
                                 };
                                 Self::disposition_ext(&mut self.headers, ext);
+                                self.cache_response(200, &self.headers, &self.src_bytes);
                                 let body = std::mem::take(&mut self.src_bytes);
-                                self.cache_response(200, &self.headers, &body);
                                 return Err((
                                     axum::http::StatusCode::OK,
                                     self.headers.clone(),
@@ -3457,7 +3687,8 @@ mod metrics_tests {
         let stats = Arc::new(GlobalStats::with_otlp(Some(&provider)));
         let timings = PhaseTimings {
             upstream_status: Some(503),
-            cache_result: Some(CacheResult::Miss),
+            cache_result: Some(CacheResult::Stale),
+            passthrough: true,
             check: Duration::from_millis(1),
             dl_wait: Duration::from_millis(2),
             ttfb: Duration::from_millis(3),
@@ -3466,6 +3697,13 @@ mod metrics_tests {
             buffer_wait: Duration::from_millis(5),
             decode: Duration::from_millis(6),
             encode: Duration::from_millis(7),
+            anim: true,
+            anim_frames: 3,
+            anim_in_bytes: 1000,
+            anim_out_bytes: 400,
+            fetch_err: Some("timeout".to_owned()),
+            retried: true,
+            fetch_retry_succeeded: true,
             ..Default::default()
         };
 
@@ -3479,6 +3717,28 @@ mod metrics_tests {
         stats.requests.fetch_add(1, Ordering::Relaxed);
         stats.errors.fetch_add(1, Ordering::Relaxed);
         stats.otlp.as_ref().unwrap().record_phases(&timings, true);
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_outcome(&timings, 200, false, None);
+        stats.otlp.as_ref().unwrap().record_outcome(
+            &PhaseTimings::default(),
+            502,
+            true,
+            Some("DecodeError_invalid"),
+        );
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_processed_output(Some("image/webp"), 1000, 400);
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .fetch_retry_attempts
+            .add(1, &[]);
         stats.otlp.as_ref().unwrap().record_resource_snapshot(
             ResourceSnapshot {
                 cache_entries: 2,
@@ -3491,7 +3751,9 @@ mod metrics_tests {
                 cpu_limit: 2,
                 buffer_used_bytes: 2048,
                 buffer_limit_bytes: 8192,
+                uptime_seconds: 1.0,
             },
+            (1, 1),
             (1, 1),
         );
         stats
@@ -3546,6 +3808,22 @@ mod metrics_tests {
             "media_proxy_buffer_used_bytes",
             "media_proxy_buffer_limit_bytes",
             "media_proxy_buffer_wait_duration",
+            "media_proxy_outputs_total",
+            "media_proxy_input_bytes_total",
+            "media_proxy_output_bytes_total",
+            "media_proxy_passthrough_total",
+            "media_proxy_processing_errors_total",
+            "media_proxy_fetch_errors_total",
+            "media_proxy_fetch_retry_attempts_total",
+            "media_proxy_fetch_retry_successes_total",
+            "media_proxy_dns_retry_attempts_total",
+            "media_proxy_dns_retry_successes_total",
+            "media_proxy_stale_served_total",
+            "media_proxy_animations_total",
+            "media_proxy_animation_frames_total",
+            "media_proxy_animation_input_bytes_total",
+            "media_proxy_animation_output_bytes_total",
+            "media_proxy_uptime",
         ] {
             assert!(names.contains(name), "missing metric: {name}");
         }
@@ -3573,6 +3851,30 @@ mod metrics_tests {
         assert_eq!(status_class(404), "4xx");
         assert_eq!(status_class(503), "5xx");
         assert_eq!(status_class(999), "other");
+        assert_eq!(output_format(Some("image/jpeg")), "jpeg");
+        assert_eq!(output_format(Some("image/png; charset=binary")), "png");
+        assert_eq!(output_format(Some("image/webp")), "webp");
+        assert_eq!(output_format(Some("image/avif")), "avif");
+        assert_eq!(output_format(Some("image/gif")), "other");
+        assert_eq!(proxy_error_category(Some("DecodeError")), Some("decode"));
+        assert_eq!(proxy_error_category(Some("EncodeError")), Some("encode"));
+        assert_eq!(proxy_error_category(Some("length:2>1")), Some("size"));
+        assert_eq!(
+            proxy_error_category(Some("Blocked address")),
+            Some("policy")
+        );
+        assert_eq!(
+            proxy_error_category(Some("RelativeUrlWithoutBase")),
+            Some("policy")
+        );
+        assert_eq!(proxy_error_category(Some("unexpected")), Some("internal"));
+        assert_eq!(proxy_error_category(Some("status:404")), None);
+        assert_eq!(fetch_error_category("dns:lookup failed"), "dns");
+        assert_eq!(fetch_error_category("connect"), "connect");
+        assert_eq!(fetch_error_category("timeout"), "timeout");
+        assert_eq!(fetch_error_category("reset"), "reset");
+        assert_eq!(fetch_error_category("body"), "body");
+        assert_eq!(fetch_error_category("unexpected:detail"), "other");
     }
 }
 
@@ -3670,8 +3972,12 @@ mod network_policy_tests {
         let cache = test_dns_cache(Duration::from_millis(20));
         cache.retry_attempts.fetch_add(2, Ordering::Relaxed);
         cache.retry_saved.fetch_add(1, Ordering::Relaxed);
+        cache.retry_attempts_total.fetch_add(2, Ordering::Relaxed);
+        cache.retry_saved_total.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(cache.cumulative_retries(), (2, 1));
         assert_eq!(cache.swap_reset_retries(), (2, 1));
         assert_eq!(cache.swap_reset_retries(), (0, 0));
+        assert_eq!(cache.cumulative_retries(), (2, 1));
     }
     #[test]
     fn parse_valid_config() {

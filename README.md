@@ -185,6 +185,27 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_buffer_limit_bytes`             | Gauge     | 処理中バッファ上限                     |
 | `media_proxy_buffer_wait_duration`           | Histogram | バッファ予算セマフォ待機時間           |
 
+出力形式の属性 `format` は `jpeg`、`png`、`webp`、`avif`、`other` の5種類です。圧縮率は `media_proxy_output_bytes_total / media_proxy_input_bytes_total`、パススルー率は `media_proxy_passthrough_total / media_proxy_requests_total` で算出します。処理エラーの `category` は `decode`、`encode`、`policy`、`size`、`internal`、fetchエラーは `dns`、`connect`、`timeout`、`reset`、`body`、`other` の固定分類です。
+
+| メトリクス                                 | 種別    | 内容                                 |
+| ------------------------------------------ | ------- | ------------------------------------ |
+| `media_proxy_outputs_total`                | Counter | 出力形式別累積数                     |
+| `media_proxy_input_bytes_total`            | Counter | 処理入力バイト累積数                 |
+| `media_proxy_output_bytes_total`           | Counter | 処理出力バイト累積数                 |
+| `media_proxy_passthrough_total`            | Counter | パススルー累積数                     |
+| `media_proxy_processing_errors_total`      | Counter | 画像処理・ポリシーエラー分類別累積数 |
+| `media_proxy_fetch_errors_total`           | Counter | fetchエラー分類別累積数              |
+| `media_proxy_fetch_retry_attempts_total`   | Counter | fetchリトライ累積数                  |
+| `media_proxy_fetch_retry_successes_total`  | Counter | fetchリトライ成功累積数              |
+| `media_proxy_dns_retry_attempts_total`     | Counter | DNSリトライ累積数                    |
+| `media_proxy_dns_retry_successes_total`    | Counter | DNSリトライ成功累積数                |
+| `media_proxy_stale_served_total`           | Counter | staleキャッシュ提供累積数            |
+| `media_proxy_animations_total`             | Counter | アニメーション処理累積数             |
+| `media_proxy_animation_frames_total`       | Counter | アニメーション処理フレーム累積数     |
+| `media_proxy_animation_input_bytes_total`  | Counter | アニメーション入力バイト累積数       |
+| `media_proxy_animation_output_bytes_total` | Counter | アニメーション出力バイト累積数       |
+| `media_proxy_uptime`                       | Gauge   | プロセス起動からの経過秒数           |
+
 ## media-proxy.jiskey.dev 向け運用設定
 
 `config.media-proxy.jiskey.dev.json` にIntel N95 (4コア, RAM 8GB) で稼働するmedia-proxy.jiskey.dev向けの運用設定を用意しています。主な変更点:
