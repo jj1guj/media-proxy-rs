@@ -10,7 +10,7 @@ use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
-use opentelemetry::metrics::{Counter, Histogram, MeterProvider as _, UpDownCounter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider as _, UpDownCounter};
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
@@ -41,6 +41,21 @@ struct OtlpMetrics {
     cpu_wait_duration: Histogram<f64>,
     decode_duration: Histogram<f64>,
     encode_duration: Histogram<f64>,
+    cache_requests: Counter<u64>,
+    cache_entries: Gauge<u64>,
+    cache_bytes: Gauge<u64>,
+    cache_capacity_bytes: Gauge<u64>,
+    cache_capacity_evictions: Counter<u64>,
+    cache_expired_evictions: Counter<u64>,
+    singleflight_active: Gauge<u64>,
+    static_requests: Counter<u64>,
+    downloads_active: Gauge<u64>,
+    downloads_limit: Gauge<u64>,
+    cpu_active: Gauge<u64>,
+    cpu_limit: Gauge<u64>,
+    buffer_used_bytes: Gauge<u64>,
+    buffer_limit_bytes: Gauge<u64>,
+    buffer_wait_duration: Histogram<f64>,
 }
 impl OtlpMetrics {
     fn new(provider: &SdkMeterProvider) -> Self {
@@ -71,6 +86,29 @@ impl OtlpMetrics {
             cpu_wait_duration: duration_histogram(&meter, "media_proxy_cpu_wait_duration"),
             decode_duration: duration_histogram(&meter, "media_proxy_decode_duration"),
             encode_duration: duration_histogram(&meter, "media_proxy_encode_duration"),
+            cache_requests: meter
+                .u64_counter("media_proxy_cache_requests_total")
+                .build(),
+            cache_entries: meter.u64_gauge("media_proxy_cache_entries").build(),
+            cache_bytes: meter.u64_gauge("media_proxy_cache_bytes").build(),
+            cache_capacity_bytes: meter.u64_gauge("media_proxy_cache_capacity_bytes").build(),
+            cache_capacity_evictions: meter
+                .u64_counter("media_proxy_cache_capacity_evictions_total")
+                .build(),
+            cache_expired_evictions: meter
+                .u64_counter("media_proxy_cache_expired_evictions_total")
+                .build(),
+            singleflight_active: meter.u64_gauge("media_proxy_singleflight_active").build(),
+            static_requests: meter
+                .u64_counter("media_proxy_static_requests_total")
+                .build(),
+            downloads_active: meter.u64_gauge("media_proxy_downloads_active").build(),
+            downloads_limit: meter.u64_gauge("media_proxy_downloads_limit").build(),
+            cpu_active: meter.u64_gauge("media_proxy_cpu_active").build(),
+            cpu_limit: meter.u64_gauge("media_proxy_cpu_limit").build(),
+            buffer_used_bytes: meter.u64_gauge("media_proxy_buffer_used_bytes").build(),
+            buffer_limit_bytes: meter.u64_gauge("media_proxy_buffer_limit_bytes").build(),
+            buffer_wait_duration: duration_histogram(&meter, "media_proxy_buffer_wait_duration"),
         }
     }
 
@@ -86,7 +124,14 @@ impl OtlpMetrics {
             .record(total_duration.as_secs_f64(), &[]);
     }
 
-    fn record_phases(&self, timings: &PhaseTimings) {
+    fn record_phases(&self, timings: &PhaseTimings, is_static_path: bool) {
+        if let Some(cache_result) = timings.cache_result {
+            let attributes = [KeyValue::new("result", cache_result.to_string())];
+            self.cache_requests.add(1, &attributes);
+            if is_static_path {
+                self.static_requests.add(1, &attributes);
+            }
+        }
         if let Some(upstream_status) = timings.upstream_status {
             self.upstream_responses.add(
                 1,
@@ -103,11 +148,83 @@ impl OtlpMetrics {
             .record(timings.body.as_secs_f64(), &[]);
         self.cpu_wait_duration
             .record(timings.cpu_wait.as_secs_f64(), &[]);
+        self.buffer_wait_duration
+            .record(timings.buffer_wait.as_secs_f64(), &[]);
         self.decode_duration
             .record(timings.decode.as_secs_f64(), &[]);
         self.encode_duration
             .record(timings.encode.as_secs_f64(), &[]);
     }
+
+    fn record_resource_snapshot(&self, snapshot: ResourceSnapshot, eviction_deltas: (u64, u64)) {
+        self.cache_entries.record(snapshot.cache_entries, &[]);
+        self.cache_bytes.record(snapshot.cache_bytes, &[]);
+        self.cache_capacity_bytes
+            .record(snapshot.cache_capacity_bytes, &[]);
+        self.cache_capacity_evictions.add(eviction_deltas.0, &[]);
+        self.cache_expired_evictions.add(eviction_deltas.1, &[]);
+        self.singleflight_active
+            .record(snapshot.singleflight_active, &[]);
+        self.downloads_active.record(snapshot.downloads_active, &[]);
+        self.downloads_limit.record(snapshot.downloads_limit, &[]);
+        self.cpu_active.record(snapshot.cpu_active, &[]);
+        self.cpu_limit.record(snapshot.cpu_limit, &[]);
+        self.buffer_used_bytes
+            .record(snapshot.buffer_used_bytes, &[]);
+        self.buffer_limit_bytes
+            .record(snapshot.buffer_limit_bytes, &[]);
+    }
+}
+
+struct ResourceSnapshot {
+    cache_entries: u64,
+    cache_bytes: u64,
+    cache_capacity_bytes: u64,
+    singleflight_active: u64,
+    downloads_active: u64,
+    downloads_limit: u64,
+    cpu_active: u64,
+    cpu_limit: u64,
+    buffer_used_bytes: u64,
+    buffer_limit_bytes: u64,
+}
+
+fn record_resource_metrics(
+    metrics: &OtlpMetrics,
+    response_cache: &ResponseCache,
+    download_semaphore: &Semaphore,
+    download_limit: usize,
+    cpu_semaphore: &Semaphore,
+    cpu_limit: usize,
+    buffer_budget: &Semaphore,
+    buffer_limit: usize,
+    cache_capacity_bytes: u64,
+    previous_evictions: &mut (u64, u64),
+) {
+    let (cache_entries, cache_bytes) = response_cache.stats();
+    let cumulative_evictions = response_cache.cumulative_evictions();
+    let eviction_deltas = (
+        cumulative_evictions.0.saturating_sub(previous_evictions.0),
+        cumulative_evictions.1.saturating_sub(previous_evictions.1),
+    );
+    *previous_evictions = cumulative_evictions;
+    metrics.record_resource_snapshot(
+        ResourceSnapshot {
+            cache_entries: cache_entries as u64,
+            cache_bytes: cache_bytes as u64,
+            cache_capacity_bytes,
+            singleflight_active: response_cache.inflight_count() as u64,
+            downloads_active: download_limit.saturating_sub(download_semaphore.available_permits())
+                as u64,
+            downloads_limit: download_limit as u64,
+            cpu_active: cpu_limit.saturating_sub(cpu_semaphore.available_permits()) as u64,
+            cpu_limit: cpu_limit as u64,
+            buffer_used_bytes: buffer_limit.saturating_sub(buffer_budget.available_permits())
+                as u64,
+            buffer_limit_bytes: buffer_limit as u64,
+        },
+        eviction_deltas,
+    );
 }
 
 fn duration_histogram(meter: &opentelemetry::metrics::Meter, name: &'static str) -> Histogram<f64> {
@@ -880,6 +997,36 @@ fn main() {
         global_stats,
     );
     rt.block_on(async {
+        if let Some(metrics) = arg_tup.10.otlp.clone() {
+            let response_cache = arg_tup.7.clone();
+            let download_semaphore = arg_tup.8.clone();
+            let cpu_semaphore = arg_tup.4.clone();
+            let buffer_budget = arg_tup.9.clone();
+            let download_limit = arg_tup.1.max_concurrent_downloads;
+            let cpu_limit = max_concurrent_encode;
+            let buffer_limit = arg_tup.1.inflight_buffer_budget_bytes as usize;
+            let cache_capacity_bytes = arg_tup.1.cache_max_bytes;
+            let interval_ms = arg_tup.1.otlp_export_interval_ms;
+            tokio::spawn(async move {
+                let mut previous_evictions = (0, 0);
+                let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                loop {
+                    interval.tick().await;
+                    record_resource_metrics(
+                        &metrics,
+                        &response_cache,
+                        &download_semaphore,
+                        download_limit,
+                        &cpu_semaphore,
+                        cpu_limit,
+                        &buffer_budget,
+                        buffer_limit,
+                        cache_capacity_bytes,
+                        &mut previous_evictions,
+                    );
+                }
+            });
+        }
         // --- 60秒ごとの定期統計ログ ---
         {
             let stats = arg_tup.10.clone();
@@ -1619,6 +1766,8 @@ struct PhaseTimings {
     dl_wait: Duration,
     /// CPUセマフォの待機時間。
     cpu_wait: Duration,
+    /// バッファ予算セマフォの待機時間。
+    buffer_wait: Duration,
     /// TTFB(送信開始〜レスポンスヘッダ受信)。
     ttfb: Duration,
     /// ボディ受信時間。
@@ -1756,7 +1905,7 @@ fn emit_summary(
     stats: &GlobalStats,
 ) {
     if let Some(metrics) = &stats.otlp {
-        metrics.record_phases(t);
+        metrics.record_phases(t, s.is_static_path);
     }
     stats.requests.fetch_add(1, Ordering::Relaxed);
     stats.observe_request(t, s.is_static_path);
@@ -2207,8 +2356,24 @@ async fn get_file_inner(
     {
         Ok(Ok(permit)) => permit,
         _ => {
+            if let Ok(mut t) = timings.lock() {
+                let elapsed = wait_start.elapsed();
+                t.wait += elapsed;
+                t.dl_wait += elapsed;
+            }
             let mut h = HeaderMap::new();
             h.append("X-Proxy-Error", "DownloadSemaphoreError".parse().unwrap());
+            if let Ok(t) = timings.lock() {
+                emit_summary(
+                    &config,
+                    &summary,
+                    &t,
+                    503,
+                    true,
+                    Some("DownloadSemaphoreError"),
+                    &global_stats,
+                );
+            }
             return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
         }
     };
@@ -2770,6 +2935,11 @@ impl RequestContext {
             {
                 Ok(Ok(permit)) => permit,
                 _ => {
+                    if let Ok(mut t) = self.timings.lock() {
+                        let elapsed = wait_start.elapsed();
+                        t.wait += elapsed;
+                        t.buffer_wait += elapsed;
+                    }
                     let mut h = self.headers.clone();
                     h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
                     return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
@@ -2779,7 +2949,9 @@ impl RequestContext {
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
             if let Ok(mut t) = self.timings.lock() {
-                t.wait += wait_start.elapsed();
+                let elapsed = wait_start.elapsed();
+                t.wait += elapsed;
+                t.buffer_wait += elapsed;
             }
             self.load_all(resp).await?;
             drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
@@ -2791,6 +2963,11 @@ impl RequestContext {
             {
                 Ok(Ok(permit)) => permit,
                 _ => {
+                    if let Ok(mut t) = self.timings.lock() {
+                        let elapsed = wait_start.elapsed();
+                        t.wait += elapsed;
+                        t.cpu_wait += elapsed;
+                    }
                     let mut h = self.headers.clone();
                     h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
                     return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
@@ -2868,6 +3045,11 @@ impl RequestContext {
             {
                 Ok(Ok(permit)) => permit,
                 _ => {
+                    if let Ok(mut t) = self.timings.lock() {
+                        let elapsed = wait_start.elapsed();
+                        t.wait += elapsed;
+                        t.buffer_wait += elapsed;
+                    }
                     header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
                     return Err(
                         (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
@@ -2879,7 +3061,9 @@ impl RequestContext {
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
             if let Ok(mut t) = self.timings.lock() {
-                t.wait += wait_start.elapsed();
+                let elapsed = wait_start.elapsed();
+                t.wait += elapsed;
+                t.buffer_wait += elapsed;
             }
             self.load_all(resp).await?;
             drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
@@ -2945,6 +3129,11 @@ impl RequestContext {
                 {
                     Ok(Ok(permit)) => permit,
                     _ => {
+                        if let Ok(mut t) = self.timings.lock() {
+                            let elapsed = wait_start.elapsed();
+                            t.wait += elapsed;
+                            t.cpu_wait += elapsed;
+                        }
                         header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
                         return Err(
                             (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
@@ -3268,11 +3457,13 @@ mod metrics_tests {
         let stats = Arc::new(GlobalStats::with_otlp(Some(&provider)));
         let timings = PhaseTimings {
             upstream_status: Some(503),
+            cache_result: Some(CacheResult::Miss),
             check: Duration::from_millis(1),
             dl_wait: Duration::from_millis(2),
             ttfb: Duration::from_millis(3),
             body: Duration::from_millis(4),
             cpu_wait: Duration::from_millis(5),
+            buffer_wait: Duration::from_millis(5),
             decode: Duration::from_millis(6),
             encode: Duration::from_millis(7),
             ..Default::default()
@@ -3287,7 +3478,22 @@ mod metrics_tests {
         assert_eq!(stats.swap_reset(), (1, 0, 0, 0));
         stats.requests.fetch_add(1, Ordering::Relaxed);
         stats.errors.fetch_add(1, Ordering::Relaxed);
-        stats.otlp.as_ref().unwrap().record_phases(&timings);
+        stats.otlp.as_ref().unwrap().record_phases(&timings, true);
+        stats.otlp.as_ref().unwrap().record_resource_snapshot(
+            ResourceSnapshot {
+                cache_entries: 2,
+                cache_bytes: 1024,
+                cache_capacity_bytes: 4096,
+                singleflight_active: 1,
+                downloads_active: 2,
+                downloads_limit: 4,
+                cpu_active: 1,
+                cpu_limit: 2,
+                buffer_used_bytes: 2048,
+                buffer_limit_bytes: 8192,
+            },
+            (1, 1),
+        );
         stats
             .otlp
             .as_ref()
@@ -3325,6 +3531,21 @@ mod metrics_tests {
             "media_proxy_cpu_wait_duration",
             "media_proxy_decode_duration",
             "media_proxy_encode_duration",
+            "media_proxy_cache_requests_total",
+            "media_proxy_cache_entries",
+            "media_proxy_cache_bytes",
+            "media_proxy_cache_capacity_bytes",
+            "media_proxy_cache_capacity_evictions_total",
+            "media_proxy_cache_expired_evictions_total",
+            "media_proxy_singleflight_active",
+            "media_proxy_static_requests_total",
+            "media_proxy_downloads_active",
+            "media_proxy_downloads_limit",
+            "media_proxy_cpu_active",
+            "media_proxy_cpu_limit",
+            "media_proxy_buffer_used_bytes",
+            "media_proxy_buffer_limit_bytes",
+            "media_proxy_buffer_wait_duration",
         ] {
             assert!(names.contains(name), "missing metric: {name}");
         }
@@ -3637,8 +3858,21 @@ mod cache_tests {
         // key1 は追い出されているはず
         assert!(cache.get(&key1).is_none());
         assert!(cache.get(&key2).is_some());
+        assert_eq!(cache.cumulative_evictions(), (1, 0));
         assert_eq!(cache.swap_reset_evictions(), (1, 0));
         assert_eq!(cache.swap_reset_evictions(), (0, 0));
+        assert_eq!(cache.cumulative_evictions(), (1, 0));
+    }
+    #[test]
+    fn singleflight_count_tracks_active_guards() {
+        let cache = test_cache();
+        assert_eq!(cache.inflight_count(), 0);
+        let guard = cache
+            .start_flight(test_key())
+            .expect("first request should own the flight");
+        assert_eq!(cache.inflight_count(), 1);
+        drop(guard);
+        assert_eq!(cache.inflight_count(), 0);
     }
     #[test]
     fn cache_skip_oversized_entry() {

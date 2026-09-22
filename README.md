@@ -165,6 +165,26 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_decode_duration`          | Histogram     | decode時間                                     |
 | `media_proxy_encode_duration`          | Histogram     | encode時間                                     |
 
+キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale` の5種類です。キャッシュヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
+
+| メトリクス                                   | 種別      | 内容                                   |
+| -------------------------------------------- | --------- | -------------------------------------- |
+| `media_proxy_cache_requests_total`           | Counter   | キャッシュ結果別リクエスト累積数       |
+| `media_proxy_cache_entries`                  | Gauge     | キャッシュエントリ数                   |
+| `media_proxy_cache_bytes`                    | Gauge     | キャッシュ使用バイト数                 |
+| `media_proxy_cache_capacity_bytes`           | Gauge     | キャッシュ容量上限                     |
+| `media_proxy_cache_capacity_evictions_total` | Counter   | 容量超過によるeviction累積数           |
+| `media_proxy_cache_expired_evictions_total`  | Counter   | 有効期間超過によるeviction累積数       |
+| `media_proxy_singleflight_active`            | Gauge     | singleflight処理中件数                 |
+| `media_proxy_static_requests_total`          | Counter   | `/static.webp`のキャッシュ結果別累積数 |
+| `media_proxy_downloads_active`               | Gauge     | ダウンロード同時処理数                 |
+| `media_proxy_downloads_limit`                | Gauge     | ダウンロード同時処理上限               |
+| `media_proxy_cpu_active`                     | Gauge     | CPU同時処理数                          |
+| `media_proxy_cpu_limit`                      | Gauge     | CPU同時処理上限                        |
+| `media_proxy_buffer_used_bytes`              | Gauge     | 処理中バッファ使用量                   |
+| `media_proxy_buffer_limit_bytes`             | Gauge     | 処理中バッファ上限                     |
+| `media_proxy_buffer_wait_duration`           | Histogram | バッファ予算セマフォ待機時間           |
+
 ## media-proxy.jiskey.dev 向け運用設定
 
 `config.media-proxy.jiskey.dev.json` にIntel N95 (4コア, RAM 8GB) で稼働するmedia-proxy.jiskey.dev向けの運用設定を用意しています。主な変更点:
