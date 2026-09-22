@@ -3498,7 +3498,7 @@ impl RequestContext {
                     if libvips_dep::is_vips(head) {
                         is_img = true;
                     }
-                    if head.starts_with(&crate::mng::SIGNATURE) {
+                    if crate::mng::is_mng_or_jng(head) {
                         is_img = true;
                         self.headers.remove("Content-Type");
                         self.headers

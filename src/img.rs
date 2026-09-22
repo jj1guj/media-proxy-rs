@@ -293,7 +293,7 @@ impl RequestContext {
     }
     pub(crate) fn encode_img(&mut self) -> axum::response::Response {
         let max_decode_pixels = (self.config.max_size / 4).max(1);
-		if self.codec.is_err() && self.src_bytes.starts_with(&crate::mng::SIGNATURE) {
+        if self.codec.is_err() && crate::mng::is_mng_or_jng(&self.src_bytes) {
 			return self.encode_mng(max_decode_pixels);
         }
         if self.codec.is_err() && libvips_dep::is_vips(&self.src_bytes) {
