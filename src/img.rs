@@ -1287,7 +1287,7 @@ fn jpegxr_img(
 }
 
 pub fn image_to_frame(
-    image: &DynamicImage,
+    image: &'_ DynamicImage,
     timestamp: i32,
 ) -> Result<webp::AnimFrame<'_>, &'static str> {
     match image {
