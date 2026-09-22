@@ -120,6 +120,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `inflight_buffer_budget_bytes` | u64 | `268435456` (256MB) | 同時ダウンロードの合計バイト予算 |
 | `connect_timeout_ms` | u64 | `3000` | TCP接続タイムアウト(ms)。`timeout`より小さく設定すること |
 | `fetch_retry_delay_ms` | u64 | `500` | 接続失敗時のリトライ前待機(ms) |
+| `otlp_metrics_endpoint` | string? | `null` | OTLP/HTTP metrics送信先。`/v1/metrics`を含む完全なURL。`null`で無効 |
+| `otlp_export_interval_ms` | u64 | `5000` | OTLP metrics送信間隔(ms) |
+| `otlp_service_name` | string | `"media-proxy-rs"` | OpenTelemetryの`service.name` |
 | `allowed_networks` | string[]? | `null` | 許可するCIDR。ヘルスチェック等でloopbackを使う場合は`["127.0.0.1/32"]`を追加 |
 | `blocked_networks` | string[]? | `null` | 遮断するCIDR |
 | `blocked_hosts` | string[]? | `null` | 遮断するホスト名 |

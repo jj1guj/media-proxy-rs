@@ -10,6 +10,8 @@ use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_stream::StreamExt;
@@ -401,6 +403,16 @@ pub struct ConfigFile {
     /// TTL切れ後もこの期間はstaleとして保持し、フェッチ失敗時に返す。0で無効。
     #[serde(default = "default_cache_stale_max_secs")]
     cache_stale_max_secs: u64,
+    /// OTLP/HTTP metrics の送信先。未設定ならメトリクス送信を無効化する。
+    /// シグナルパスを含む完全なURLを指定する。
+    #[serde(default)]
+    otlp_metrics_endpoint: Option<String>,
+    /// OTLP metrics の送信間隔(ms、既定5000)。
+    #[serde(default = "default_otlp_export_interval_ms")]
+    otlp_export_interval_ms: u64,
+    /// OpenTelemetry resource の service.name。
+    #[serde(default = "default_otlp_service_name")]
+    otlp_service_name: String,
 }
 fn default_slow_log_ms() -> u64 {
     50
@@ -452,6 +464,12 @@ fn default_fetch_retry_delay_ms() -> u64 {
 }
 fn default_cache_stale_max_secs() -> u64 {
     86400
+}
+fn default_otlp_export_interval_ms() -> u64 {
+    5000
+}
+fn default_otlp_service_name() -> String {
+    env!("CARGO_PKG_NAME").to_owned()
 }
 #[derive(Debug, Deserialize)]
 pub struct RequestParams {
@@ -520,6 +538,41 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 }
+fn init_otlp_metrics(config: &ConfigFile) -> Result<Option<SdkMeterProvider>, String> {
+    let Some(endpoint) = config
+        .otlp_metrics_endpoint
+        .as_deref()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    if config.otlp_export_interval_ms == 0 {
+        return Err("otlp_export_interval_ms must be greater than 0".to_owned());
+    }
+    if config.otlp_service_name.trim().is_empty() {
+        return Err("otlp_service_name must not be empty".to_owned());
+    }
+
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|error| format!("failed to build OTLP metrics exporter: {error}"))?;
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_millis(config.otlp_export_interval_ms))
+        .build();
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(config.otlp_service_name.clone())
+        .build();
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
+
+    Ok(Some(provider))
+}
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -573,6 +626,9 @@ fn main() {
 			connect_timeout_ms:default_connect_timeout_ms(),
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 			cache_stale_max_secs:default_cache_stale_max_secs(),
+            otlp_metrics_endpoint:None,
+            otlp_export_interval_ms:default_otlp_export_interval_ms(),
+            otlp_service_name:default_otlp_service_name(),
         };
         let default_config = serde_json::to_string_pretty(&default_config).unwrap();
         std::fs::File::create(&config_path)
@@ -605,6 +661,22 @@ fn main() {
     }
     let dummy_png = Arc::new(include_bytes!("../asset/dummy.png").to_vec());
     let config = Arc::new(config);
+    let meter_provider = match init_otlp_metrics(&config) {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::error!(%error, "設定エラー(OTLP metrics)");
+            std::process::exit(1);
+        }
+    };
+    if let Some(provider) = &meter_provider {
+        opentelemetry::global::set_meter_provider(provider.clone());
+        tracing::info!(
+            endpoint = %config.otlp_metrics_endpoint.as_deref().unwrap_or_default(),
+            interval_ms = config.otlp_export_interval_ms,
+            service_name = %config.otlp_service_name,
+            "OTLP metrics exporter enabled"
+        );
+    }
     // allowed_networks / blocked_networks / blocked_hosts のパースは起動時に1回だけ行う。
     // 不正な設定値はここで明確なエラーメッセージ付きに失敗させる。
     let network_policy = match NetworkPolicy::from_config(&config) {
@@ -875,6 +947,11 @@ fn main() {
         .await
         .unwrap();
     });
+    if let Some(provider) = meter_provider {
+        if let Err(error) = provider.shutdown_with_timeout(Duration::from_secs(3)) {
+            tracing::warn!(%error, "OTLP metrics exporter shutdown failed");
+        }
+    }
 }
 /// タイムアウト由来のネガティブキャッシュの短いTTL。
 const DNS_TIMEOUT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
@@ -3066,6 +3143,9 @@ mod network_policy_tests {
             connect_timeout_ms: default_connect_timeout_ms(),
             fetch_retry_delay_ms: default_fetch_retry_delay_ms(),
             cache_stale_max_secs: default_cache_stale_max_secs(),
+            otlp_metrics_endpoint: None,
+            otlp_export_interval_ms: default_otlp_export_interval_ms(),
+            otlp_service_name: default_otlp_service_name(),
         }
     }
     #[test]
@@ -3077,6 +3157,41 @@ mod network_policy_tests {
             .remove("dns_cache_max_entries");
         let config: ConfigFile = serde_json::from_value(value).unwrap();
         assert_eq!(config.dns_cache_max_entries, 1024);
+    }
+    #[test]
+    fn otlp_metrics_defaults_for_existing_config() {
+        let mut value = serde_json::to_value(base_config()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("otlp_metrics_endpoint");
+        object.remove("otlp_export_interval_ms");
+        object.remove("otlp_service_name");
+        let config: ConfigFile = serde_json::from_value(value).unwrap();
+        assert_eq!(config.otlp_metrics_endpoint, None);
+        assert_eq!(config.otlp_export_interval_ms, 5000);
+        assert_eq!(config.otlp_service_name, "media-proxy-rs");
+    }
+    #[test]
+    fn unavailable_otlp_collector_does_not_block_initialization() {
+        let mut config = base_config();
+        config.otlp_metrics_endpoint = Some("http://127.0.0.1:9/v1/metrics".to_owned());
+        let start = Instant::now();
+        let provider = init_otlp_metrics(&config)
+            .expect("valid endpoint should initialize")
+            .expect("configured endpoint should enable exporter");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        provider
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .expect("empty provider should shut down");
+    }
+    #[test]
+    fn invalid_otlp_settings_are_rejected() {
+        let mut config = base_config();
+        config.otlp_metrics_endpoint = Some("http://127.0.0.1:4318/v1/metrics".to_owned());
+        config.otlp_export_interval_ms = 0;
+        assert!(init_otlp_metrics(&config).is_err());
+        config.otlp_export_interval_ms = 5000;
+        config.otlp_service_name.clear();
+        assert!(init_otlp_metrics(&config).is_err());
     }
     #[test]
     fn dns_retry_counters_reset_as_an_interval() {
