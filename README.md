@@ -206,6 +206,19 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_animation_output_bytes_total` | Counter | アニメーション出力バイト累積数       |
 | `media_proxy_uptime`                       | Gauge   | プロセス起動からの経過秒数           |
 
+### ドメイン構造化ログ
+
+リクエストサマリの `request` ログには、Lokiでドメイン別に集計するための以下のフィールドを出力します。これらはログフィールドとして保存し、Lokiのストリームラベルには設定しないでください。
+
+| フィールド            | 内容                                                           |
+| --------------------- | -------------------------------------------------------------- |
+| `caller_domain`       | `Origin`のドメイン。未指定時は`Referer`、両方なければ`unknown` |
+| `target_domain`       | `url`パラメータの取得対象ドメイン。不正URLは`invalid`          |
+| `final_target_domain` | リダイレクト後に最後に試行した取得対象ドメイン                 |
+| `error`               | HTTP 4xx／5xxまたはプロキシ処理エラーの場合は`true`            |
+
+ドメインは小文字へ正規化し、ポート、パス、クエリを含めません。IPv4／IPv6アドレスは生値を記録せず、`ip`として集約します。`Origin`と`Referer`は欠落・偽装可能な申告値であり、認証やアクセス制御には使用しません。
+
 ## media-proxy.jiskey.dev 向け運用設定
 
 `config.media-proxy.jiskey.dev.json` にIntel N95 (4コア, RAM 8GB) で稼働するmedia-proxy.jiskey.dev向けの運用設定を用意しています。主な変更点:

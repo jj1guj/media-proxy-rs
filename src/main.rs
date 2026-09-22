@@ -2008,10 +2008,44 @@ impl Drop for PhaseGuard {
         }
     }
 }
+
+fn domain_from_url(value: &str, fallback: &str) -> String {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .map(|host| {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            let address = host.trim_start_matches('[').trim_end_matches(']');
+            if address.parse::<IpAddr>().is_ok() {
+                "ip".to_owned()
+            } else {
+                host
+            }
+        })
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn caller_domain(headers: &HeaderMap) -> String {
+    let value = if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        origin.to_str().ok()
+    } else {
+        headers
+            .get(axum::http::header::REFERER)
+            .and_then(|referer| referer.to_str().ok())
+    };
+    value
+        .map(|value| domain_from_url(value, "unknown"))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// アクセスログ用に、消費(move)される前の RequestParams から必要な値だけ控えておく。
 struct ReqSummary {
     path: String,
     url: String,
+    caller_domain: String,
+    target_domain: String,
+    final_target_domain: String,
     request_uri_hash: String,
     cache_key_hash: String,
     is_static_path: bool,
@@ -2023,12 +2057,21 @@ struct ReqSummary {
     fallback: bool,
 }
 impl ReqSummary {
-    fn new(q: &RequestParams, uri: &axum::http::Uri, cache_key: &CacheKey) -> Self {
+    fn new(
+        q: &RequestParams,
+        uri: &axum::http::Uri,
+        headers: &HeaderMap,
+        cache_key: &CacheKey,
+    ) -> Self {
         let path = uri.path().to_owned();
+        let target_domain = domain_from_url(&q.url, "invalid");
         Self {
             is_static_path: path == "/static.webp",
             path,
             url: q.url.clone(),
+            caller_domain: caller_domain(headers),
+            final_target_domain: target_domain.clone(),
+            target_domain,
             request_uri_hash: cache::fingerprint_bytes(uri.to_string().as_bytes()),
             cache_key_hash: cache_key.fingerprint(),
             is_static: q.r#static.is_some(),
@@ -2102,9 +2145,10 @@ fn emit_summary(
         metrics.record_phases(t, s.is_static_path);
         metrics.record_outcome(t, status, has_error, error_detail);
     }
+    let is_error = status >= 400 || has_error;
     stats.requests.fetch_add(1, Ordering::Relaxed);
     stats.observe_request(t, s.is_static_path);
-    if status >= 400 || has_error {
+    if is_error {
         stats.errors.fetch_add(1, Ordering::Relaxed);
         if has_error {
             stats.inc_proxy_error(t, error_detail);
@@ -2169,27 +2213,31 @@ fn emit_summary(
         .unwrap_or_else(|| "-".to_owned());
     let fetch_err_str = t.fetch_err.as_deref().unwrap_or("-");
     let http_str = t.http_version.unwrap_or("-");
-    let fast = status < 400 && !has_error && !s.is_static_path && total_ms < cfg.slow_log_ms;
+    let fast = !is_error && !s.is_static_path && total_ms < cfg.slow_log_ms;
     if fast {
         tracing::debug!(
-            path=%s.path,url=%s.url,request_uri_hash=%s.request_uri_hash,
+            path=%s.path,url=%s.url,caller_domain=%s.caller_domain,
+            target_domain=%s.target_domain,final_target_domain=%s.final_target_domain,
+            request_uri_hash=%s.request_uri_hash,
             cache_key_hash=%s.cache_key_hash,params=%params,dns_hit=%dns_str,cache=%cache_str,
             passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
             http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
             check_ms,wait_ms,dl_wait_ms,cpu_wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
-            status=status as u64,error=has_error,anim=t.anim,
+            status=status as u64,error=is_error,anim=t.anim,
             anim_frames=t.anim_frames as u64,
             anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
             "request"
         );
     } else {
         tracing::info!(
-            path=%s.path,url=%s.url,request_uri_hash=%s.request_uri_hash,
+            path=%s.path,url=%s.url,caller_domain=%s.caller_domain,
+            target_domain=%s.target_domain,final_target_domain=%s.final_target_domain,
+            request_uri_hash=%s.request_uri_hash,
             cache_key_hash=%s.cache_key_hash,params=%params,dns_hit=%dns_str,cache=%cache_str,
             passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
             http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
             check_ms,wait_ms,dl_wait_ms,cpu_wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
-            status=status as u64,error=has_error,anim=t.anim,
+            status=status as u64,error=is_error,anim=t.anim,
             anim_frames=t.anim_frames as u64,
             anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
             "request"
@@ -2328,7 +2376,7 @@ async fn get_file_inner(
         badge: q.badge.is_some(),
         accept_avif: is_accept_avif,
     };
-    let summary = ReqSummary::new(&q, &original_uri, &cache_key);
+    let mut summary = ReqSummary::new(&q, &original_uri, &client_headers, &cache_key);
 
     // --- キャッシュヒット ---
     if !has_range {
@@ -2784,6 +2832,7 @@ async fn get_file_inner(
                 return Err((axum::http::StatusCode::BAD_REQUEST, headers, detail).into_response());
             }
         };
+        summary.final_target_domain = domain_from_url(next_url.as_str(), "invalid");
         const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
         let mut stream = resp.bytes_stream();
         let mut drained = 0;
@@ -3596,6 +3645,32 @@ mod metrics_tests {
     use super::*;
     use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
     use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+
+    #[test]
+    fn structured_log_domains_prefer_origin_and_avoid_ip_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::REFERER,
+            "https://referer.example/path?secret=1".parse().unwrap(),
+        );
+        assert_eq!(caller_domain(&headers), "referer.example");
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://Origin.Example:8443".parse().unwrap(),
+        );
+        assert_eq!(caller_domain(&headers), "origin.example");
+        assert_eq!(
+            domain_from_url("https://192.0.2.1/image.png", "invalid"),
+            "ip"
+        );
+        assert_eq!(
+            domain_from_url("https://[2001:db8::1]/image.png", "invalid"),
+            "ip"
+        );
+        assert_eq!(domain_from_url("not a url", "invalid"), "invalid");
+        assert_eq!(caller_domain(&HeaderMap::new()), "unknown");
+    }
 
     #[test]
     fn request_metrics_classify_upstream_status_and_keep_interval_maxima() {
