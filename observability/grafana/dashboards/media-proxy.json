@@ -23,97 +23,6 @@
   "cursorSync": "Crosshair",
   "editable": true,
   "elements": {
-    "panel-1": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "time() - max(timestamp(media_proxy_uptime_seconds))",
-                      "instant": true,
-                      "legendFormat": "Telemetry age",
-                      "range": false
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "",
-        "id": 1,
-        "links": [],
-        "title": "Telemetry freshness",
-        "vizConfig": {
-          "group": "stat",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "thresholds"
-                },
-                "noValue": "No data - check media-proxy / Alloy",
-                "thresholds": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "green",
-                      "value": 0
-                    },
-                    {
-                      "color": "orange",
-                      "value": 15
-                    },
-                    {
-                      "color": "red",
-                      "value": 30
-                    }
-                  ]
-                },
-                "unit": "s"
-              },
-              "overrides": []
-            },
-            "options": {
-              "colorMode": "background",
-              "graphMode": "none",
-              "justifyMode": "auto",
-              "orientation": "auto",
-              "percentChangeColorMode": "standard",
-              "reduceOptions": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "fields": "",
-                "values": false
-              },
-              "showPercentChange": false,
-              "textMode": "auto",
-              "wideLayout": true
-            }
-          },
-          "version": "12.2.0"
-        }
-      }
-    },
     "panel-10": {
       "kind": "Panel",
       "spec": {
@@ -2711,24 +2620,11 @@
                     "spec": {
                       "element": {
                         "kind": "ElementReference",
-                        "name": "panel-1"
-                      },
-                      "height": 4,
-                      "width": 5,
-                      "x": 0,
-                      "y": 0
-                    }
-                  },
-                  {
-                    "kind": "GridLayoutItem",
-                    "spec": {
-                      "element": {
-                        "kind": "ElementReference",
                         "name": "panel-3"
                       },
                       "height": 4,
-                      "width": 4,
-                      "x": 5,
+                      "width": 6,
+                      "x": 0,
                       "y": 0
                     }
                   },
@@ -2740,8 +2636,8 @@
                         "name": "panel-4"
                       },
                       "height": 4,
-                      "width": 5,
-                      "x": 9,
+                      "width": 6,
+                      "x": 6,
                       "y": 0
                     }
                   },
@@ -2753,8 +2649,8 @@
                         "name": "panel-5"
                       },
                       "height": 4,
-                      "width": 5,
-                      "x": 14,
+                      "width": 6,
+                      "x": 12,
                       "y": 0
                     }
                   },
@@ -2766,8 +2662,8 @@
                         "name": "panel-19"
                       },
                       "height": 4,
-                      "width": 5,
-                      "x": 19,
+                      "width": 6,
+                      "x": 18,
                       "y": 0
                     }
                   }
