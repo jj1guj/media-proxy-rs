@@ -65,6 +65,9 @@ struct OtlpMetrics {
     fetch_errors: Counter<u64>,
     fetch_retry_attempts: Counter<u64>,
     fetch_retry_successes: Counter<u64>,
+    dns_cache_requests: Counter<u64>,
+    dns_cache_entries: Gauge<u64>,
+    dns_cache_capacity_entries: Gauge<u64>,
     dns_retry_attempts: Counter<u64>,
     dns_retry_successes: Counter<u64>,
     stale_served: Counter<u64>,
@@ -143,6 +146,13 @@ impl OtlpMetrics {
             fetch_retry_successes: meter
                 .u64_counter("media_proxy_fetch_retry_successes_total")
                 .build(),
+            dns_cache_requests: meter
+                .u64_counter("media_proxy_dns_cache_requests_total")
+                .build(),
+            dns_cache_entries: meter.u64_gauge("media_proxy_dns_cache_entries").build(),
+            dns_cache_capacity_entries: meter
+                .u64_gauge("media_proxy_dns_cache_capacity_entries")
+                .build(),
             dns_retry_attempts: meter
                 .u64_counter("media_proxy_dns_retry_attempts_total")
                 .build(),
@@ -188,6 +198,10 @@ impl OtlpMetrics {
     }
 
     fn record_phases(&self, timings: &PhaseTimings, is_static_path: bool) {
+        if let Some(dns_hit) = timings.dns_hit {
+            self.dns_cache_requests
+                .add(1, &[KeyValue::new("result", dns_hit.to_string())]);
+        }
         if let Some(cache_result) = timings.cache_result {
             let attributes = [KeyValue::new("result", cache_result.to_string())];
             self.cache_requests.add(1, &attributes);
@@ -290,6 +304,10 @@ impl OtlpMetrics {
             .record(snapshot.buffer_used_bytes, &[]);
         self.buffer_limit_bytes
             .record(snapshot.buffer_limit_bytes, &[]);
+        self.dns_cache_entries
+            .record(snapshot.dns_cache_entries, &[]);
+        self.dns_cache_capacity_entries
+            .record(snapshot.dns_cache_capacity_entries, &[]);
         self.dns_retry_attempts.add(dns_retry_deltas.0, &[]);
         self.dns_retry_successes.add(dns_retry_deltas.1, &[]);
         self.uptime.record(snapshot.uptime_seconds, &[]);
@@ -323,6 +341,8 @@ struct ResourceSnapshot {
     cpu_limit: u64,
     buffer_used_bytes: u64,
     buffer_limit_bytes: u64,
+    dns_cache_entries: u64,
+    dns_cache_capacity_entries: u64,
     uptime_seconds: f64,
 }
 
@@ -372,6 +392,8 @@ fn record_resource_metrics(
             buffer_used_bytes: buffer_limit.saturating_sub(buffer_budget.available_permits())
                 as u64,
             buffer_limit_bytes: buffer_limit as u64,
+            dns_cache_entries: dns_cache.len() as u64,
+            dns_cache_capacity_entries: dns_cache.max_entries as u64,
             uptime_seconds: process_started.elapsed().as_secs_f64(),
         },
         eviction_deltas,
@@ -3781,6 +3803,7 @@ mod metrics_tests {
             .build();
         let stats = Arc::new(GlobalStats::with_otlp(Some(&provider)));
         let timings = PhaseTimings {
+            dns_hit: Some(DnsHitStatus::Hit),
             upstream_status: Some(503),
             cache_result: Some(CacheResult::Stale),
             passthrough: true,
@@ -3851,6 +3874,8 @@ mod metrics_tests {
                 cpu_limit: 2,
                 buffer_used_bytes: 2048,
                 buffer_limit_bytes: 8192,
+                dns_cache_entries: 8,
+                dns_cache_capacity_entries: 1024,
                 uptime_seconds: 1.0,
             },
             (1, 1),
@@ -3917,6 +3942,9 @@ mod metrics_tests {
             "media_proxy_fetch_errors_total",
             "media_proxy_fetch_retry_attempts_total",
             "media_proxy_fetch_retry_successes_total",
+            "media_proxy_dns_cache_requests_total",
+            "media_proxy_dns_cache_entries",
+            "media_proxy_dns_cache_capacity_entries",
             "media_proxy_dns_retry_attempts_total",
             "media_proxy_dns_retry_successes_total",
             "media_proxy_stale_served_total",

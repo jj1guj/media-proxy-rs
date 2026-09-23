@@ -198,6 +198,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_fetch_errors_total`           | Counter | fetchエラー分類別累積数              |
 | `media_proxy_fetch_retry_attempts_total`   | Counter | fetchリトライ累積数                  |
 | `media_proxy_fetch_retry_successes_total`  | Counter | fetchリトライ成功累積数              |
+| `media_proxy_dns_cache_requests_total`     | Counter | DNSキャッシュ結果別累積数            |
+| `media_proxy_dns_cache_entries`            | Gauge   | DNSキャッシュエントリ数              |
+| `media_proxy_dns_cache_capacity_entries`   | Gauge   | DNSキャッシュエントリ上限            |
 | `media_proxy_dns_retry_attempts_total`     | Counter | DNSリトライ累積数                    |
 | `media_proxy_dns_retry_successes_total`    | Counter | DNSリトライ成功累積数                |
 | `media_proxy_stale_served_total`           | Counter | staleキャッシュ提供累積数            |
@@ -206,6 +209,8 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_animation_input_bytes_total`  | Counter | アニメーション入力バイト累積数       |
 | `media_proxy_animation_output_bytes_total` | Counter | アニメーション出力バイト累積数       |
 | `media_proxy_uptime`                       | Gauge   | プロセス起動からの経過秒数           |
+
+DNSキャッシュ結果の属性 `result` は `hit`、`stale`、`miss` の3種類です。
 
 ### ドメイン構造化ログ
 
