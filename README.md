@@ -226,7 +226,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 既存Prometheusはremote-write receiverを有効にして起動してください。
 
 ```text
---web.enable-remote-write-receiver
+--enable-feature=remote-write-receiver
 ```
 
 既定ではAlloyから `http://host.docker.internal:9090/api/v1/write` へメトリクスを送り、Composeサービス名が `server` のコンテナログをLokiへ送ります。`config/config.json` のOTLP設定は、同じComposeネットワーク内のAlloyを指定します。

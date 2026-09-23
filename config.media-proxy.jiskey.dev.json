@@ -30,7 +30,7 @@
   "connect_timeout_ms": 3000,
   "fetch_retry_delay_ms": 500,
   "cache_stale_max_secs": 86400,
-  "otlp_metrics_endpoint": null,
+  "otlp_metrics_endpoint": "http://alloy:4318/v1/metrics",
   "otlp_export_interval_ms": 5000,
   "otlp_service_name": "media-proxy-rs"
 }
