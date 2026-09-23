@@ -133,8 +133,8 @@
                     "kind": "DataQuery",
                     "spec": {
                       "editorMode": "code",
-                      "expr": "max(media_proxy_downloads_active)",
-                      "legendFormat": "Downloads active",
+                      "expr": "100 * max(media_proxy_downloads_active) / clamp_min(max(media_proxy_downloads_limit), 1)",
+                      "legendFormat": "Download utilization",
                       "range": true
                     },
                     "version": "v0"
@@ -154,76 +154,13 @@
                     "kind": "DataQuery",
                     "spec": {
                       "editorMode": "code",
-                      "expr": "max(media_proxy_downloads_limit)",
-                      "legendFormat": "Downloads limit",
+                      "expr": "100 * max(media_proxy_cpu_active) / clamp_min(max(media_proxy_cpu_limit), 1)",
+                      "legendFormat": "CPU utilization",
                       "range": true
                     },
                     "version": "v0"
                   },
                   "refId": "B"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "max(media_proxy_cpu_active)",
-                      "legendFormat": "CPU active",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "C"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "max(media_proxy_cpu_limit)",
-                      "legendFormat": "CPU limit",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "D"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "max(media_proxy_singleflight_active)",
-                      "legendFormat": "Singleflight",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "E"
                 }
               }
             ],
@@ -234,7 +171,7 @@
         "description": "",
         "id": 10,
         "links": [],
-        "title": "Concurrency",
+        "title": "Concurrency utilization",
         "vizConfig": {
           "group": "timeseries",
           "kind": "VizConfig",
@@ -244,6 +181,8 @@
                 "color": {
                   "mode": "palette-classic"
                 },
+                "max": 100,
+                "min": 0,
                 "custom": {
                   "axisBorderShow": false,
                   "axisCenteredZero": false,
@@ -291,7 +230,7 @@
                     }
                   ]
                 },
-                "unit": "short"
+                "unit": "percent"
               },
               "overrides": []
             },
