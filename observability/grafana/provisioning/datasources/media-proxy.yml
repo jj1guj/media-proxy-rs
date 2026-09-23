@@ -1,0 +1,12 @@
+apiVersion: 1
+
+datasources:
+  - name: Media Proxy Prometheus
+    uid: media-proxy-prometheus
+    type: prometheus
+    access: proxy
+    url: ${PROMETHEUS_URL}
+    isDefault: false
+    editable: false
+    jsonData:
+      timeInterval: 5s

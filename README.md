@@ -154,6 +154,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | -------------------------------------- | ------------- | ---------------------------------------------- |
 | `media_proxy_requests_total`           | Counter       | 完了リクエスト累積数（最終ステータスクラス別） |
 | `media_proxy_errors_total`             | Counter       | エラー累積数（最終ステータスクラス別）         |
+| `media_proxy_domain_requests_total`    | Counter       | caller／targetドメイン・成否別リクエスト累積数 |
 | `media_proxy_requests_active`          | UpDownCounter | 処理中リクエスト数                             |
 | `media_proxy_upstream_responses_total` | Counter       | 上流レスポンス累積数（ステータスクラス別）     |
 | `media_proxy_request_duration`         | Histogram     | リクエスト合計レイテンシ                       |
@@ -208,7 +209,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 ### ドメイン構造化ログ
 
-リクエストサマリの `request` ログには、Lokiでドメイン別に集計するための以下のフィールドを出力します。これらはログフィールドとして保存し、Lokiのストリームラベルには設定しないでください。
+リクエストサマリの `request` ログには、ログ分析に利用できる以下のフィールドを出力します。
 
 | フィールド            | 内容                                                           |
 | --------------------- | -------------------------------------------------------------- |
@@ -219,9 +220,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 ドメインは小文字へ正規化し、ポート、パス、クエリを含めません。IPv4／IPv6アドレスは生値を記録せず、`ip`として集約します。`Origin`と`Referer`は欠落・偽装可能な申告値であり、認証やアクセス制御には使用しません。
 
-### AlloyとLoki
+### Alloy
 
-`compose.example.yml` は、media-proxy、Alloy、Lokiを同じComposeプロジェクトで起動する単一構成です。Prometheusは既存インスタンスを使用し、GrafanaはこのComposeでは起動しません。
+`compose.example.yml` は、media-proxyとAlloyを同じComposeプロジェクトで起動します。Prometheusは既存インスタンスを使用し、GrafanaはこのComposeでは起動しません。
 
 既存Prometheusはremote-write receiverを有効にして起動してください。
 
@@ -229,7 +230,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 --enable-feature=remote-write-receiver
 ```
 
-既定ではAlloyから `http://host.docker.internal:9090/api/v1/write` へメトリクスを送り、Composeサービス名が `server` のコンテナログをLokiへ送ります。`config/config.json` のOTLP設定は、同じComposeネットワーク内のAlloyを指定します。
+既定ではAlloyから `http://host.docker.internal:9090/api/v1/write` へメトリクスを送ります。`config/config.json` のOTLP設定は、同じComposeネットワーク内のAlloyを指定します。
 
 ```json
 {
@@ -238,24 +239,32 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 }
 ```
 
-既存設定の他の項目は変更せず、上記2項目だけを反映してください。環境に合わせてPrometheus接続先とサービス名の正規表現を指定して起動します。
+既存設定の他の項目は変更せず、上記2項目だけを反映してください。環境に合わせてPrometheus接続先を指定して起動します。
 
 ```fish
 set -lx PROMETHEUS_REMOTE_WRITE_URL http://host.docker.internal:9090/api/v1/write
-set -lx MEDIA_PROXY_SERVICE_REGEX server
 docker compose -f compose.example.yml up -d
 ```
 
-`server` とAlloyは同じComposeネットワークに参加するため、OTLPポート4318をホストへ公開する必要はありません。
+`server` とAlloyは同じComposeネットワークに参加するため、OTLPポート4318をホストへ公開する必要はありません。Grafanaダッシュボードは既存Prometheusだけをデータソースとして使用します。Alloyの管理画面だけが `127.0.0.1:12345` に公開され、OTLP受信ポートはComposeネットワーク内に限定されます。
 
-Lokiは既定で `127.0.0.1:3100` のみに公開されます。別サーバーのGrafanaから接続する場合は、VPNやプライベートネットワーク上の待受IPを指定してください。Lokiは認証を行わないため、インターネットへ直接公開しないでください。
+### Grafana provisioning
 
-```fish
-set -lx LOKI_BIND_ADDRESS 10.0.0.10
-docker compose -f compose.example.yml up -d
-```
+外部Grafanaに以下の環境変数を設定します。
 
-外部Grafanaでは、既存Prometheusと `http://<media-proxyサーバーのプライベートIP>:3100` のLokiをデータソースとして使用します。Alloyの管理画面だけが `127.0.0.1:12345` に公開され、OTLP受信ポートはComposeネットワーク内に限定されます。
+| 環境変数         | 内容                                 |
+| ---------------- | ------------------------------------ |
+| `PROMETHEUS_URL` | Grafanaから到達できるPrometheusのURL |
+
+次のディレクトリをGrafanaコンテナへread-onlyでマウントします。
+
+| リポジトリ内のパス                               | Grafanaコンテナ内のパス                   |
+| ------------------------------------------------ | ----------------------------------------- |
+| `observability/grafana/provisioning/datasources` | `/etc/grafana/provisioning/datasources`   |
+| `observability/grafana/provisioning/dashboards`  | `/etc/grafana/provisioning/dashboards`    |
+| `observability/grafana/dashboards`               | `/var/lib/grafana/dashboards/media-proxy` |
+
+provisioning後は `Media Proxy` フォルダーに `Media Proxy Overview` ダッシュボードが作成されます。既定範囲は直近15分、更新間隔は5秒です。RPS、エラー率、レイテンシ、キャッシュ、リソース使用量、上流障害、出力形式、Prometheusで集計したドメインTop 10を表示します。`Telemetry freshness` が30秒を超えるか `No data - check media-proxy / Alloy` になった場合は、media-proxyまたはAlloyからの送信停止を確認してください。
 
 ## media-proxy.jiskey.dev 向け運用設定
 

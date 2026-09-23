@@ -31,6 +31,7 @@ use cache::{CacheKey, CacheResult, ResponseCache};
 struct OtlpMetrics {
     requests: Counter<u64>,
     errors: Counter<u64>,
+    domain_requests: Counter<u64>,
     requests_active: UpDownCounter<i64>,
     upstream_responses: Counter<u64>,
     request_duration: Histogram<f64>,
@@ -79,6 +80,9 @@ impl OtlpMetrics {
         Self {
             requests: meter.u64_counter("media_proxy_requests_total").build(),
             errors: meter.u64_counter("media_proxy_errors_total").build(),
+            domain_requests: meter
+                .u64_counter("media_proxy_domain_requests_total")
+                .build(),
             requests_active: meter
                 .i64_up_down_counter("media_proxy_requests_active")
                 .build(),
@@ -170,6 +174,17 @@ impl OtlpMetrics {
         }
         self.request_duration
             .record(total_duration.as_secs_f64(), &[]);
+    }
+
+    fn record_domains(&self, caller_domain: &str, target_domain: &str, is_error: bool) {
+        self.domain_requests.add(
+            1,
+            &[
+                KeyValue::new("caller_domain", caller_domain.to_owned()),
+                KeyValue::new("target_domain", target_domain.to_owned()),
+                KeyValue::new("error", is_error),
+            ],
+        );
     }
 
     fn record_phases(&self, timings: &PhaseTimings, is_static_path: bool) {
@@ -2144,6 +2159,11 @@ fn emit_summary(
     if let Some(metrics) = &stats.otlp {
         metrics.record_phases(t, s.is_static_path);
         metrics.record_outcome(t, status, has_error, error_detail);
+        metrics.record_domains(
+            &s.caller_domain,
+            &s.target_domain,
+            status >= 400 || has_error,
+        );
     }
     let is_error = status >= 400 || has_error;
     stats.requests.fetch_add(1, Ordering::Relaxed);
@@ -3788,6 +3808,11 @@ mod metrics_tests {
             .as_ref()
             .unwrap()
             .record_completion(200, false, Duration::from_millis(20));
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_domains("caller.example", "target.example", false);
         assert_eq!(stats.swap_reset(), (1, 0, 0, 0));
         stats.requests.fetch_add(1, Ordering::Relaxed);
         stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -3858,6 +3883,7 @@ mod metrics_tests {
         for name in [
             "media_proxy_requests_total",
             "media_proxy_errors_total",
+            "media_proxy_domain_requests_total",
             "media_proxy_requests_active",
             "media_proxy_upstream_responses_total",
             "media_proxy_request_duration",
