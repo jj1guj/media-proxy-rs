@@ -2508,306 +2508,376 @@
     }
   },
   "layout": {
-    "kind": "GridLayout",
+    "kind": "RowsLayout",
     "spec": {
-      "items": [
+      "rows": [
         {
-          "kind": "GridLayoutItem",
+          "kind": "RowsLayoutRow",
           "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-1"
-            },
-            "height": 4,
-            "width": 5,
-            "x": 0,
-            "y": 0
+            "collapse": false,
+            "title": "Overview",
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-1"
+                      },
+                      "height": 4,
+                      "width": 5,
+                      "x": 0,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-3"
+                      },
+                      "height": 4,
+                      "width": 4,
+                      "x": 5,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-4"
+                      },
+                      "height": 4,
+                      "width": 5,
+                      "x": 9,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-5"
+                      },
+                      "height": 4,
+                      "width": 5,
+                      "x": 14,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-19"
+                      },
+                      "height": 4,
+                      "width": 5,
+                      "x": 19,
+                      "y": 0
+                    }
+                  }
+                ]
+              }
+            }
           }
         },
         {
-          "kind": "GridLayoutItem",
+          "kind": "RowsLayoutRow",
           "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-3"
-            },
-            "height": 4,
-            "width": 4,
-            "x": 5,
-            "y": 0
+            "collapse": false,
+            "title": "Traffic & latency",
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-2"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-6"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-7"
+                      },
+                      "height": 11,
+                      "width": 24,
+                      "x": 0,
+                      "y": 10
+                    }
+                  }
+                ]
+              }
+            }
           }
         },
         {
-          "kind": "GridLayoutItem",
+          "kind": "RowsLayoutRow",
           "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-4"
-            },
-            "height": 4,
-            "width": 5,
-            "x": 9,
-            "y": 0
+            "collapse": false,
+            "title": "Cache & resources",
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-8"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-9"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-10"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-11"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-12"
+                      },
+                      "height": 10,
+                      "width": 24,
+                      "x": 0,
+                      "y": 20
+                    }
+                  }
+                ]
+              }
+            }
           }
         },
         {
-          "kind": "GridLayoutItem",
+          "kind": "RowsLayoutRow",
           "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-5"
-            },
-            "height": 4,
-            "width": 5,
-            "x": 14,
-            "y": 0
+            "collapse": false,
+            "title": "Upstream & processing",
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-13"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-14"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-15"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-16"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-17"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 20
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-18"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 20
+                    }
+                  }
+                ]
+              }
+            }
           }
         },
         {
-          "kind": "GridLayoutItem",
+          "kind": "RowsLayoutRow",
           "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-19"
-            },
-            "height": 4,
-            "width": 5,
-            "x": 19,
-            "y": 0
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-2"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 4
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-6"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 4
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-7"
-            },
-            "height": 11,
-            "width": 24,
-            "x": 0,
-            "y": 14
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-8"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 25
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-9"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 25
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-10"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 35
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-11"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 35
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-12"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 45
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-13"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 45
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-14"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 55
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-15"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 55
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-16"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 65
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-17"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 65
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-18"
-            },
-            "height": 10,
-            "width": 24,
-            "x": 0,
-            "y": 75
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-20"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 85
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-21"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 85
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-23"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 0,
-            "y": 95
-          }
-        },
-        {
-          "kind": "GridLayoutItem",
-          "spec": {
-            "element": {
-              "kind": "ElementReference",
-              "name": "panel-24"
-            },
-            "height": 10,
-            "width": 12,
-            "x": 12,
-            "y": 95
+            "collapse": false,
+            "title": "Domains",
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-20"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-21"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-23"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-24"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 12,
+                      "y": 10
+                    }
+                  }
+                ]
+              }
+            }
           }
         }
       ]
