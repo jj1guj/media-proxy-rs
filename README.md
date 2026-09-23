@@ -219,6 +219,44 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 ドメインは小文字へ正規化し、ポート、パス、クエリを含めません。IPv4／IPv6アドレスは生値を記録せず、`ip`として集約します。`Origin`と`Referer`は欠落・偽装可能な申告値であり、認証やアクセス制御には使用しません。
 
+### AlloyとLoki
+
+`compose.example.yml` は、media-proxy、Alloy、Lokiを同じComposeプロジェクトで起動する単一構成です。Prometheusは既存インスタンスを使用し、GrafanaはこのComposeでは起動しません。
+
+既存Prometheusはremote-write receiverを有効にして起動してください。
+
+```text
+--web.enable-remote-write-receiver
+```
+
+既定ではAlloyから `http://host.docker.internal:9090/api/v1/write` へメトリクスを送り、Composeサービス名が `server` のコンテナログをLokiへ送ります。`config/config.json` のOTLP設定は、同じComposeネットワーク内のAlloyを指定します。
+
+```json
+{
+  "otlp_metrics_endpoint": "http://alloy:4318/v1/metrics",
+  "otlp_export_interval_ms": 5000
+}
+```
+
+既存設定の他の項目は変更せず、上記2項目だけを反映してください。環境に合わせてPrometheus接続先とサービス名の正規表現を指定して起動します。
+
+```fish
+set -lx PROMETHEUS_REMOTE_WRITE_URL http://host.docker.internal:9090/api/v1/write
+set -lx MEDIA_PROXY_SERVICE_REGEX server
+docker compose -f compose.example.yml up -d
+```
+
+`server` とAlloyは同じComposeネットワークに参加するため、OTLPポート4318をホストへ公開する必要はありません。
+
+Lokiは既定で `127.0.0.1:3100` のみに公開されます。別サーバーのGrafanaから接続する場合は、VPNやプライベートネットワーク上の待受IPを指定してください。Lokiは認証を行わないため、インターネットへ直接公開しないでください。
+
+```fish
+set -lx LOKI_BIND_ADDRESS 10.0.0.10
+docker compose -f compose.example.yml up -d
+```
+
+外部Grafanaでは、既存Prometheusと `http://<media-proxyサーバーのプライベートIP>:3100` のLokiをデータソースとして使用します。Alloyの管理画面だけが `127.0.0.1:12345` に公開され、OTLP受信ポートはComposeネットワーク内に限定されます。
+
 ## media-proxy.jiskey.dev 向け運用設定
 
 `config.media-proxy.jiskey.dev.json` にIntel N95 (4コア, RAM 8GB) で稼働するmedia-proxy.jiskey.dev向けの運用設定を用意しています。主な変更点:

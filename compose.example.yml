@@ -1,0 +1,54 @@
+services:
+  server:
+    build: .
+    restart: always
+    environment:
+      MEDIA_PROXY_CONFIG_PATH: /config/config.json
+    volumes:
+      - ./config/:/config:Z
+    ports:
+      - "80:12766"
+    depends_on:
+      - alloy
+
+  alloy:
+    image: grafana/alloy:v1.12.2
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    restart: unless-stopped
+    environment:
+      PROMETHEUS_REMOTE_WRITE_URL: ${PROMETHEUS_REMOTE_WRITE_URL:-http://host.docker.internal:9090/api/v1/write}
+      MEDIA_PROXY_SERVICE_REGEX: ${MEDIA_PROXY_SERVICE_REGEX:-server}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:12345:12345
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro,Z
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      - loki
+
+  loki:
+    image: grafana/loki:3.6.0
+    user: "0"
+    command:
+      - -config.file=/etc/loki/config.yml
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - ${LOKI_BIND_ADDRESS:-127.0.0.1}:3100:3100
+    volumes:
+      - ./observability/loki/config.yml:/etc/loki/config.yml:ro,Z
+      - loki-data:/loki
+
+volumes:
+  alloy-data:
+  loki-data:
