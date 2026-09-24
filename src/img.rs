@@ -126,6 +126,79 @@ fn png_apng_within_budget(data: &[u8], max_decode_pixels: u64) -> Result<(), Str
 	Ok(())
 }
 
+fn png_bit_depth(data: &[u8]) -> Option<u8> {
+	const SIG: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+	if data.len() < 25
+		|| !data.starts_with(&SIG)
+		|| u32::from_be_bytes(data[8..12].try_into().ok()?) != 13
+		|| &data[12..16] != b"IHDR"
+	{
+		return None;
+	}
+	Some(data[24])
+}
+
+fn normalize_16bit_apng(data: &[u8]) -> Result<Vec<u8>, String> {
+	let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+	decoder.set_transformations(png::Transformations::normalize_to_color8());
+	let mut reader = decoder.read_info().map_err(|error| error.to_string())?;
+	let animation = reader
+		.info()
+		.animation_control
+		.ok_or_else(|| "missing animation control".to_owned())?;
+	let separate_default_image = reader.info().frame_control.is_none();
+	let total_images = animation
+		.num_frames
+		.checked_add(u32::from(separate_default_image))
+		.ok_or_else(|| "frame count overflow".to_owned())?;
+	let (color_type, bit_depth) = reader.output_color_type();
+	if bit_depth != png::BitDepth::Eight {
+		return Err(format!("unexpected output bit depth: {bit_depth:?}"));
+	}
+	let width = reader.info().width;
+	let height = reader.info().height;
+	let mut frame_buf = vec![
+		0;
+		reader
+			.output_buffer_size()
+			.ok_or_else(|| "frame buffer size overflow".to_owned())?
+	];
+	let mut normalized = Vec::new();
+	{
+		let mut encoder = png::Encoder::new(&mut normalized, width, height);
+		encoder.set_color(color_type);
+		encoder.set_depth(png::BitDepth::Eight);
+		encoder
+			.set_animated(animation.num_frames, animation.num_plays)
+			.map_err(|error| error.to_string())?;
+		encoder
+			.set_sep_def_img(separate_default_image)
+			.map_err(|error| error.to_string())?;
+		let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+
+		for image_index in 0..total_images {
+			let output = reader
+				.next_frame(&mut frame_buf)
+				.map_err(|error| format!("frame {image_index}: {error}"))?;
+			if let Some(control) = reader.info().frame_control {
+				writer
+					.reset_frame_position()
+					.and_then(|_| writer.set_frame_dimension(control.width, control.height))
+					.and_then(|_| writer.set_frame_position(control.x_offset, control.y_offset))
+					.and_then(|_| writer.set_frame_delay(control.delay_num, control.delay_den))
+					.and_then(|_| writer.set_blend_op(control.blend_op))
+					.and_then(|_| writer.set_dispose_op(control.dispose_op))
+					.map_err(|error| format!("frame {image_index} control: {error}"))?;
+			}
+			writer
+				.write_image_data(&frame_buf[..output.buffer_size()])
+				.map_err(|error| format!("frame {image_index} encode: {error}"))?;
+		}
+		writer.finish().map_err(|error| error.to_string())?;
+	}
+	Ok(normalized)
+}
+
 /// GIF事前スキャン:画像ディスクリプタの矩形合計をデコーダが実際に確保する
 /// ピクセル数とみなし、論理画面を超える矩形は仕様上不正なので即座に拒否する
 /// (`gif`/`image` クレートは `check_frame_consistency` の既定が false で矩形を検証しない)。
@@ -580,13 +653,13 @@ impl RequestContext {
 				}
 			}
 			image::ImageFormat::Png => {
-				let a = match image::codecs::png::PngDecoder::new(std::io::Cursor::new(
+				let decoder = match image::codecs::png::PngDecoder::new(std::io::Cursor::new(
 					&self.src_bytes,
 				)) {
-					Ok(a) => a,
+					Ok(decoder) => decoder,
 					Err(_) => return self.encode_single(),
 				};
-				if !a.is_apng().unwrap_or(false) {
+				if !decoder.is_apng().unwrap_or(false) {
 					return self.encode_single();
 				}
 				if let Err(e) = png_apng_within_budget(&self.src_bytes, max_decode_pixels) {
@@ -597,7 +670,31 @@ impl RequestContext {
 					return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
 						.into_response();
 				}
-				match a.apng() {
+				let normalized = if png_bit_depth(&self.src_bytes) == Some(16) {
+					match normalize_16bit_apng(&self.src_bytes) {
+						Ok(data) => Some(data),
+						Err(error) => {
+							self.headers.append(
+								"X-Proxy-Error",
+								error_header_value(
+									format!("ApngNormalize {error}"),
+									"ApngNormalize",
+								),
+							);
+							return (axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
+								.into_response();
+						}
+					}
+				} else {
+					None
+				};
+				let decode_bytes = normalized.as_deref().unwrap_or(&self.src_bytes);
+				let decoder =
+					match image::codecs::png::PngDecoder::new(std::io::Cursor::new(decode_bytes)) {
+						Ok(decoder) => decoder,
+						Err(_) => return self.encode_single(),
+					};
+				match decoder.apng() {
 					Ok(frames) => {
 						let loop_count = 0; //TODO 現在ループ回数を取得するAPIが無いため無限ループ
 						self.encode_anim(frames.into_frames(), loop_count)
@@ -1401,10 +1498,65 @@ mod tests {
 		v.extend_from_slice(&png_chunk(b"IDAT", &[0, 1, 2, 3]));
 		v
 	}
+	fn build_16bit_apng(separate_default_image: bool) -> Vec<u8> {
+		let mut data = Vec::new();
+		{
+			let mut encoder = png::Encoder::new(&mut data, 2, 1);
+			encoder.set_color(png::ColorType::Rgba);
+			encoder.set_depth(png::BitDepth::Sixteen);
+			encoder.set_animated(2, 3).unwrap();
+			encoder.set_sep_def_img(separate_default_image).unwrap();
+			let mut writer = encoder.write_header().unwrap();
+			writer
+				.write_image_data(&[
+					0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff,
+				])
+				.unwrap();
+			if separate_default_image {
+				writer
+					.write_image_data(&[
+						0xff, 0xff, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff, 0, 0, 0xff, 0xff,
+					])
+					.unwrap();
+			}
+			writer.set_frame_dimension(1, 1).unwrap();
+			writer.set_frame_position(1, 0).unwrap();
+			writer.set_frame_delay(1, 10).unwrap();
+			writer.set_blend_op(png::BlendOp::Over).unwrap();
+			writer.set_dispose_op(png::DisposeOp::Background).unwrap();
+			writer
+				.write_image_data(&[0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff])
+				.unwrap();
+			writer.finish().unwrap();
+		}
+		data
+	}
 
 	#[test]
 	fn apng_non_png_data_is_ok() {
 		assert!(png_apng_within_budget(b"not a png at all", 1_000_000).is_ok());
+	}
+	#[test]
+	fn normalizes_16bit_apng_for_image_decoder() {
+		let normalized = normalize_16bit_apng(&build_16bit_apng(false)).unwrap();
+		assert_eq!(png_bit_depth(&normalized), Some(8));
+		let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(normalized))
+			.unwrap()
+			.apng()
+			.unwrap();
+		let frames = decoder.into_frames().collect_frames().unwrap();
+		assert_eq!(frames.len(), 2);
+		assert_eq!(frames[0].buffer().dimensions(), (2, 1));
+		assert_eq!(frames[1].buffer().dimensions(), (2, 1));
+	}
+	#[test]
+	fn normalizes_16bit_apng_with_separate_default_image() {
+		let normalized = normalize_16bit_apng(&build_16bit_apng(true)).unwrap();
+		let decoder = image::codecs::png::PngDecoder::new(std::io::Cursor::new(normalized))
+			.unwrap()
+			.apng()
+			.unwrap();
+		assert_eq!(decoder.into_frames().collect_frames().unwrap().len(), 2);
 	}
 	#[test]
 	fn apng_within_budget_is_ok() {

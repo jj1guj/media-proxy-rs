@@ -2172,6 +2172,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "png",
  "reqwest",
  "resvg",
  "rexif",
