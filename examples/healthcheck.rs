@@ -36,7 +36,11 @@ fn parse_target(s: &str) -> Option<Target> {
 			std::net::IpAddr::V4(ip) => ip.to_string(),
 			std::net::IpAddr::V6(ip) => format!("[{}]", ip),
 		};
-		return Some(Target::Tcp(format!("http://{}:{}/healthz", host, addr.port())));
+		return Some(Target::Tcp(format!(
+			"http://{}:{}/healthz",
+			host,
+			addr.port()
+		)));
 	}
 	if s.contains('/') || s.ends_with(".sock") {
 		return Some(Target::Unix(PathBuf::from(s)));
