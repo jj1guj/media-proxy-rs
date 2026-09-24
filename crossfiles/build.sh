@@ -8,9 +8,8 @@ export RUSTFLAGS="${RUSTFLAGS} -C target-feature=-crt-static -C link-self-contai
 libgcc_path="$("${CC}" -print-libgcc-file-name)"
 printf 'GROUP ( /vips-system-lib/libgcc_s.so.1 %s )\n' "${libgcc_path}" > /vips-system-lib/libgcc_s.so
 printf 'GROUP ( /vips-system-lib/libgcc_s.so.1 %s )\n' "${libgcc_path}" > /vips-system-lib/libunwind.a
-mkdir -p /musl/${MUSL_NAME}/dav1d /musl/${MUSL_NAME}/imagemagick /musl/${MUSL_NAME}/lcms2
+mkdir -p /musl/${MUSL_NAME}/dav1d /musl/${MUSL_NAME}/lcms2
 cp -r /dav1d/lib /musl/${MUSL_NAME}/dav1d/lib
-cp -r /imagemagick/lib /musl/${MUSL_NAME}/imagemagick/lib
 cp -r /lcms2/lib /musl/${MUSL_NAME}/lcms2/lib
 cargo build --release --target ${RUST_TARGET}
 cargo build --release --target ${RUST_TARGET} --example healthcheck

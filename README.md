@@ -79,9 +79,8 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 1. https://www.rust-lang.org/ja/tools/install に従ってrustをインストール
 2. `apt-get install -y build-essential meson ninja-build pkg-config nasm git python3 libglib2.0-dev`
 3. `git clone https://github.com/yojo-art/media-proxy-rs && cd media-proxy-rs`
-4. `bash crossfiles/build-imagemagick.sh`
-5. `bash crossfiles/build-libvips.sh`
-6. `cargo build --release`
+4. `bash crossfiles/build-libvips.sh`
+5. `cargo build --release`
 
 ## 対応する画像形式
 
@@ -104,7 +103,8 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 - JPEG 2000(openjp2)
 - JPEG XR(jxrlib)
 - HEIC
-- MNG
+- MNG (MNG-LC規格相当。埋め込まれたJNG(JPEG)メンバーもデコード)
+- JNG (単体 `.jng` ファイル、およびMNG埋め込みの両方に対応)
 - PDF
 - VIPSネイティブ形式
 

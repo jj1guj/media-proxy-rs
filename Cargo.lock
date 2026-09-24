@@ -1607,14 +1607,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "imagemagick_dep"
-version = "0.1.0"
-dependencies = [
- "image",
- "pkg-config",
-]
-
-[[package]]
 name = "imagesize"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2159,6 +2151,7 @@ dependencies = [
  "avif-decoder_dep",
  "axum",
  "chrono",
+ "dav1d",
  "fast_image_resize",
  "futures",
  "futures-util",
@@ -2166,7 +2159,6 @@ dependencies = [
  "headers",
  "heic-rs",
  "image",
- "imagemagick_dep",
  "indexmap",
  "ipnet",
  "iprange",
@@ -2175,6 +2167,7 @@ dependencies = [
  "jxl-oxide",
  "libvips_dep",
  "mailparse",
+ "mp4parse",
  "num_cpus",
  "opentelemetry",
  "opentelemetry-otlp",
