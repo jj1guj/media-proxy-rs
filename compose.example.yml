@@ -1,0 +1,33 @@
+services:
+  server:
+    build: .
+    restart: always
+    environment:
+      MEDIA_PROXY_CONFIG_PATH: /config/config.json
+    volumes:
+      - ./config/:/config:Z
+    ports:
+      - "80:12766"
+    depends_on:
+      - alloy
+
+  alloy:
+    image: grafana/alloy:v1.12.2
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    restart: unless-stopped
+    environment:
+      PROMETHEUS_REMOTE_WRITE_URL: ${PROMETHEUS_REMOTE_WRITE_URL:-http://host.docker.internal:9090/api/v1/write}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - 127.0.0.1:12345:12345
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro,Z
+      - alloy-data:/var/lib/alloy/data
+
+volumes:
+  alloy-data:

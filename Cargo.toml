@@ -59,6 +59,17 @@ turbojpeg = { version = "1.4", default-features = false, features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.33", default-features = false, features = [
+    "metrics",
+] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+    "metrics",
+] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
+    "metrics",
+    "http-proto",
+    "reqwest-blocking-client",
+] }
 indexmap = "2"
 sha2 = "0.10"
 heic-rs = { version = "0.1.1", default-features = false }
@@ -66,6 +77,12 @@ hayro = { version = "0.7.1", default-features = false }
 tower-http = { version = "0.7", features = ["catch-panic"] }
 libvips_dep = { path = "./libvips_dep" }
 imagemagick_dep = { path = "./imagemagick_dep" }
+
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
+    "metrics",
+    "testing",
+] }
 
 [profile.release]
 strip = true

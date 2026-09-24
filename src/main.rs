@@ -10,6 +10,10 @@ use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 use axum::{http::HeaderMap, response::IntoResponse, Router};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use iprange::IpRange;
+use opentelemetry::metrics::{Counter, Gauge, Histogram, MeterProvider as _, UpDownCounter};
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{Protocol, WithExportConfig};
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, Semaphore};
 use tokio_stream::StreamExt;
@@ -24,9 +28,437 @@ mod svg;
 
 use cache::{CacheKey, CacheResult, ResponseCache};
 
+struct OtlpMetrics {
+    requests: Counter<u64>,
+    errors: Counter<u64>,
+    domain_requests: Counter<u64>,
+    requests_active: UpDownCounter<i64>,
+    upstream_responses: Counter<u64>,
+    request_duration: Histogram<f64>,
+    url_check_duration: Histogram<f64>,
+    download_wait_duration: Histogram<f64>,
+    upstream_ttfb_duration: Histogram<f64>,
+    upstream_body_duration: Histogram<f64>,
+    cpu_wait_duration: Histogram<f64>,
+    decode_duration: Histogram<f64>,
+    encode_duration: Histogram<f64>,
+    cache_requests: Counter<u64>,
+    cache_entries: Gauge<u64>,
+    cache_bytes: Gauge<u64>,
+    cache_capacity_bytes: Gauge<u64>,
+    cache_capacity_evictions: Counter<u64>,
+    cache_expired_evictions: Counter<u64>,
+    singleflight_active: Gauge<u64>,
+    static_requests: Counter<u64>,
+    downloads_active: Gauge<u64>,
+    downloads_limit: Gauge<u64>,
+    cpu_active: Gauge<u64>,
+    cpu_limit: Gauge<u64>,
+    buffer_used_bytes: Gauge<u64>,
+    buffer_limit_bytes: Gauge<u64>,
+    buffer_wait_duration: Histogram<f64>,
+    outputs: Counter<u64>,
+    input_bytes: Counter<u64>,
+    output_bytes: Counter<u64>,
+    passthrough: Counter<u64>,
+    processing_errors: Counter<u64>,
+    fetch_errors: Counter<u64>,
+    fetch_retry_attempts: Counter<u64>,
+    fetch_retry_successes: Counter<u64>,
+    dns_cache_requests: Counter<u64>,
+    dns_cache_entries: Gauge<u64>,
+    dns_cache_capacity_entries: Gauge<u64>,
+    dns_retry_attempts: Counter<u64>,
+    dns_retry_successes: Counter<u64>,
+    stale_served: Counter<u64>,
+    animations: Counter<u64>,
+    animation_frames: Counter<u64>,
+    animation_input_bytes: Counter<u64>,
+    animation_output_bytes: Counter<u64>,
+    uptime: Gauge<f64>,
+}
+impl OtlpMetrics {
+    fn new(provider: &SdkMeterProvider) -> Self {
+        let meter = provider.meter(env!("CARGO_PKG_NAME"));
+        Self {
+            requests: meter.u64_counter("media_proxy_requests_total").build(),
+            errors: meter.u64_counter("media_proxy_errors_total").build(),
+            domain_requests: meter
+                .u64_counter("media_proxy_domain_requests_total")
+                .build(),
+            requests_active: meter
+                .i64_up_down_counter("media_proxy_requests_active")
+                .build(),
+            upstream_responses: meter
+                .u64_counter("media_proxy_upstream_responses_total")
+                .build(),
+            request_duration: duration_histogram(&meter, "media_proxy_request_duration"),
+            url_check_duration: duration_histogram(&meter, "media_proxy_url_check_duration"),
+            download_wait_duration: duration_histogram(
+                &meter,
+                "media_proxy_download_wait_duration",
+            ),
+            upstream_ttfb_duration: duration_histogram(
+                &meter,
+                "media_proxy_upstream_ttfb_duration",
+            ),
+            upstream_body_duration: duration_histogram(
+                &meter,
+                "media_proxy_upstream_body_duration",
+            ),
+            cpu_wait_duration: duration_histogram(&meter, "media_proxy_cpu_wait_duration"),
+            decode_duration: duration_histogram(&meter, "media_proxy_decode_duration"),
+            encode_duration: duration_histogram(&meter, "media_proxy_encode_duration"),
+            cache_requests: meter
+                .u64_counter("media_proxy_cache_requests_total")
+                .build(),
+            cache_entries: meter.u64_gauge("media_proxy_cache_entries").build(),
+            cache_bytes: meter.u64_gauge("media_proxy_cache_bytes").build(),
+            cache_capacity_bytes: meter.u64_gauge("media_proxy_cache_capacity_bytes").build(),
+            cache_capacity_evictions: meter
+                .u64_counter("media_proxy_cache_capacity_evictions_total")
+                .build(),
+            cache_expired_evictions: meter
+                .u64_counter("media_proxy_cache_expired_evictions_total")
+                .build(),
+            singleflight_active: meter.u64_gauge("media_proxy_singleflight_active").build(),
+            static_requests: meter
+                .u64_counter("media_proxy_static_requests_total")
+                .build(),
+            downloads_active: meter.u64_gauge("media_proxy_downloads_active").build(),
+            downloads_limit: meter.u64_gauge("media_proxy_downloads_limit").build(),
+            cpu_active: meter.u64_gauge("media_proxy_cpu_active").build(),
+            cpu_limit: meter.u64_gauge("media_proxy_cpu_limit").build(),
+            buffer_used_bytes: meter.u64_gauge("media_proxy_buffer_used_bytes").build(),
+            buffer_limit_bytes: meter.u64_gauge("media_proxy_buffer_limit_bytes").build(),
+            buffer_wait_duration: duration_histogram(&meter, "media_proxy_buffer_wait_duration"),
+            outputs: meter.u64_counter("media_proxy_outputs_total").build(),
+            input_bytes: meter.u64_counter("media_proxy_input_bytes_total").build(),
+            output_bytes: meter.u64_counter("media_proxy_output_bytes_total").build(),
+            passthrough: meter.u64_counter("media_proxy_passthrough_total").build(),
+            processing_errors: meter
+                .u64_counter("media_proxy_processing_errors_total")
+                .build(),
+            fetch_errors: meter.u64_counter("media_proxy_fetch_errors_total").build(),
+            fetch_retry_attempts: meter
+                .u64_counter("media_proxy_fetch_retry_attempts_total")
+                .build(),
+            fetch_retry_successes: meter
+                .u64_counter("media_proxy_fetch_retry_successes_total")
+                .build(),
+            dns_cache_requests: meter
+                .u64_counter("media_proxy_dns_cache_requests_total")
+                .build(),
+            dns_cache_entries: meter.u64_gauge("media_proxy_dns_cache_entries").build(),
+            dns_cache_capacity_entries: meter
+                .u64_gauge("media_proxy_dns_cache_capacity_entries")
+                .build(),
+            dns_retry_attempts: meter
+                .u64_counter("media_proxy_dns_retry_attempts_total")
+                .build(),
+            dns_retry_successes: meter
+                .u64_counter("media_proxy_dns_retry_successes_total")
+                .build(),
+            stale_served: meter.u64_counter("media_proxy_stale_served_total").build(),
+            animations: meter.u64_counter("media_proxy_animations_total").build(),
+            animation_frames: meter
+                .u64_counter("media_proxy_animation_frames_total")
+                .build(),
+            animation_input_bytes: meter
+                .u64_counter("media_proxy_animation_input_bytes_total")
+                .build(),
+            animation_output_bytes: meter
+                .u64_counter("media_proxy_animation_output_bytes_total")
+                .build(),
+            uptime: meter.f64_gauge("media_proxy_uptime").with_unit("s").build(),
+        }
+    }
+
+    fn record_completion(&self, status: u16, has_error: bool, total_duration: Duration) {
+        let final_status_class = KeyValue::new("status_class", status_class(status));
+        self.requests
+            .add(1, std::slice::from_ref(&final_status_class));
+        if status >= 400 || has_error {
+            self.errors
+                .add(1, std::slice::from_ref(&final_status_class));
+        }
+        self.request_duration
+            .record(total_duration.as_secs_f64(), &[]);
+    }
+
+    fn record_domains(&self, caller_domain: &str, target_domain: &str, is_error: bool) {
+        self.domain_requests.add(
+            1,
+            &[
+                KeyValue::new("caller_domain", caller_domain.to_owned()),
+                KeyValue::new("target_domain", target_domain.to_owned()),
+                KeyValue::new("error", is_error),
+            ],
+        );
+    }
+
+    fn record_phases(&self, timings: &PhaseTimings, is_static_path: bool) {
+        if let Some(dns_hit) = timings.dns_hit {
+            self.dns_cache_requests
+                .add(1, &[KeyValue::new("result", dns_hit.to_string())]);
+        }
+        if let Some(cache_result) = timings.cache_result {
+            let attributes = [KeyValue::new("result", cache_result.to_string())];
+            self.cache_requests.add(1, &attributes);
+            if is_static_path {
+                self.static_requests.add(1, &attributes);
+            }
+        }
+        if let Some(upstream_status) = timings.upstream_status {
+            self.upstream_responses.add(
+                1,
+                &[KeyValue::new("status_class", status_class(upstream_status))],
+            );
+        }
+        self.url_check_duration
+            .record(timings.check.as_secs_f64(), &[]);
+        self.download_wait_duration
+            .record(timings.dl_wait.as_secs_f64(), &[]);
+        self.upstream_ttfb_duration
+            .record(timings.ttfb.as_secs_f64(), &[]);
+        self.upstream_body_duration
+            .record(timings.body.as_secs_f64(), &[]);
+        self.cpu_wait_duration
+            .record(timings.cpu_wait.as_secs_f64(), &[]);
+        self.buffer_wait_duration
+            .record(timings.buffer_wait.as_secs_f64(), &[]);
+        self.decode_duration
+            .record(timings.decode.as_secs_f64(), &[]);
+        self.encode_duration
+            .record(timings.encode.as_secs_f64(), &[]);
+    }
+
+    fn record_outcome(
+        &self,
+        timings: &PhaseTimings,
+        status: u16,
+        has_error: bool,
+        error_detail: Option<&str>,
+    ) {
+        if timings.passthrough {
+            self.passthrough.add(1, &[]);
+        }
+        if matches!(timings.cache_result, Some(CacheResult::Stale)) {
+            self.stale_served.add(1, &[]);
+        }
+        if let Some(fetch_error) = timings.fetch_err.as_deref() {
+            self.fetch_errors.add(
+                1,
+                &[KeyValue::new("category", fetch_error_category(fetch_error))],
+            );
+        } else if status >= 400 || has_error {
+            if let Some(category) = proxy_error_category(error_detail) {
+                self.processing_errors
+                    .add(1, &[KeyValue::new("category", category)]);
+            }
+        }
+        if timings.fetch_retry_succeeded {
+            self.fetch_retry_successes.add(1, &[]);
+        }
+        if timings.anim {
+            self.animations.add(1, &[]);
+            self.animation_frames.add(timings.anim_frames as u64, &[]);
+            self.animation_input_bytes
+                .add(timings.anim_in_bytes as u64, &[]);
+            self.animation_output_bytes
+                .add(timings.anim_out_bytes as u64, &[]);
+        }
+    }
+
+    fn record_processed_output(
+        &self,
+        content_type: Option<&str>,
+        input_bytes: usize,
+        output_bytes: usize,
+    ) {
+        self.outputs
+            .add(1, &[KeyValue::new("format", output_format(content_type))]);
+        self.input_bytes.add(input_bytes as u64, &[]);
+        self.output_bytes.add(output_bytes as u64, &[]);
+    }
+
+    fn record_resource_snapshot(
+        &self,
+        snapshot: ResourceSnapshot,
+        eviction_deltas: (u64, u64),
+        dns_retry_deltas: (u64, u64),
+    ) {
+        self.cache_entries.record(snapshot.cache_entries, &[]);
+        self.cache_bytes.record(snapshot.cache_bytes, &[]);
+        self.cache_capacity_bytes
+            .record(snapshot.cache_capacity_bytes, &[]);
+        self.cache_capacity_evictions.add(eviction_deltas.0, &[]);
+        self.cache_expired_evictions.add(eviction_deltas.1, &[]);
+        self.singleflight_active
+            .record(snapshot.singleflight_active, &[]);
+        self.downloads_active.record(snapshot.downloads_active, &[]);
+        self.downloads_limit.record(snapshot.downloads_limit, &[]);
+        self.cpu_active.record(snapshot.cpu_active, &[]);
+        self.cpu_limit.record(snapshot.cpu_limit, &[]);
+        self.buffer_used_bytes
+            .record(snapshot.buffer_used_bytes, &[]);
+        self.buffer_limit_bytes
+            .record(snapshot.buffer_limit_bytes, &[]);
+        self.dns_cache_entries
+            .record(snapshot.dns_cache_entries, &[]);
+        self.dns_cache_capacity_entries
+            .record(snapshot.dns_cache_capacity_entries, &[]);
+        self.dns_retry_attempts.add(dns_retry_deltas.0, &[]);
+        self.dns_retry_successes.add(dns_retry_deltas.1, &[]);
+        self.uptime.record(snapshot.uptime_seconds, &[]);
+    }
+}
+
+fn output_format(content_type: Option<&str>) -> &'static str {
+    match content_type
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+    {
+        "image/jpeg" => "jpeg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/avif" => "avif",
+        _ => "other",
+    }
+}
+
+struct ResourceSnapshot {
+    cache_entries: u64,
+    cache_bytes: u64,
+    cache_capacity_bytes: u64,
+    singleflight_active: u64,
+    downloads_active: u64,
+    downloads_limit: u64,
+    cpu_active: u64,
+    cpu_limit: u64,
+    buffer_used_bytes: u64,
+    buffer_limit_bytes: u64,
+    dns_cache_entries: u64,
+    dns_cache_capacity_entries: u64,
+    uptime_seconds: f64,
+}
+
+fn record_resource_metrics(
+    metrics: &OtlpMetrics,
+    response_cache: &ResponseCache,
+    dns_cache: &DnsCache,
+    download_semaphore: &Semaphore,
+    download_limit: usize,
+    cpu_semaphore: &Semaphore,
+    cpu_limit: usize,
+    buffer_budget: &Semaphore,
+    buffer_limit: usize,
+    cache_capacity_bytes: u64,
+    process_started: Instant,
+    previous_evictions: &mut (u64, u64),
+    previous_dns_retries: &mut (u64, u64),
+) {
+    let (cache_entries, cache_bytes) = response_cache.stats();
+    let cumulative_evictions = response_cache.cumulative_evictions();
+    let eviction_deltas = (
+        cumulative_evictions.0.saturating_sub(previous_evictions.0),
+        cumulative_evictions.1.saturating_sub(previous_evictions.1),
+    );
+    *previous_evictions = cumulative_evictions;
+    let cumulative_dns_retries = dns_cache.cumulative_retries();
+    let dns_retry_deltas = (
+        cumulative_dns_retries
+            .0
+            .saturating_sub(previous_dns_retries.0),
+        cumulative_dns_retries
+            .1
+            .saturating_sub(previous_dns_retries.1),
+    );
+    *previous_dns_retries = cumulative_dns_retries;
+    metrics.record_resource_snapshot(
+        ResourceSnapshot {
+            cache_entries: cache_entries as u64,
+            cache_bytes: cache_bytes as u64,
+            cache_capacity_bytes,
+            singleflight_active: response_cache.inflight_count() as u64,
+            downloads_active: download_limit.saturating_sub(download_semaphore.available_permits())
+                as u64,
+            downloads_limit: download_limit as u64,
+            cpu_active: cpu_limit.saturating_sub(cpu_semaphore.available_permits()) as u64,
+            cpu_limit: cpu_limit as u64,
+            buffer_used_bytes: buffer_limit.saturating_sub(buffer_budget.available_permits())
+                as u64,
+            buffer_limit_bytes: buffer_limit as u64,
+            dns_cache_entries: dns_cache.len() as u64,
+            dns_cache_capacity_entries: dns_cache.max_entries as u64,
+            uptime_seconds: process_started.elapsed().as_secs_f64(),
+        },
+        eviction_deltas,
+        dns_retry_deltas,
+    );
+}
+
+fn duration_histogram(meter: &opentelemetry::metrics::Meter, name: &'static str) -> Histogram<f64> {
+    meter.f64_histogram(name).with_unit("s").build()
+}
+
+fn status_class(status: u16) -> &'static str {
+    match status {
+        100..=199 => "1xx",
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+fn proxy_error_category(detail: Option<&str>) -> Option<&'static str> {
+    let detail = detail.unwrap_or_default().to_ascii_lowercase();
+    if detail.starts_with("status:") {
+        None
+    } else if detail.contains("decode") || detail.contains("unknown format") {
+        Some("decode")
+    } else if detail.contains("encode") || detail.contains("cpusemaphore") {
+        Some("encode")
+    } else if detail.contains("length") || detail.contains("bufferbudget") {
+        Some("size")
+    } else if detail.contains("blocked")
+        || detail.contains("private")
+        || detail.contains("loopback")
+        || detail.starts_with("scheme:")
+        || detail == "no host"
+        || detail == "no port"
+        || detail.contains("relativeurlwithoutbase")
+        || detail.contains("emptyhost")
+        || detail.contains("invalidport")
+        || detail.contains("invalidipv")
+        || detail.contains("idna")
+    {
+        Some("policy")
+    } else {
+        Some("internal")
+    }
+}
+
+fn fetch_error_category(detail: &str) -> &'static str {
+    match detail.split(':').next().unwrap_or("other") {
+        "dns" => "dns",
+        "connect" => "connect",
+        "timeout" => "timeout",
+        "reset" => "reset",
+        "body" => "body",
+        _ => "other",
+    }
+}
+
 /// 定期統計ログ用のグローバルカウンタ。
 /// emit_summary でインクリメントし、60秒ごとにリセット＋ログ出力する。
 struct GlobalStats {
+    otlp: Option<Arc<OtlpMetrics>>,
     requests: AtomicU64,
     errors: AtomicU64,
     cache_hits: AtomicU64,
@@ -84,6 +516,7 @@ struct GlobalStats {
 impl GlobalStats {
     fn new() -> Self {
         Self {
+            otlp: None,
             requests: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
@@ -138,6 +571,11 @@ impl GlobalStats {
             static_cache_insertions: AtomicU64::new(0),
             static_output_bytes: AtomicU64::new(0),
         }
+    }
+    fn with_otlp(provider: Option<&SdkMeterProvider>) -> Self {
+        let mut stats = Self::new();
+        stats.otlp = provider.map(|provider| Arc::new(OtlpMetrics::new(provider)));
+        stats
     }
     /// カウンタをリセットし、リセット前の値を返す。
     fn swap_reset(&self) -> (u64, u64, u64, u64) {
@@ -260,25 +698,20 @@ impl GlobalStats {
         if timings.fetch_err.is_some() {
             return;
         }
-        let detail = detail.unwrap_or_default().to_ascii_lowercase();
-        let counter = if detail.starts_with("status:") {
-            &self.perr_upstream_status
-        } else if detail.contains("decode") || detail.contains("unknown format") {
-            &self.decode_error
-        } else if detail.contains("encode") || detail.contains("cpusemaphore") {
-            &self.encode_error
-        } else if detail.contains("length") || detail.contains("bufferbudget") {
-            &self.size_reject
-        } else if detail.contains("blocked")
-            || detail.contains("private")
-            || detail.contains("loopback")
-            || detail.starts_with("scheme:")
-            || detail == "no host"
-            || detail == "no port"
+        if detail
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .starts_with("status:")
         {
-            &self.policy_reject
-        } else {
-            &self.internal_error
+            self.perr_upstream_status.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let counter = match proxy_error_category(detail) {
+            Some("decode") => &self.decode_error,
+            Some("encode") => &self.encode_error,
+            Some("size") => &self.size_reject,
+            Some("policy") => &self.policy_reject,
+            _ => &self.internal_error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -288,6 +721,9 @@ impl GlobalStats {
         input_bytes: usize,
         output_bytes: usize,
     ) {
+        if let Some(metrics) = &self.otlp {
+            metrics.record_processed_output(content_type, input_bytes, output_bytes);
+        }
         let counter = match content_type
             .unwrap_or_default()
             .split(';')
@@ -401,6 +837,16 @@ pub struct ConfigFile {
     /// TTL切れ後もこの期間はstaleとして保持し、フェッチ失敗時に返す。0で無効。
     #[serde(default = "default_cache_stale_max_secs")]
     cache_stale_max_secs: u64,
+    /// OTLP/HTTP metrics の送信先。未設定ならメトリクス送信を無効化する。
+    /// シグナルパスを含む完全なURLを指定する。
+    #[serde(default)]
+    otlp_metrics_endpoint: Option<String>,
+    /// OTLP metrics の送信間隔(ms、既定5000)。
+    #[serde(default = "default_otlp_export_interval_ms")]
+    otlp_export_interval_ms: u64,
+    /// OpenTelemetry resource の service.name。
+    #[serde(default = "default_otlp_service_name")]
+    otlp_service_name: String,
 }
 fn default_slow_log_ms() -> u64 {
     50
@@ -452,6 +898,12 @@ fn default_fetch_retry_delay_ms() -> u64 {
 }
 fn default_cache_stale_max_secs() -> u64 {
     86400
+}
+fn default_otlp_export_interval_ms() -> u64 {
+    5000
+}
+fn default_otlp_service_name() -> String {
+    env!("CARGO_PKG_NAME").to_owned()
 }
 #[derive(Debug, Deserialize)]
 pub struct RequestParams {
@@ -520,7 +972,43 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 }
+fn init_otlp_metrics(config: &ConfigFile) -> Result<Option<SdkMeterProvider>, String> {
+    let Some(endpoint) = config
+        .otlp_metrics_endpoint
+        .as_deref()
+        .filter(|endpoint| !endpoint.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    if config.otlp_export_interval_ms == 0 {
+        return Err("otlp_export_interval_ms must be greater than 0".to_owned());
+    }
+    if config.otlp_service_name.trim().is_empty() {
+        return Err("otlp_service_name must not be empty".to_owned());
+    }
+
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_http()
+        .with_protocol(Protocol::HttpBinary)
+        .with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(3))
+        .build()
+        .map_err(|error| format!("failed to build OTLP metrics exporter: {error}"))?;
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_millis(config.otlp_export_interval_ms))
+        .build();
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(config.otlp_service_name.clone())
+        .build();
+    let provider = SdkMeterProvider::builder()
+        .with_resource(resource)
+        .with_reader(reader)
+        .build();
+
+    Ok(Some(provider))
+}
 fn main() {
+    let process_started = Instant::now();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -573,6 +1061,9 @@ fn main() {
 			connect_timeout_ms:default_connect_timeout_ms(),
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 			cache_stale_max_secs:default_cache_stale_max_secs(),
+            otlp_metrics_endpoint:None,
+            otlp_export_interval_ms:default_otlp_export_interval_ms(),
+            otlp_service_name:default_otlp_service_name(),
         };
         let default_config = serde_json::to_string_pretty(&default_config).unwrap();
         std::fs::File::create(&config_path)
@@ -605,6 +1096,22 @@ fn main() {
     }
     let dummy_png = Arc::new(include_bytes!("../asset/dummy.png").to_vec());
     let config = Arc::new(config);
+    let meter_provider = match init_otlp_metrics(&config) {
+        Ok(provider) => provider,
+        Err(error) => {
+            tracing::error!(%error, "設定エラー(OTLP metrics)");
+            std::process::exit(1);
+        }
+    };
+    if let Some(provider) = &meter_provider {
+        opentelemetry::global::set_meter_provider(provider.clone());
+        tracing::info!(
+            endpoint = %config.otlp_metrics_endpoint.as_deref().unwrap_or_default(),
+            interval_ms = config.otlp_export_interval_ms,
+            service_name = %config.otlp_service_name,
+            "OTLP metrics exporter enabled"
+        );
+    }
     // allowed_networks / blocked_networks / blocked_hosts のパースは起動時に1回だけ行う。
     // 不正な設定値はここで明確なエラーメッセージ付きに失敗させる。
     let network_policy = match NetworkPolicy::from_config(&config) {
@@ -687,7 +1194,7 @@ fn main() {
         ttl: Duration::from_secs(config.cache_ttl_secs),
         stale_max: Duration::from_secs(config.cache_stale_max_secs),
     }));
-    let global_stats = Arc::new(GlobalStats::new());
+    let global_stats = Arc::new(GlobalStats::with_otlp(meter_provider.as_ref()));
     let arg_tup = (
         client,
         config,
@@ -702,6 +1209,41 @@ fn main() {
         global_stats,
     );
     rt.block_on(async {
+        if let Some(metrics) = arg_tup.10.otlp.clone() {
+            let response_cache = arg_tup.7.clone();
+            let dns_cache = arg_tup.6.clone();
+            let download_semaphore = arg_tup.8.clone();
+            let cpu_semaphore = arg_tup.4.clone();
+            let buffer_budget = arg_tup.9.clone();
+            let download_limit = arg_tup.1.max_concurrent_downloads;
+            let cpu_limit = max_concurrent_encode;
+            let buffer_limit = arg_tup.1.inflight_buffer_budget_bytes as usize;
+            let cache_capacity_bytes = arg_tup.1.cache_max_bytes;
+            let interval_ms = arg_tup.1.otlp_export_interval_ms;
+            tokio::spawn(async move {
+                let mut previous_evictions = (0, 0);
+                let mut previous_dns_retries = (0, 0);
+                let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                loop {
+                    interval.tick().await;
+                    record_resource_metrics(
+                        &metrics,
+                        &response_cache,
+                        &dns_cache,
+                        &download_semaphore,
+                        download_limit,
+                        &cpu_semaphore,
+                        cpu_limit,
+                        &buffer_budget,
+                        buffer_limit,
+                        cache_capacity_bytes,
+                        process_started,
+                        &mut previous_evictions,
+                        &mut previous_dns_retries,
+                    );
+                }
+            });
+        }
         // --- 60秒ごとの定期統計ログ ---
         {
             let stats = arg_tup.10.clone();
@@ -875,6 +1417,11 @@ fn main() {
         .await
         .unwrap();
     });
+    if let Some(provider) = meter_provider {
+        if let Err(error) = provider.shutdown_with_timeout(Duration::from_secs(3)) {
+            tracing::warn!(%error, "OTLP metrics exporter shutdown failed");
+        }
+    }
 }
 /// タイムアウト由来のネガティブキャッシュの短いTTL。
 const DNS_TIMEOUT_NEGATIVE_TTL: Duration = Duration::from_secs(2);
@@ -1111,6 +1658,8 @@ pub struct DnsCache {
     lookup_semaphore: Semaphore,
     retry_attempts: AtomicU64,
     retry_saved: AtomicU64,
+    retry_attempts_total: AtomicU64,
+    retry_saved_total: AtomicU64,
 }
 
 struct DnsFlightGuard<'a> {
@@ -1162,6 +1711,8 @@ impl DnsCache {
             lookup_semaphore: Semaphore::new(128),
             retry_attempts: AtomicU64::new(0),
             retry_saved: AtomicU64::new(0),
+            retry_attempts_total: AtomicU64::new(0),
+            retry_saved_total: AtomicU64::new(0),
         }
     }
     /// エントリのTTLを返す。タイムアウト由来の失敗は短いTTL(2秒)、確定的失敗はnegative_ttl。
@@ -1190,6 +1741,12 @@ impl DnsCache {
         (
             self.retry_attempts.swap(0, Ordering::Relaxed),
             self.retry_saved.swap(0, Ordering::Relaxed),
+        )
+    }
+    pub(crate) fn cumulative_retries(&self) -> (u64, u64) {
+        (
+            self.retry_attempts_total.load(Ordering::Relaxed),
+            self.retry_saved_total.load(Ordering::Relaxed),
         )
     }
 
@@ -1253,9 +1810,11 @@ impl DnsCache {
             Err(e) if e.contains("timeout") => {
                 // タイムアウト→1回リトライ
                 self.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                self.retry_attempts_total.fetch_add(1, Ordering::Relaxed);
                 let retry = self.do_lookup(host, port).await;
                 if retry.is_ok() {
                     self.retry_saved.fetch_add(1, Ordering::Relaxed);
+                    self.retry_saved_total.fetch_add(1, Ordering::Relaxed);
                 }
                 retry
             }
@@ -1436,6 +1995,8 @@ struct PhaseTimings {
     dl_wait: Duration,
     /// CPUセマフォの待機時間。
     cpu_wait: Duration,
+    /// バッファ予算セマフォの待機時間。
+    buffer_wait: Duration,
     /// TTFB(送信開始〜レスポンスヘッダ受信)。
     ttfb: Duration,
     /// ボディ受信時間。
@@ -1454,6 +2015,8 @@ struct PhaseTimings {
     dns_v6: u16,
     /// 接続リトライが実行された。
     retried: bool,
+    /// 接続リトライ後の上流sendが成功した。
+    fetch_retry_succeeded: bool,
     /// レスポンスのHTTPバージョン(例: "1.1", "2")。
     http_version: Option<&'static str>,
     /// 上流が返したHTTPステータス。上流応答前の失敗ではNone。
@@ -1482,10 +2045,44 @@ impl Drop for PhaseGuard {
         }
     }
 }
+
+fn domain_from_url(value: &str, fallback: &str) -> String {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .map(|host| {
+            let host = host.trim_end_matches('.').to_ascii_lowercase();
+            let address = host.trim_start_matches('[').trim_end_matches(']');
+            if address.parse::<IpAddr>().is_ok() {
+                "ip".to_owned()
+            } else {
+                host
+            }
+        })
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn caller_domain(headers: &HeaderMap) -> String {
+    let value = if let Some(origin) = headers.get(axum::http::header::ORIGIN) {
+        origin.to_str().ok()
+    } else {
+        headers
+            .get(axum::http::header::REFERER)
+            .and_then(|referer| referer.to_str().ok())
+    };
+    value
+        .map(|value| domain_from_url(value, "unknown"))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 /// アクセスログ用に、消費(move)される前の RequestParams から必要な値だけ控えておく。
 struct ReqSummary {
     path: String,
     url: String,
+    caller_domain: String,
+    target_domain: String,
+    final_target_domain: String,
     request_uri_hash: String,
     cache_key_hash: String,
     is_static_path: bool,
@@ -1497,12 +2094,21 @@ struct ReqSummary {
     fallback: bool,
 }
 impl ReqSummary {
-    fn new(q: &RequestParams, uri: &axum::http::Uri, cache_key: &CacheKey) -> Self {
+    fn new(
+        q: &RequestParams,
+        uri: &axum::http::Uri,
+        headers: &HeaderMap,
+        cache_key: &CacheKey,
+    ) -> Self {
         let path = uri.path().to_owned();
+        let target_domain = domain_from_url(&q.url, "invalid");
         Self {
             is_static_path: path == "/static.webp",
             path,
             url: q.url.clone(),
+            caller_domain: caller_domain(headers),
+            final_target_domain: target_domain.clone(),
+            target_domain,
             request_uri_hash: cache::fingerprint_bytes(uri.to_string().as_bytes()),
             cache_key_hash: cache_key.fingerprint(),
             is_static: q.r#static.is_some(),
@@ -1572,9 +2178,19 @@ fn emit_summary(
     error_detail: Option<&str>,
     stats: &GlobalStats,
 ) {
+    if let Some(metrics) = &stats.otlp {
+        metrics.record_phases(t, s.is_static_path);
+        metrics.record_outcome(t, status, has_error, error_detail);
+        metrics.record_domains(
+            &s.caller_domain,
+            &s.target_domain,
+            status >= 400 || has_error,
+        );
+    }
+    let is_error = status >= 400 || has_error;
     stats.requests.fetch_add(1, Ordering::Relaxed);
     stats.observe_request(t, s.is_static_path);
-    if status >= 400 || has_error {
+    if is_error {
         stats.errors.fetch_add(1, Ordering::Relaxed);
         if has_error {
             stats.inc_proxy_error(t, error_detail);
@@ -1639,27 +2255,31 @@ fn emit_summary(
         .unwrap_or_else(|| "-".to_owned());
     let fetch_err_str = t.fetch_err.as_deref().unwrap_or("-");
     let http_str = t.http_version.unwrap_or("-");
-    let fast = status < 400 && !has_error && !s.is_static_path && total_ms < cfg.slow_log_ms;
+    let fast = !is_error && !s.is_static_path && total_ms < cfg.slow_log_ms;
     if fast {
         tracing::debug!(
-            path=%s.path,url=%s.url,request_uri_hash=%s.request_uri_hash,
+            path=%s.path,url=%s.url,caller_domain=%s.caller_domain,
+            target_domain=%s.target_domain,final_target_domain=%s.final_target_domain,
+            request_uri_hash=%s.request_uri_hash,
             cache_key_hash=%s.cache_key_hash,params=%params,dns_hit=%dns_str,cache=%cache_str,
             passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
             http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
             check_ms,wait_ms,dl_wait_ms,cpu_wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
-            status=status as u64,error=has_error,anim=t.anim,
+            status=status as u64,error=is_error,anim=t.anim,
             anim_frames=t.anim_frames as u64,
             anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
             "request"
         );
     } else {
         tracing::info!(
-            path=%s.path,url=%s.url,request_uri_hash=%s.request_uri_hash,
+            path=%s.path,url=%s.url,caller_domain=%s.caller_domain,
+            target_domain=%s.target_domain,final_target_domain=%s.final_target_domain,
+            request_uri_hash=%s.request_uri_hash,
             cache_key_hash=%s.cache_key_hash,params=%params,dns_hit=%dns_str,cache=%cache_str,
             passthrough=t.passthrough,fetch_err=%fetch_err_str,retried=t.retried,
             http=%http_str,dns_v4=t.dns_v4,dns_v6=t.dns_v6,
             check_ms,wait_ms,dl_wait_ms,cpu_wait_ms,ttfb_ms,body_ms,decode_ms,encode_ms,
-            status=status as u64,error=has_error,anim=t.anim,
+            status=status as u64,error=is_error,anim=t.anim,
             anim_frames=t.anim_frames as u64,
             anim_in=t.anim_in_bytes as u64,anim_out=t.anim_out_bytes as u64,
             "request"
@@ -1706,7 +2326,52 @@ fn build_stale_response(
     }
     (axum::http::StatusCode::OK, headers, cached.body.clone()).into_response()
 }
+struct ActiveRequestGuard {
+    metrics: Arc<OtlpMetrics>,
+    started: Instant,
+}
+impl ActiveRequestGuard {
+    fn new(metrics: Arc<OtlpMetrics>) -> Self {
+        metrics.requests_active.add(1, &[]);
+        Self {
+            metrics,
+            started: Instant::now(),
+        }
+    }
+    fn record_completion(&self, status: u16, has_error: bool) {
+        self.metrics
+            .record_completion(status, has_error, self.started.elapsed());
+    }
+}
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.metrics.requests_active.add(-1, &[]);
+    }
+}
+
 async fn get_file(
+    path: Option<axum::extract::Path<String>>,
+    original_uri: axum::extract::OriginalUri,
+    client_headers: axum::http::HeaderMap,
+    state: AppState,
+    query: axum::extract::Query<RequestParams>,
+) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+    let active_request = state.10.otlp.clone().map(ActiveRequestGuard::new);
+    let result = get_file_inner(path, original_uri, client_headers, state, query).await;
+    if let Some(active_request) = &active_request {
+        let (status, has_error) = match &result {
+            Ok((status, headers, _)) => (status.as_u16(), headers.contains_key("X-Proxy-Error")),
+            Err(response) => (
+                response.status().as_u16(),
+                response.headers().contains_key("X-Proxy-Error"),
+            ),
+        };
+        active_request.record_completion(status, has_error);
+    }
+    result
+}
+
+async fn get_file_inner(
     _path: Option<axum::extract::Path<String>>,
     axum::extract::OriginalUri(original_uri): axum::extract::OriginalUri,
     client_headers: axum::http::HeaderMap,
@@ -1753,7 +2418,7 @@ async fn get_file(
         badge: q.badge.is_some(),
         accept_avif: is_accept_avif,
     };
-    let summary = ReqSummary::new(&q, &original_uri, &cache_key);
+    let mut summary = ReqSummary::new(&q, &original_uri, &client_headers, &cache_key);
 
     // --- キャッシュヒット ---
     if !has_range {
@@ -1917,7 +2582,7 @@ async fn get_file(
             if let Ok(mut t) = timings.lock() {
                 t.check = check_start.elapsed();
                 // DNS解決失敗の場合のみ fetch_err に記録(ポリシー拒否は除外)
-                if !s.contains("Blocked") && !s.contains("Private") && !s.contains("Loopback") {
+                if proxy_error_category(Some(&s)) != Some("policy") {
                     t.fetch_err = Some(format!("dns:{}", s.chars().take(60).collect::<String>()));
                 }
             }
@@ -1976,8 +2641,24 @@ async fn get_file(
     {
         Ok(Ok(permit)) => permit,
         _ => {
+            if let Ok(mut t) = timings.lock() {
+                let elapsed = wait_start.elapsed();
+                t.wait += elapsed;
+                t.dl_wait += elapsed;
+            }
             let mut h = HeaderMap::new();
             h.append("X-Proxy-Error", "DownloadSemaphoreError".parse().unwrap());
+            if let Ok(t) = timings.lock() {
+                emit_summary(
+                    &config,
+                    &summary,
+                    &t,
+                    503,
+                    true,
+                    Some("DownloadSemaphoreError"),
+                    &global_stats,
+                );
+            }
             return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
         }
     };
@@ -2033,12 +2714,16 @@ async fn get_file(
                     .saturating_sub(send_start.elapsed().as_millis() as u64);
                 if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
                     global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+                    if let Some(metrics) = &global_stats.otlp {
+                        metrics.fetch_retry_attempts.add(1, &[]);
+                    }
                     tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
                     match build_req().send().await {
                         Ok(resp) => {
                             if let Ok(mut t) = timings.lock() {
                                 t.ttfb = send_start.elapsed();
                                 t.retried = true;
+                                t.fetch_retry_succeeded = true;
                             }
                             resp
                         }
@@ -2151,6 +2836,17 @@ async fn get_file(
         }
         if redirects >= MAX_REDIRECTS {
             headers.append("X-Proxy-Error", "TooManyRedirects".parse().unwrap());
+            if let Ok(t) = timings.lock() {
+                emit_summary(
+                    &config,
+                    &summary,
+                    &t,
+                    502,
+                    true,
+                    Some("TooManyRedirects"),
+                    &global_stats,
+                );
+            }
             return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
         }
         let Some(location) = resp
@@ -2160,14 +2856,25 @@ async fn get_file(
         else {
             break resp;
         };
-        let next_url = current_url.join(location).map_err(|e| {
-            (
-                axum::http::StatusCode::BAD_REQUEST,
-                headers.clone(),
-                format!("{:?}", e),
-            )
-                .into_response()
-        })?;
+        let next_url = match current_url.join(location) {
+            Ok(url) => url,
+            Err(error) => {
+                let detail = format!("RedirectUrl:{error:?}");
+                if let Ok(t) = timings.lock() {
+                    emit_summary(
+                        &config,
+                        &summary,
+                        &t,
+                        400,
+                        true,
+                        Some(&detail),
+                        &global_stats,
+                    );
+                }
+                return Err((axum::http::StatusCode::BAD_REQUEST, headers, detail).into_response());
+            }
+        };
+        summary.final_target_domain = domain_from_url(next_url.as_str(), "invalid");
         const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
         let mut stream = resp.bytes_stream();
         let mut drained = 0;
@@ -2188,8 +2895,18 @@ async fn get_file(
                 }
             }
             Err(s) => {
+                if let Ok(mut t) = timings.lock() {
+                    t.check += check_start.elapsed();
+                    if proxy_error_category(Some(&s)) != Some("policy") {
+                        t.fetch_err =
+                            Some(format!("dns:{}", s.chars().take(60).collect::<String>()));
+                    }
+                }
                 if let Ok(value) = s.parse() {
                     headers.append("X-Proxy-Error", value);
+                }
+                if let Ok(t) = timings.lock() {
+                    emit_summary(&config, &summary, &t, 400, true, Some(&s), &global_stats);
                 }
                 return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
             }
@@ -2539,6 +3256,11 @@ impl RequestContext {
             {
                 Ok(Ok(permit)) => permit,
                 _ => {
+                    if let Ok(mut t) = self.timings.lock() {
+                        let elapsed = wait_start.elapsed();
+                        t.wait += elapsed;
+                        t.buffer_wait += elapsed;
+                    }
                     let mut h = self.headers.clone();
                     h.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
                     return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
@@ -2548,7 +3270,9 @@ impl RequestContext {
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
             if let Ok(mut t) = self.timings.lock() {
-                t.wait += wait_start.elapsed();
+                let elapsed = wait_start.elapsed();
+                t.wait += elapsed;
+                t.buffer_wait += elapsed;
             }
             self.load_all(resp).await?;
             drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
@@ -2560,6 +3284,11 @@ impl RequestContext {
             {
                 Ok(Ok(permit)) => permit,
                 _ => {
+                    if let Ok(mut t) = self.timings.lock() {
+                        let elapsed = wait_start.elapsed();
+                        t.wait += elapsed;
+                        t.cpu_wait += elapsed;
+                    }
                     let mut h = self.headers.clone();
                     h.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
                     return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
@@ -2637,6 +3366,11 @@ impl RequestContext {
             {
                 Ok(Ok(permit)) => permit,
                 _ => {
+                    if let Ok(mut t) = self.timings.lock() {
+                        let elapsed = wait_start.elapsed();
+                        t.wait += elapsed;
+                        t.buffer_wait += elapsed;
+                    }
                     header.append("X-Proxy-Error", "BufferBudgetError".parse().unwrap());
                     return Err(
                         (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
@@ -2648,7 +3382,9 @@ impl RequestContext {
                 self.config.inflight_buffer_budget_bytes as usize - budget_sem.available_permits(),
             );
             if let Ok(mut t) = self.timings.lock() {
-                t.wait += wait_start.elapsed();
+                let elapsed = wait_start.elapsed();
+                t.wait += elapsed;
+                t.buffer_wait += elapsed;
             }
             self.load_all(resp).await?;
             drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
@@ -2692,8 +3428,8 @@ impl RequestContext {
                                     _ => ".bin",
                                 };
                                 Self::disposition_ext(&mut self.headers, ext);
+                                self.cache_response(200, &self.headers, &self.src_bytes);
                                 let body = std::mem::take(&mut self.src_bytes);
-                                self.cache_response(200, &self.headers, &body);
                                 return Err((
                                     axum::http::StatusCode::OK,
                                     self.headers.clone(),
@@ -2714,6 +3450,11 @@ impl RequestContext {
                 {
                     Ok(Ok(permit)) => permit,
                     _ => {
+                        if let Ok(mut t) = self.timings.lock() {
+                            let elapsed = wait_start.elapsed();
+                            t.wait += elapsed;
+                            t.cpu_wait += elapsed;
+                        }
                         header.append("X-Proxy-Error", "CpuSemaphoreError".parse().unwrap());
                         return Err(
                             (axum::http::StatusCode::SERVICE_UNAVAILABLE, header.clone())
@@ -2944,6 +3685,34 @@ impl futures::stream::Stream for PreDataStream {
 #[cfg(test)]
 mod metrics_tests {
     use super::*;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+
+    #[test]
+    fn structured_log_domains_prefer_origin_and_avoid_ip_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::REFERER,
+            "https://referer.example/path?secret=1".parse().unwrap(),
+        );
+        assert_eq!(caller_domain(&headers), "referer.example");
+
+        headers.insert(
+            axum::http::header::ORIGIN,
+            "https://Origin.Example:8443".parse().unwrap(),
+        );
+        assert_eq!(caller_domain(&headers), "origin.example");
+        assert_eq!(
+            domain_from_url("https://192.0.2.1/image.png", "invalid"),
+            "ip"
+        );
+        assert_eq!(
+            domain_from_url("https://[2001:db8::1]/image.png", "invalid"),
+            "ip"
+        );
+        assert_eq!(domain_from_url("not a url", "invalid"), "invalid");
+        assert_eq!(caller_domain(&HeaderMap::new()), "unknown");
+    }
 
     #[test]
     fn request_metrics_classify_upstream_status_and_keep_interval_maxima() {
@@ -3025,6 +3794,217 @@ mod metrics_tests {
         assert_eq!(stats.static_cache_insertions.load(Ordering::Relaxed), 1);
         assert_eq!(stats.static_output_bytes.load(Ordering::Relaxed), 1234);
     }
+
+    #[test]
+    fn otlp_metrics_are_cumulative_across_periodic_stats_reset() {
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let stats = Arc::new(GlobalStats::with_otlp(Some(&provider)));
+        let timings = PhaseTimings {
+            dns_hit: Some(DnsHitStatus::Hit),
+            upstream_status: Some(503),
+            cache_result: Some(CacheResult::Stale),
+            passthrough: true,
+            check: Duration::from_millis(1),
+            dl_wait: Duration::from_millis(2),
+            ttfb: Duration::from_millis(3),
+            body: Duration::from_millis(4),
+            cpu_wait: Duration::from_millis(5),
+            buffer_wait: Duration::from_millis(5),
+            decode: Duration::from_millis(6),
+            encode: Duration::from_millis(7),
+            anim: true,
+            anim_frames: 3,
+            anim_in_bytes: 1000,
+            anim_out_bytes: 400,
+            fetch_err: Some("timeout".to_owned()),
+            retried: true,
+            fetch_retry_succeeded: true,
+            ..Default::default()
+        };
+
+        stats.requests.fetch_add(1, Ordering::Relaxed);
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_completion(200, false, Duration::from_millis(20));
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_domains("caller.example", "target.example", false);
+        assert_eq!(stats.swap_reset(), (1, 0, 0, 0));
+        stats.requests.fetch_add(1, Ordering::Relaxed);
+        stats.errors.fetch_add(1, Ordering::Relaxed);
+        stats.otlp.as_ref().unwrap().record_phases(&timings, true);
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_outcome(&timings, 200, false, None);
+        stats.otlp.as_ref().unwrap().record_outcome(
+            &PhaseTimings::default(),
+            502,
+            true,
+            Some("DecodeError_invalid"),
+        );
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_processed_output(Some("image/webp"), 1000, 400);
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .fetch_retry_attempts
+            .add(1, &[]);
+        stats.otlp.as_ref().unwrap().record_resource_snapshot(
+            ResourceSnapshot {
+                cache_entries: 2,
+                cache_bytes: 1024,
+                cache_capacity_bytes: 4096,
+                singleflight_active: 1,
+                downloads_active: 2,
+                downloads_limit: 4,
+                cpu_active: 1,
+                cpu_limit: 2,
+                buffer_used_bytes: 2048,
+                buffer_limit_bytes: 8192,
+                dns_cache_entries: 8,
+                dns_cache_capacity_entries: 1024,
+                uptime_seconds: 1.0,
+            },
+            (1, 1),
+            (1, 1),
+        );
+        stats
+            .otlp
+            .as_ref()
+            .unwrap()
+            .record_completion(503, true, Duration::from_millis(30));
+        {
+            let _active = ActiveRequestGuard::new(stats.otlp.as_ref().unwrap().clone());
+        }
+        assert_eq!(stats.swap_reset(), (1, 1, 0, 0));
+
+        provider.force_flush().expect("metrics should flush");
+        let exports = exporter
+            .get_finished_metrics()
+            .expect("metrics should be exported");
+        let metrics = exports
+            .last()
+            .expect("one metrics export")
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .collect::<Vec<_>>();
+        let names = metrics
+            .iter()
+            .map(|metric| metric.name())
+            .collect::<HashSet<_>>();
+        for name in [
+            "media_proxy_requests_total",
+            "media_proxy_errors_total",
+            "media_proxy_domain_requests_total",
+            "media_proxy_requests_active",
+            "media_proxy_upstream_responses_total",
+            "media_proxy_request_duration",
+            "media_proxy_url_check_duration",
+            "media_proxy_download_wait_duration",
+            "media_proxy_upstream_ttfb_duration",
+            "media_proxy_upstream_body_duration",
+            "media_proxy_cpu_wait_duration",
+            "media_proxy_decode_duration",
+            "media_proxy_encode_duration",
+            "media_proxy_cache_requests_total",
+            "media_proxy_cache_entries",
+            "media_proxy_cache_bytes",
+            "media_proxy_cache_capacity_bytes",
+            "media_proxy_cache_capacity_evictions_total",
+            "media_proxy_cache_expired_evictions_total",
+            "media_proxy_singleflight_active",
+            "media_proxy_static_requests_total",
+            "media_proxy_downloads_active",
+            "media_proxy_downloads_limit",
+            "media_proxy_cpu_active",
+            "media_proxy_cpu_limit",
+            "media_proxy_buffer_used_bytes",
+            "media_proxy_buffer_limit_bytes",
+            "media_proxy_buffer_wait_duration",
+            "media_proxy_outputs_total",
+            "media_proxy_input_bytes_total",
+            "media_proxy_output_bytes_total",
+            "media_proxy_passthrough_total",
+            "media_proxy_processing_errors_total",
+            "media_proxy_fetch_errors_total",
+            "media_proxy_fetch_retry_attempts_total",
+            "media_proxy_fetch_retry_successes_total",
+            "media_proxy_dns_cache_requests_total",
+            "media_proxy_dns_cache_entries",
+            "media_proxy_dns_cache_capacity_entries",
+            "media_proxy_dns_retry_attempts_total",
+            "media_proxy_dns_retry_successes_total",
+            "media_proxy_stale_served_total",
+            "media_proxy_animations_total",
+            "media_proxy_animation_frames_total",
+            "media_proxy_animation_input_bytes_total",
+            "media_proxy_animation_output_bytes_total",
+            "media_proxy_uptime",
+        ] {
+            assert!(names.contains(name), "missing metric: {name}");
+        }
+        let requests = metrics
+            .iter()
+            .find(|metric| metric.name() == "media_proxy_requests_total")
+            .expect("request counter");
+        let AggregatedMetrics::U64(MetricData::Sum(requests)) = requests.data() else {
+            panic!("request counter should export as a u64 sum");
+        };
+        assert_eq!(
+            requests
+                .data_points()
+                .map(|data_point| data_point.value())
+                .sum::<u64>(),
+            2
+        );
+        drop(stats);
+        provider.shutdown().expect("provider should shut down");
+    }
+
+    #[test]
+    fn status_classes_are_low_cardinality() {
+        assert_eq!(status_class(200), "2xx");
+        assert_eq!(status_class(404), "4xx");
+        assert_eq!(status_class(503), "5xx");
+        assert_eq!(status_class(999), "other");
+        assert_eq!(output_format(Some("image/jpeg")), "jpeg");
+        assert_eq!(output_format(Some("image/png; charset=binary")), "png");
+        assert_eq!(output_format(Some("image/webp")), "webp");
+        assert_eq!(output_format(Some("image/avif")), "avif");
+        assert_eq!(output_format(Some("image/gif")), "other");
+        assert_eq!(proxy_error_category(Some("DecodeError")), Some("decode"));
+        assert_eq!(proxy_error_category(Some("EncodeError")), Some("encode"));
+        assert_eq!(proxy_error_category(Some("length:2>1")), Some("size"));
+        assert_eq!(
+            proxy_error_category(Some("Blocked address")),
+            Some("policy")
+        );
+        assert_eq!(
+            proxy_error_category(Some("RelativeUrlWithoutBase")),
+            Some("policy")
+        );
+        assert_eq!(proxy_error_category(Some("unexpected")), Some("internal"));
+        assert_eq!(proxy_error_category(Some("status:404")), None);
+        assert_eq!(fetch_error_category("dns:lookup failed"), "dns");
+        assert_eq!(fetch_error_category("connect"), "connect");
+        assert_eq!(fetch_error_category("timeout"), "timeout");
+        assert_eq!(fetch_error_category("reset"), "reset");
+        assert_eq!(fetch_error_category("body"), "body");
+        assert_eq!(fetch_error_category("unexpected:detail"), "other");
+    }
 }
 
 #[cfg(test)]
@@ -3066,6 +4046,9 @@ mod network_policy_tests {
             connect_timeout_ms: default_connect_timeout_ms(),
             fetch_retry_delay_ms: default_fetch_retry_delay_ms(),
             cache_stale_max_secs: default_cache_stale_max_secs(),
+            otlp_metrics_endpoint: None,
+            otlp_export_interval_ms: default_otlp_export_interval_ms(),
+            otlp_service_name: default_otlp_service_name(),
         }
     }
     #[test]
@@ -3079,12 +4062,51 @@ mod network_policy_tests {
         assert_eq!(config.dns_cache_max_entries, 1024);
     }
     #[test]
+    fn otlp_metrics_defaults_for_existing_config() {
+        let mut value = serde_json::to_value(base_config()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("otlp_metrics_endpoint");
+        object.remove("otlp_export_interval_ms");
+        object.remove("otlp_service_name");
+        let config: ConfigFile = serde_json::from_value(value).unwrap();
+        assert_eq!(config.otlp_metrics_endpoint, None);
+        assert_eq!(config.otlp_export_interval_ms, 5000);
+        assert_eq!(config.otlp_service_name, "media-proxy-rs");
+    }
+    #[test]
+    fn unavailable_otlp_collector_does_not_block_initialization() {
+        let mut config = base_config();
+        config.otlp_metrics_endpoint = Some("http://127.0.0.1:9/v1/metrics".to_owned());
+        let start = Instant::now();
+        let provider = init_otlp_metrics(&config)
+            .expect("valid endpoint should initialize")
+            .expect("configured endpoint should enable exporter");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        provider
+            .shutdown_with_timeout(Duration::from_secs(1))
+            .expect("empty provider should shut down");
+    }
+    #[test]
+    fn invalid_otlp_settings_are_rejected() {
+        let mut config = base_config();
+        config.otlp_metrics_endpoint = Some("http://127.0.0.1:4318/v1/metrics".to_owned());
+        config.otlp_export_interval_ms = 0;
+        assert!(init_otlp_metrics(&config).is_err());
+        config.otlp_export_interval_ms = 5000;
+        config.otlp_service_name.clear();
+        assert!(init_otlp_metrics(&config).is_err());
+    }
+    #[test]
     fn dns_retry_counters_reset_as_an_interval() {
         let cache = test_dns_cache(Duration::from_millis(20));
         cache.retry_attempts.fetch_add(2, Ordering::Relaxed);
         cache.retry_saved.fetch_add(1, Ordering::Relaxed);
+        cache.retry_attempts_total.fetch_add(2, Ordering::Relaxed);
+        cache.retry_saved_total.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(cache.cumulative_retries(), (2, 1));
         assert_eq!(cache.swap_reset_retries(), (2, 1));
         assert_eq!(cache.swap_reset_retries(), (0, 0));
+        assert_eq!(cache.cumulative_retries(), (2, 1));
     }
     #[test]
     fn parse_valid_config() {
@@ -3271,8 +4293,21 @@ mod cache_tests {
         // key1 は追い出されているはず
         assert!(cache.get(&key1).is_none());
         assert!(cache.get(&key2).is_some());
+        assert_eq!(cache.cumulative_evictions(), (1, 0));
         assert_eq!(cache.swap_reset_evictions(), (1, 0));
         assert_eq!(cache.swap_reset_evictions(), (0, 0));
+        assert_eq!(cache.cumulative_evictions(), (1, 0));
+    }
+    #[test]
+    fn singleflight_count_tracks_active_guards() {
+        let cache = test_cache();
+        assert_eq!(cache.inflight_count(), 0);
+        let guard = cache
+            .start_flight(test_key())
+            .expect("first request should own the flight");
+        assert_eq!(cache.inflight_count(), 1);
+        drop(guard);
+        assert_eq!(cache.inflight_count(), 0);
     }
     #[test]
     fn cache_skip_oversized_entry() {

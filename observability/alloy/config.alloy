@@ -1,0 +1,41 @@
+logging {
+	level  = "info"
+	format = "logfmt"
+}
+
+otelcol.receiver.otlp "media_proxy" {
+	http {
+		endpoint = "0.0.0.0:4318"
+	}
+
+	output {
+		metrics = [otelcol.processor.batch.media_proxy.input]
+	}
+}
+
+otelcol.processor.batch "media_proxy" {
+	timeout         = "200ms"
+	send_batch_size = 1024
+
+	output {
+		metrics = [otelcol.exporter.prometheus.media_proxy.input]
+	}
+}
+
+otelcol.exporter.prometheus "media_proxy" {
+	forward_to         = [prometheus.remote_write.existing.receiver]
+	include_scope_info = false
+}
+
+prometheus.remote_write "existing" {
+	endpoint {
+		url            = sys.env("PROMETHEUS_REMOTE_WRITE_URL")
+		remote_timeout = "3s"
+
+		queue_config {
+			batch_send_deadline  = "200ms"
+			max_samples_per_send = 1000
+			max_shards           = 4
+		}
+	}
+}

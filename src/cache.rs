@@ -117,6 +117,8 @@ pub struct ResponseCache {
     inflight: Mutex<HashMap<CacheKey, broadcast::Sender<Option<CacheEntry>>>>,
     capacity_evictions: AtomicU64,
     expired_evictions: AtomicU64,
+    capacity_evictions_total: AtomicU64,
+    expired_evictions_total: AtomicU64,
 }
 
 struct LruInner {
@@ -135,6 +137,8 @@ impl ResponseCache {
             inflight: Mutex::new(HashMap::new()),
             capacity_evictions: AtomicU64::new(0),
             expired_evictions: AtomicU64::new(0),
+            capacity_evictions_total: AtomicU64::new(0),
+            expired_evictions_total: AtomicU64::new(0),
         }
     }
 
@@ -160,6 +164,7 @@ impl ResponseCache {
                 if let Some(r) = removed {
                     inner.total_bytes = inner.total_bytes.saturating_sub(r.size);
                     self.expired_evictions.fetch_add(1, Ordering::Relaxed);
+                    self.expired_evictions_total.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -208,6 +213,7 @@ impl ResponseCache {
                 if let Some((_, evicted)) = inner.map.shift_remove_index(0) {
                     inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
                     self.expired_evictions.fetch_add(1, Ordering::Relaxed);
+                    self.expired_evictions_total.fetch_add(1, Ordering::Relaxed);
                 }
             } else {
                 break;
@@ -218,6 +224,8 @@ impl ResponseCache {
             if let Some((_, evicted)) = inner.map.shift_remove_index(0) {
                 inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
                 self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
+                self.capacity_evictions_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         inner.total_bytes += entry.size;
@@ -283,6 +291,20 @@ impl ResponseCache {
             self.capacity_evictions.swap(0, Ordering::Relaxed),
             self.expired_evictions.swap(0, Ordering::Relaxed),
         )
+    }
+
+    pub fn cumulative_evictions(&self) -> (u64, u64) {
+        (
+            self.capacity_evictions_total.load(Ordering::Relaxed),
+            self.expired_evictions_total.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn inflight_count(&self) -> usize {
+        self.inflight
+            .lock()
+            .map(|inflight| inflight.len())
+            .unwrap_or(0)
     }
 }
 
