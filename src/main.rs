@@ -3769,9 +3769,16 @@ impl RequestContext {
 				return Err(if resp.status() == axum::http::StatusCode::OK {
 					resp
 				} else {
-					header.remove("Content-Type");
-					header.append("Content-Type", "image/png".parse().unwrap());
-					(axum::http::StatusCode::OK, header, (*dummy_img).clone()).into_response()
+					let mut fallback_headers = resp.headers().clone();
+					fallback_headers.remove("Content-Type");
+					fallback_headers.remove("Content-Length");
+					fallback_headers.append("Content-Type", "image/png".parse().unwrap());
+					(
+						axum::http::StatusCode::OK,
+						fallback_headers,
+						(*dummy_img).clone(),
+					)
+						.into_response()
 				});
 			}
 			return Err(resp);

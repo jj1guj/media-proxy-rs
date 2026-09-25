@@ -25,6 +25,66 @@ pub(crate) fn dimensions_allowed_for(max_decode_pixels: u64, width: u64, height:
 		.is_some_and(|pixels| pixels <= max_decode_pixels)
 }
 
+fn decode_embedded_ico_png(
+	src: &[u8],
+	max_decode_pixels: u64,
+	max_alloc: u64,
+) -> Result<DynamicImage, String> {
+	if src.get(..4) != Some(&[0, 0, 1, 0]) {
+		return Err("invalid ICO header".to_owned());
+	}
+	let count = u16::from_le_bytes([src[4], src[5]]) as usize;
+	let directory_end = 6usize
+		.checked_add(count.checked_mul(16).ok_or("ICO directory overflow")?)
+		.ok_or("ICO directory overflow")?;
+	if count == 0 || directory_end > src.len() {
+		return Err("invalid ICO directory".to_owned());
+	}
+
+	let mut candidates = Vec::new();
+	for index in 0..count {
+		let entry = 6 + index * 16;
+		let length = u32::from_le_bytes(src[entry + 8..entry + 12].try_into().unwrap()) as usize;
+		let offset = u32::from_le_bytes(src[entry + 12..entry + 16].try_into().unwrap()) as usize;
+		let Some(end) = offset.checked_add(length) else {
+			continue;
+		};
+		let Some(data) = src.get(offset..end) else {
+			continue;
+		};
+		if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
+			continue;
+		}
+		let dimensions = image::ImageReader::with_format(
+			std::io::Cursor::new(data),
+			image::ImageFormat::Png,
+		)
+		.into_dimensions();
+		if let Ok((width, height)) = dimensions {
+			if dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
+				candidates.push((width as u64 * height as u64, data));
+			}
+		}
+	}
+	candidates.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+
+	let mut last_error = "no supported embedded PNG".to_owned();
+	for (_, data) in candidates {
+		let mut reader = image::ImageReader::with_format(
+			std::io::Cursor::new(data),
+			image::ImageFormat::Png,
+		);
+		let mut limits = image::Limits::default();
+		limits.max_alloc = Some(max_alloc);
+		reader.limits(limits);
+		match reader.decode() {
+			Ok(image) => return Ok(image),
+			Err(error) => last_error = error.to_string(),
+		}
+	}
+	Err(last_error)
+}
+
 fn le24(bytes: &[u8]) -> u32 {
 	(bytes[0] as u32) | ((bytes[1] as u32) << 8) | ((bytes[2] as u32) << 16)
 }
@@ -1139,6 +1199,7 @@ impl RequestContext {
 		let img = {
 			let _dg = self.phase_guard(Phase::Decode);
 			let max_alloc = (self.config.max_size / 4).max(1).saturating_mul(4);
+			let max_decode_pixels = (self.config.max_size / 4).max(1);
 			let img = match &self.codec {
 				Ok(codec) => {
 					let mut reader = image::ImageReader::with_format(
@@ -1148,7 +1209,20 @@ impl RequestContext {
 					let mut limits = image::Limits::default();
 					limits.max_alloc = Some(max_alloc);
 					reader.limits(limits);
-					reader.decode().map_err(|e| format!("{:?}", e))
+					match reader.decode() {
+						Ok(image) => Ok(image),
+						Err(error) if *codec == image::ImageFormat::Ico => {
+							decode_embedded_ico_png(
+								&self.src_bytes,
+								max_decode_pixels,
+								max_alloc,
+							)
+							.map_err(|fallback_error| {
+								format!("{error:?}; IcoPngFallback_{fallback_error}")
+							})
+						}
+						Err(error) => Err(format!("{error:?}")),
+					}
 				}
 				Err(Some(e)) => Err(format!("{:?}", e)),
 				_ => {
@@ -1497,6 +1571,35 @@ mod tests {
 		v.extend_from_slice(&png_chunk(b"IHDR", &ihdr));
 		v.extend_from_slice(&png_chunk(b"IDAT", &[0, 1, 2, 3]));
 		v
+	}
+	fn build_ico_with_grayscale_png() -> Vec<u8> {
+		let mut png = Vec::new();
+		{
+			let mut encoder = png::Encoder::new(&mut png, 2, 2);
+			encoder.set_color(png::ColorType::Grayscale);
+			encoder.set_depth(png::BitDepth::Eight);
+			let mut writer = encoder.write_header().unwrap();
+			writer.write_image_data(&[0, 85, 170, 255]).unwrap();
+		}
+		let mut ico = vec![0, 0, 1, 0, 1, 0, 2, 2, 0, 0, 1, 0, 8, 0];
+		ico.extend_from_slice(&(png.len() as u32).to_le_bytes());
+		ico.extend_from_slice(&22u32.to_le_bytes());
+		ico.extend_from_slice(&png);
+		ico
+	}
+
+	#[test]
+	fn ico_with_non_rgba_png_uses_embedded_png_fallback() {
+		let ico = build_ico_with_grayscale_png();
+		let standard_decode = image::ImageReader::with_format(
+			std::io::Cursor::new(&ico),
+			image::ImageFormat::Ico,
+		)
+		.decode();
+		assert!(standard_decode.is_err());
+
+		let decoded = decode_embedded_ico_png(&ico, 4, 16).unwrap();
+		assert_eq!(decoded.dimensions(), (2, 2));
 	}
 	fn build_16bit_apng(separate_default_image: bool) -> Vec<u8> {
 		let mut data = Vec::new();
