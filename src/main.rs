@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{io::Write, net::SocketAddr, pin::Pin, str::FromStr, sync::Arc};
 
 use axum::{http::HeaderMap, response::IntoResponse, Router};
@@ -16,7 +16,7 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use tokio_stream::StreamExt;
 
 #[cfg(feature = "avif-decoder")]
@@ -30,6 +30,189 @@ mod ssrf;
 mod svg;
 
 use cache::{CacheKey, CacheResult, ResponseCache};
+
+const HOST_THROTTLE_FALLBACK_COOLDOWN: Duration = Duration::from_secs(5);
+const HOST_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(60);
+const HOST_THROTTLE_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HostThrottleConfig {
+	requests_per_second: f64,
+	burst: u32,
+	max_wait_ms: u64,
+	max_hosts: usize,
+}
+
+struct HostThrottleState {
+	tokens: f64,
+	last_refill: Instant,
+	cooldown_until: Instant,
+	consecutive_429: u32,
+	last_seen: Instant,
+}
+
+struct HostThrottle {
+	rate_per_second: f64,
+	burst: f64,
+	max_wait: Duration,
+	max_hosts: usize,
+	states: AsyncMutex<HashMap<String, HostThrottleState>>,
+}
+
+impl HostThrottle {
+	fn new(config: &HostThrottleConfig) -> Result<Self, String> {
+		if !config.requests_per_second.is_finite() || config.requests_per_second <= 0.0 {
+			return Err("host_throttle.requests_per_second must be greater than 0".to_owned());
+		}
+		if config.burst == 0 {
+			return Err("host_throttle.burst must be greater than 0".to_owned());
+		}
+		if config.max_wait_ms == 0 {
+			return Err("host_throttle.max_wait_ms must be greater than 0".to_owned());
+		}
+		if config.max_hosts == 0 {
+			return Err("host_throttle.max_hosts must be greater than 0".to_owned());
+		}
+		Ok(Self::with_limits(
+			config.requests_per_second,
+			config.burst,
+			Duration::from_millis(config.max_wait_ms),
+			config.max_hosts,
+		))
+	}
+
+	fn with_limits(rate_per_second: f64, burst: u32, max_wait: Duration, max_hosts: usize) -> Self {
+		Self {
+			rate_per_second,
+			burst: f64::from(burst),
+			max_wait,
+			max_hosts,
+			states: AsyncMutex::new(HashMap::new()),
+		}
+	}
+
+	fn host_key(url: &reqwest::Url) -> Option<String> {
+		url.host_str().map(str::to_ascii_lowercase)
+	}
+
+	fn state_for_host<'a>(
+		&self,
+		states: &'a mut HashMap<String, HostThrottleState>,
+		host: &str,
+		now: Instant,
+	) -> &'a mut HostThrottleState {
+		if !states.contains_key(host) && states.len() >= self.max_hosts {
+			states.retain(|_, state| now.duration_since(state.last_seen) < HOST_THROTTLE_IDLE_TTL);
+			if states.len() >= self.max_hosts {
+				if let Some(oldest) = states
+					.iter()
+					.min_by_key(|(_, state)| state.last_seen)
+					.map(|(host, _)| host.clone())
+				{
+					states.remove(&oldest);
+				}
+			}
+		}
+		states.entry(host.to_owned()).or_insert(HostThrottleState {
+			tokens: self.burst,
+			last_refill: now,
+			cooldown_until: now,
+			consecutive_429: 0,
+			last_seen: now,
+		})
+	}
+
+	async fn acquire(&self, url: &reqwest::Url) -> Result<Duration, Duration> {
+		let Some(host) = Self::host_key(url) else {
+			return Ok(Duration::ZERO);
+		};
+
+		let started = Instant::now();
+		loop {
+			let sleep_for = {
+				let mut states = self.states.lock().await;
+				let now = Instant::now();
+				let state = self.state_for_host(&mut states, &host, now);
+				let refill_seconds = now.duration_since(state.last_refill).as_secs_f64();
+				state.tokens =
+					(state.tokens + refill_seconds * self.rate_per_second).min(self.burst);
+				state.last_refill = now;
+				state.last_seen = now;
+
+				if now >= state.cooldown_until && state.tokens >= 1.0 {
+					state.tokens -= 1.0;
+					return Ok(started.elapsed());
+				}
+
+				let cooldown_wait = state.cooldown_until.saturating_duration_since(now);
+				let token_wait = if state.tokens >= 1.0 {
+					Duration::ZERO
+				} else {
+					Duration::from_secs_f64((1.0 - state.tokens) / self.rate_per_second)
+				};
+				cooldown_wait.max(token_wait)
+			};
+
+			let elapsed = started.elapsed();
+			let remaining = self.max_wait.saturating_sub(elapsed);
+			if sleep_for > remaining || remaining.is_zero() {
+				return Err(elapsed);
+			}
+			tokio::time::sleep(sleep_for).await;
+		}
+	}
+
+	async fn observe_response(
+		&self,
+		url: &reqwest::Url,
+		status: reqwest::StatusCode,
+		headers: &reqwest::header::HeaderMap,
+	) {
+		let Some(host) = Self::host_key(url) else {
+			return;
+		};
+
+		let mut states = self.states.lock().await;
+		let now = Instant::now();
+		let state = self.state_for_host(&mut states, &host, now);
+		state.last_seen = now;
+		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			state.consecutive_429 = state.consecutive_429.saturating_add(1);
+			let retry_after = parse_retry_after(headers).unwrap_or_else(|| {
+				let shift = state.consecutive_429.saturating_sub(1).min(4);
+				let exponential = (HOST_THROTTLE_FALLBACK_COOLDOWN * (1 << shift))
+					.min(HOST_THROTTLE_MAX_COOLDOWN);
+				let jitter_ms = SystemTime::now()
+					.duration_since(SystemTime::UNIX_EPOCH)
+					.unwrap_or_default()
+					.subsec_millis() as u64;
+				exponential + Duration::from_millis(jitter_ms)
+			});
+			state.cooldown_until = state.cooldown_until.max(now + retry_after);
+			tracing::warn!(
+				host,
+				cooldown_ms = retry_after.as_millis() as u64,
+				consecutive_429 = state.consecutive_429,
+				"host throttle cooldown activated"
+			);
+		} else if status.is_success() {
+			state.consecutive_429 = 0;
+		}
+	}
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+	let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+	if let Ok(seconds) = value.trim().parse::<u64>() {
+		return Some(Duration::from_secs(seconds));
+	}
+	let retry_at = httpdate::parse_http_date(value).ok()?;
+	Some(
+		retry_at
+			.duration_since(SystemTime::now())
+			.unwrap_or_default(),
+	)
+}
 
 struct OtlpMetrics {
 	requests: Counter<u64>,
@@ -765,6 +948,7 @@ type AppState = (
 	Arc<Semaphore>,
 	Arc<Semaphore>,
 	Arc<GlobalStats>,
+	Option<Arc<HostThrottle>>,
 );
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -839,6 +1023,9 @@ pub struct ConfigFile {
 	/// 接続段階失敗時のリトライ前待機(ms、既定500)。SYN再送で瞬断窓を跨ぐ効果を狙う。
 	#[serde(default = "default_fetch_retry_delay_ms")]
 	fetch_retry_delay_ms: u64,
+	/// 特定ホストへの要求を平滑化し、429後はRetry-Afterまで送信を止める。
+	#[serde(default)]
+	host_throttle: Option<HostThrottleConfig>,
 	/// stale-if-error の保持上限(秒、既定86400=24時間)。
 	/// TTL切れ後もこの期間はstaleとして保持し、フェッチ失敗時に返す。0で無効。
 	#[serde(default = "default_cache_stale_max_secs")]
@@ -1067,6 +1254,7 @@ fn main() {
 			inflight_buffer_budget_bytes:default_inflight_buffer_budget(),
 			connect_timeout_ms:default_connect_timeout_ms(),
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
+			host_throttle:None,
 			cache_stale_max_secs:default_cache_stale_max_secs(),
             otlp_metrics_endpoint:None,
             otlp_export_interval_ms:default_otlp_export_interval_ms(),
@@ -1214,6 +1402,18 @@ fn main() {
 		stale_max: Duration::from_secs(config.cache_stale_max_secs),
 	}));
 	let global_stats = Arc::new(GlobalStats::with_otlp(meter_provider.as_ref()));
+	let host_throttle = match config
+		.host_throttle
+		.as_ref()
+		.map(HostThrottle::new)
+		.transpose()
+	{
+		Ok(throttle) => throttle.map(Arc::new),
+		Err(error) => {
+			tracing::error!(%error, "設定エラー(host_throttle)");
+			std::process::exit(1);
+		}
+	};
 	let arg_tup = (
 		client,
 		config,
@@ -1226,6 +1426,7 @@ fn main() {
 		download_semaphore,
 		buffer_budget,
 		global_stats,
+		host_throttle,
 	);
 	rt.block_on(async {
 		if let Some(metrics) = arg_tup.10.otlp.clone() {
@@ -2585,6 +2786,7 @@ async fn get_file_inner(
 		download_semaphore,
 		buffer_budget,
 		global_stats,
+		host_throttle,
 	): AppState,
 	axum::extract::Query(q): axum::extract::Query<RequestParams>,
 ) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
@@ -2894,7 +3096,39 @@ async fn get_file_inner(
 	let mut redirects = 0;
 	let mut forward_range = has_range;
 	let mut partial_image_response = None;
+	let mut throttle_wait_total = Duration::ZERO;
 	let resp = loop {
+		let throttle_wait = match if let Some(throttle) = &host_throttle {
+			throttle.acquire(&current_url).await
+		} else {
+			Ok(Duration::ZERO)
+		} {
+			Ok(wait) => wait,
+			Err(wait) => {
+				if let Ok(mut t) = timings.lock() {
+					t.wait += wait;
+					t.fetch_err = Some("throttle:wait_timeout".to_owned());
+				}
+				headers.append("X-Proxy-Error", "HostThrottleTimeout".parse().unwrap());
+				headers.append("Retry-After", "1".parse().unwrap());
+				if let Ok(t) = timings.lock() {
+					emit_summary(
+						&config,
+						&summary,
+						&t,
+						503,
+						true,
+						Some("HostThrottleTimeout"),
+						&global_stats,
+					);
+				}
+				return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers).into_response());
+			}
+		};
+		throttle_wait_total += throttle_wait;
+		if let Ok(mut t) = timings.lock() {
+			t.wait += throttle_wait;
+		}
 		let build_req = || {
 			let req = client.get(current_url.as_str());
 			let req = req.header("User-Agent", config.user_agent.clone());
@@ -2908,7 +3142,7 @@ async fn get_file_inner(
 		let resp = match build_req().send().await {
 			Ok(resp) => {
 				if let Ok(mut t) = timings.lock() {
-					t.ttfb = send_start.elapsed();
+					t.ttfb = send_start.elapsed().saturating_sub(throttle_wait_total);
 				}
 				resp
 			}
@@ -2929,10 +3163,43 @@ async fn get_file_inner(
 						metrics.fetch_retry_attempts.add(1, &[]);
 					}
 					tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
+					let retry_throttle_wait = match if let Some(throttle) = &host_throttle {
+						throttle.acquire(&current_url).await
+					} else {
+						Ok(Duration::ZERO)
+					} {
+						Ok(wait) => wait,
+						Err(wait) => {
+							if let Ok(mut t) = timings.lock() {
+								t.wait += wait;
+								t.fetch_err = Some("throttle:wait_timeout".to_owned());
+								t.retried = true;
+							}
+							headers.append("X-Proxy-Error", "HostThrottleTimeout".parse().unwrap());
+							headers.append("Retry-After", "1".parse().unwrap());
+							if let Ok(t) = timings.lock() {
+								emit_summary(
+									&config,
+									&summary,
+									&t,
+									503,
+									true,
+									Some("HostThrottleTimeout"),
+									&global_stats,
+								);
+							}
+							return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers)
+								.into_response());
+						}
+					};
+					throttle_wait_total += retry_throttle_wait;
+					if let Ok(mut t) = timings.lock() {
+						t.wait += retry_throttle_wait;
+					}
 					match build_req().send().await {
 						Ok(resp) => {
 							if let Ok(mut t) = timings.lock() {
-								t.ttfb = send_start.elapsed();
+								t.ttfb = send_start.elapsed().saturating_sub(throttle_wait_total);
 								t.retried = true;
 								t.fetch_retry_succeeded = true;
 							}
@@ -3032,6 +3299,11 @@ async fn get_file_inner(
 				}
 			}
 		};
+		if let Some(throttle) = &host_throttle {
+			throttle
+				.observe_response(&current_url, resp.status(), resp.headers())
+				.await;
+		}
 		let is_image_response = resp
 			.headers()
 			.get(reqwest::header::CONTENT_TYPE)
@@ -4258,6 +4530,60 @@ mod metrics_tests {
 #[cfg(test)]
 mod network_policy_tests {
 	use super::*;
+
+	#[test]
+	fn host_throttle_enforces_burst_and_retry_after() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let throttle = HostThrottle::with_limits(1.0, 2, Duration::from_millis(5), 16);
+			let target = reqwest::Url::parse("https://throttled.example/image.webp").unwrap();
+			let other = reqwest::Url::parse("https://example.com/image.webp").unwrap();
+
+			assert!(throttle.acquire(&target).await.is_ok());
+			assert!(throttle.acquire(&target).await.is_ok());
+			assert!(throttle.acquire(&target).await.is_err());
+			assert!(throttle.acquire(&other).await.is_ok());
+			assert!(throttle.acquire(&other).await.is_ok());
+			assert!(throttle.acquire(&other).await.is_err());
+
+			let mut headers = reqwest::header::HeaderMap::new();
+			headers.insert(reqwest::header::RETRY_AFTER, "1".parse().unwrap());
+			throttle
+				.observe_response(&target, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers)
+				.await;
+			assert!(throttle.acquire(&target).await.is_err());
+			let unaffected = reqwest::Url::parse("https://unaffected.example/image.webp").unwrap();
+			assert!(throttle.acquire(&unaffected).await.is_ok());
+		});
+	}
+
+	#[test]
+	fn retry_after_supports_seconds_and_http_dates() {
+		let mut headers = reqwest::header::HeaderMap::new();
+		headers.insert(reqwest::header::RETRY_AFTER, "12".parse().unwrap());
+		assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(12)));
+
+		let retry_at = SystemTime::now() + Duration::from_secs(30);
+		headers.insert(
+			reqwest::header::RETRY_AFTER,
+			httpdate::fmt_http_date(retry_at).parse().unwrap(),
+		);
+		let parsed = parse_retry_after(&headers).unwrap();
+		assert!(parsed >= Duration::from_secs(29));
+		assert!(parsed <= Duration::from_secs(30));
+	}
+
+	#[test]
+	fn host_throttle_config_defaults_for_existing_config() {
+		let mut value = serde_json::to_value(base_config()).unwrap();
+		value.as_object_mut().unwrap().remove("host_throttle");
+		let config: ConfigFile = serde_json::from_value(value).unwrap();
+		assert!(config.host_throttle.is_none());
+	}
+
 	fn test_dns_cache(timeout: Duration) -> DnsCache {
 		DnsCache::new(Duration::from_secs(60), Duration::from_secs(1), timeout, 16)
 	}
@@ -4294,6 +4620,7 @@ mod network_policy_tests {
 			inflight_buffer_budget_bytes: default_inflight_buffer_budget(),
 			connect_timeout_ms: default_connect_timeout_ms(),
 			fetch_retry_delay_ms: default_fetch_retry_delay_ms(),
+			host_throttle: None,
 			cache_stale_max_secs: default_cache_stale_max_secs(),
 			otlp_metrics_endpoint: None,
 			otlp_export_interval_ms: default_otlp_export_interval_ms(),

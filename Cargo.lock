@@ -2158,6 +2158,7 @@ dependencies = [
  "hayro",
  "headers",
  "heic-rs",
+ "httpdate",
  "image",
  "indexmap",
  "ipnet",

@@ -30,6 +30,12 @@
   "inflight_buffer_budget_bytes": 268435456,
   "connect_timeout_ms": 3000,
   "fetch_retry_delay_ms": 500,
+  "host_throttle": {
+    "requests_per_second": 1.0,
+    "burst": 30,
+    "max_wait_ms": 15000,
+    "max_hosts": 4096
+  },
   "cache_stale_max_secs": 86400,
   "otlp_metrics_endpoint": null,
   "otlp_export_interval_ms": 5000,

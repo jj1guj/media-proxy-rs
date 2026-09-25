@@ -137,6 +137,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `inflight_buffer_budget_bytes` | u64       | `268435456` (256MB) | 同時ダウンロードの合計バイト予算                                             |
 | `connect_timeout_ms`           | u64       | `3000`              | TCP接続タイムアウト(ms)。`timeout`より小さく設定すること                     |
 | `fetch_retry_delay_ms`         | u64       | `500`               | 接続失敗時のリトライ前待機(ms)                                               |
+| `host_throttle`                | object?   | `null`              | ホストごとに独立したToken Bucketと429クールダウン設定                        |
 | `otlp_metrics_endpoint`        | string?   | `null`              | OTLP/HTTP metrics送信先。`/v1/metrics`を含む完全なURL。`null`で無効          |
 | `otlp_export_interval_ms`      | u64       | `5000`              | OTLP metrics送信間隔(ms)                                                     |
 | `otlp_service_name`            | string    | `"media-proxy-rs"`  | OpenTelemetryの`service.name`                                                |
@@ -145,6 +146,8 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `blocked_hosts`                | string[]? | `null`              | 遮断するホスト名                                                             |
 
 すべての追加項目は `#[serde(default)]` 付きのため、既存の config.json をそのまま使えます。
+
+`host_throttle`を設定した場合、`requests_per_second`、`burst`、`max_wait_ms`、`max_hosts`が必須です。各ホストに独立したToken Bucketを割り当て、429応答に`Retry-After`があれば、その期間は該当ホストへの送信を停止します。
 
 ### OTLP基本メトリクス
 

@@ -1727,6 +1727,7 @@ mod tests {
 				inflight_buffer_budget_bytes: default_inflight_buffer_budget(),
 				connect_timeout_ms: default_connect_timeout_ms(),
 				fetch_retry_delay_ms: default_fetch_retry_delay_ms(),
+				host_throttle: None,
 				cache_stale_max_secs: default_cache_stale_max_secs(),
 				otlp_metrics_endpoint: None,
 				otlp_export_interval_ms: default_otlp_export_interval_ms(),

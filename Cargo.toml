@@ -42,6 +42,7 @@ resvg = { version = "0.48", features = [
 rexif = "0.7"
 avif-decoder_dep = { path = "./avif-decoder_dep", optional = true }
 chrono = "0.4"
+httpdate = "1"
 fast_image_resize = "6.1"
 jxl-oxide = { version = "0.12.6", features = ["image", "lcms2"] }
 jpeg2k = { version = "0.10.1", default-features = false, features = [
