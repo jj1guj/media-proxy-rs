@@ -1,6 +1,6 @@
 {
   "bind_addr": "0.0.0.0:12766",
-  "timeout": 10000,
+  "timeout": 30000,
   "user_agent": "https://github.com/jj1guj/media-proxy-rs",
   "max_size": 67108864,
   "proxy": null,
@@ -27,7 +27,7 @@
   "webp_method": 4,
   "max_concurrent_downloads": 128,
   "inflight_buffer_budget_bytes": 536870912,
-  "connect_timeout_ms": 3000,
+  "connect_timeout_ms": 10000,
   "fetch_retry_delay_ms": 500,
   "host_throttle": {
     "requests_per_second": 1.0,
