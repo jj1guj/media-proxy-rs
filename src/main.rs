@@ -341,6 +341,67 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 	(!duration.is_zero()).then_some(duration)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RateLimitHeaderSnapshot {
+	retry_after: Option<String>,
+	retry_after_ms: Option<u64>,
+	ratelimit_limit: Option<String>,
+	ratelimit_remaining: Option<String>,
+	ratelimit_reset: Option<String>,
+	ratelimit_policy: Option<String>,
+	x_ratelimit_limit: Option<String>,
+	x_ratelimit_remaining: Option<String>,
+	x_ratelimit_reset: Option<String>,
+	server: Option<String>,
+	cf_ray: Option<String>,
+}
+
+impl RateLimitHeaderSnapshot {
+	fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+		fn value(headers: &reqwest::header::HeaderMap, name: &'static str) -> Option<String> {
+			headers
+				.get(name)
+				.and_then(|value| value.to_str().ok())
+				.map(|value| value.chars().take(256).collect())
+		}
+
+		Self {
+			retry_after: value(headers, "retry-after"),
+			retry_after_ms: parse_retry_after(headers)
+				.map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64),
+			ratelimit_limit: value(headers, "ratelimit-limit"),
+			ratelimit_remaining: value(headers, "ratelimit-remaining"),
+			ratelimit_reset: value(headers, "ratelimit-reset"),
+			ratelimit_policy: value(headers, "ratelimit-policy"),
+			x_ratelimit_limit: value(headers, "x-ratelimit-limit"),
+			x_ratelimit_remaining: value(headers, "x-ratelimit-remaining"),
+			x_ratelimit_reset: value(headers, "x-ratelimit-reset"),
+			server: value(headers, "server"),
+			cf_ray: value(headers, "cf-ray"),
+		}
+	}
+}
+
+fn log_upstream_429(url: &reqwest::Url, headers: &reqwest::header::HeaderMap) {
+	let snapshot = RateLimitHeaderSnapshot::from_headers(headers);
+	tracing::warn!(
+		target_host = url.host_str().unwrap_or("unknown"),
+		retry_after = snapshot.retry_after.as_deref().unwrap_or(""),
+		retry_after_ms = snapshot.retry_after_ms.unwrap_or(0),
+		retry_after_valid = snapshot.retry_after_ms.is_some(),
+		ratelimit_limit = snapshot.ratelimit_limit.as_deref().unwrap_or(""),
+		ratelimit_remaining = snapshot.ratelimit_remaining.as_deref().unwrap_or(""),
+		ratelimit_reset = snapshot.ratelimit_reset.as_deref().unwrap_or(""),
+		ratelimit_policy = snapshot.ratelimit_policy.as_deref().unwrap_or(""),
+		x_ratelimit_limit = snapshot.x_ratelimit_limit.as_deref().unwrap_or(""),
+		x_ratelimit_remaining = snapshot.x_ratelimit_remaining.as_deref().unwrap_or(""),
+		x_ratelimit_reset = snapshot.x_ratelimit_reset.as_deref().unwrap_or(""),
+		server = snapshot.server.as_deref().unwrap_or(""),
+		cf_ray = snapshot.cf_ray.as_deref().unwrap_or(""),
+		"upstream 429 response headers"
+	);
+}
+
 fn throttle_wait_budget(config: &ConfigFile, request_started: Instant) -> Duration {
 	let request_timeout = Duration::from_millis(config.timeout);
 	let fetch_reserve = Duration::from_millis(config.connect_timeout_ms.min(config.timeout));
@@ -3533,6 +3594,9 @@ async fn get_file_inner(
 				}
 			}
 		};
+		if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			log_upstream_429(&current_url, resp.headers());
+		}
 		if let Some(throttle) = &host_throttle {
 			let was_throttled = throttle_permit
 				.as_ref()
@@ -4857,6 +4921,34 @@ mod network_policy_tests {
 		let parsed = parse_retry_after(&headers).unwrap();
 		assert!(parsed >= Duration::from_secs(29));
 		assert!(parsed <= Duration::from_secs(30));
+	}
+
+	#[test]
+	fn rate_limit_header_snapshot_captures_diagnostic_headers() {
+		let mut headers = reqwest::header::HeaderMap::new();
+		headers.insert(reqwest::header::RETRY_AFTER, "12".parse().unwrap());
+		headers.insert("ratelimit-limit", "120".parse().unwrap());
+		headers.insert("ratelimit-remaining", "0".parse().unwrap());
+		headers.insert("ratelimit-reset", "9".parse().unwrap());
+		headers.insert("ratelimit-policy", "120;w=60".parse().unwrap());
+		headers.insert("x-ratelimit-limit", "120".parse().unwrap());
+		headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+		headers.insert("x-ratelimit-reset", "9".parse().unwrap());
+		headers.insert("server", "cloudflare".parse().unwrap());
+		headers.insert("cf-ray", "test-ray-NRT".parse().unwrap());
+
+		let snapshot = RateLimitHeaderSnapshot::from_headers(&headers);
+		assert_eq!(snapshot.retry_after.as_deref(), Some("12"));
+		assert_eq!(snapshot.retry_after_ms, Some(12_000));
+		assert_eq!(snapshot.ratelimit_limit.as_deref(), Some("120"));
+		assert_eq!(snapshot.ratelimit_remaining.as_deref(), Some("0"));
+		assert_eq!(snapshot.ratelimit_reset.as_deref(), Some("9"));
+		assert_eq!(snapshot.ratelimit_policy.as_deref(), Some("120;w=60"));
+		assert_eq!(snapshot.x_ratelimit_limit.as_deref(), Some("120"));
+		assert_eq!(snapshot.x_ratelimit_remaining.as_deref(), Some("0"));
+		assert_eq!(snapshot.x_ratelimit_reset.as_deref(), Some("9"));
+		assert_eq!(snapshot.server.as_deref(), Some("cloudflare"));
+		assert_eq!(snapshot.cf_ray.as_deref(), Some("test-ray-NRT"));
 	}
 
 	#[test]
