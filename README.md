@@ -128,6 +128,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `cache_max_bytes`              | u64       | `134217728` (128MB) | キャッシュ合計バイト数上限                                                   |
 | `cache_entry_max_bytes`        | u64       | `5242880` (5MB)     | 1エントリの最大バイト数                                                      |
 | `cache_ttl_secs`               | u64       | `3600`              | キャッシュTTL(秒)                                                            |
+| `negative_cache_404_ttl_secs`  | u64       | `3600`              | 上流404のネガティブキャッシュTTL(秒)。`0`で無効                              |
+| `negative_cache_410_ttl_secs`  | u64       | `86400`             | 上流410のネガティブキャッシュTTL(秒)。`0`で無効                              |
+| `negative_cache_max_entries`   | usize     | `16384`             | 404/410ネガティブキャッシュの最大URL数                                       |
 | `passthrough_max_bytes`        | u64       | `1048576` (1MB)     | パススルー対象の最大バイトサイズ                                             |
 | `dns_negative_ttl_secs`        | u64       | `10`                | DNS解決失敗のネガティブキャッシュTTL(秒)                                     |
 | `dns_timeout_ms`               | u64       | `4000`              | DNS解決のタイムアウト(ms)。タイムアウト時は1回リトライ                       |
@@ -149,6 +152,8 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 `host_throttle`を設定した場合、通常時の送信は制限せず、429を返したホストだけサーキットブレーカーの対象にします。`requests_per_second`と`burst`は回復中の送信レートとバースト上限です。`max_wait_ms`はFIFOキューで待機できる上限で、5秒・10秒のクールダウンをジッター込みで待てる`15000`を推奨します。`max_hosts`は保持するホスト状態数、`queue_capacity`はホストごとの最大待機数です。`queue_capacity`を省略した場合は64です。429応答ごとにレートを半減（下限0.25件/秒）し、有効な`Retry-After`があればその期間は送信を停止します。0秒または期限切れの場合は5〜60秒の指数バックオフとジッターを使用します。クールダウン終了後は1件ずつ送信し、成功応答に応じて通常状態へ復帰します。
 
+上流の404/410は正規化した元URL単位でネガティブキャッシュされ、異なる画像変換からの再取得も抑止します。期限切れエントリは返さず、Rangeリクエストと429を含むその他のステータスは保存しません。ヒットはリクエストログと`media_proxy_cache_requests_total`の`result=negative`、保持件数は定期統計ログの`negative_cache_entries`で確認できます。
+
 ### OTLP基本メトリクス
 
 `otlp_metrics_endpoint` を設定すると、以下のメトリクスをOTLP/HTTPで送信します。時間の単位は秒です。ステータス属性は `status_class` (`1xx`〜`5xx`、`other`) のみで、URL、ドメイン、IP、キャッシュキー、エラー詳細は属性に含めません。
@@ -169,7 +174,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_decode_duration`          | Histogram     | decode時間                                     |
 | `media_proxy_encode_duration`          | Histogram     | encode時間                                     |
 
-キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale` の5種類です。キャッシュヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
+キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative` の6種類です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
 
 | メトリクス                                   | 種別      | 内容                                   |
 | -------------------------------------------- | --------- | -------------------------------------- |

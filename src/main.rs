@@ -1208,6 +1208,7 @@ type AppState = (
 	Arc<Semaphore>,
 	Arc<GlobalStats>,
 	Option<Arc<HostThrottle>>,
+	Arc<cache::NegativeCache>,
 );
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1244,6 +1245,15 @@ pub struct ConfigFile {
 	/// キャッシュTTL(秒、既定3600)。
 	#[serde(default = "default_cache_ttl_secs")]
 	cache_ttl_secs: u64,
+	/// 上流404のネガティブキャッシュTTL(秒、既定3600)。0で無効。
+	#[serde(default = "default_negative_cache_404_ttl_secs")]
+	negative_cache_404_ttl_secs: u64,
+	/// 上流410のネガティブキャッシュTTL(秒、既定86400)。0で無効。
+	#[serde(default = "default_negative_cache_410_ttl_secs")]
+	negative_cache_410_ttl_secs: u64,
+	/// 上流404/410ネガティブキャッシュの最大URL数(既定16384)。
+	#[serde(default = "default_negative_cache_max_entries")]
+	negative_cache_max_entries: usize,
 	/// パススルー対象の最大バイトサイズ(既定1MB)。
 	/// webp/png/jpeg/gif かつ badge/static 未指定かつ寸法が目標以下かつこのサイズ以下なら
 	/// デコード・再エンコードせず元バイト列を返す。
@@ -1314,6 +1324,15 @@ fn default_cache_entry_max_bytes() -> u64 {
 }
 fn default_cache_ttl_secs() -> u64 {
 	3600
+}
+fn default_negative_cache_404_ttl_secs() -> u64 {
+	3600
+}
+fn default_negative_cache_410_ttl_secs() -> u64 {
+	86400
+}
+fn default_negative_cache_max_entries() -> usize {
+	16384
 }
 fn default_passthrough_max_bytes() -> u64 {
 	1024 * 1024
@@ -1502,6 +1521,9 @@ fn main() {
 			cache_max_bytes:default_cache_max_bytes(),
 			cache_entry_max_bytes:default_cache_entry_max_bytes(),
 			cache_ttl_secs:default_cache_ttl_secs(),
+			negative_cache_404_ttl_secs:default_negative_cache_404_ttl_secs(),
+			negative_cache_410_ttl_secs:default_negative_cache_410_ttl_secs(),
+			negative_cache_max_entries:default_negative_cache_max_entries(),
 			passthrough_max_bytes:default_passthrough_max_bytes(),
 			dns_negative_ttl_secs:default_dns_negative_ttl_secs(),
 			dns_timeout_ms:default_dns_timeout_ms(),
@@ -1660,6 +1682,12 @@ fn main() {
 		ttl: Duration::from_secs(config.cache_ttl_secs),
 		stale_max: Duration::from_secs(config.cache_stale_max_secs),
 	}));
+	let negative_cache = Arc::new(cache::NegativeCache::new(cache::NegativeCacheConfig {
+		enabled: config.enable_cache,
+		max_entries: config.negative_cache_max_entries,
+		not_found_ttl: Duration::from_secs(config.negative_cache_404_ttl_secs),
+		gone_ttl: Duration::from_secs(config.negative_cache_410_ttl_secs),
+	}));
 	let global_stats = Arc::new(GlobalStats::with_otlp(meter_provider.as_ref()));
 	let host_throttle = match config
 		.host_throttle
@@ -1686,6 +1714,7 @@ fn main() {
 		buffer_budget,
 		global_stats,
 		host_throttle,
+		negative_cache,
 	);
 	rt.block_on(async {
 		if let Some(metrics) = arg_tup.10.otlp.clone() {
@@ -1730,6 +1759,7 @@ fn main() {
 			let dl_sem = arg_tup.8.clone();
 			let buf_sem = arg_tup.9.clone();
 			let resp_cache = arg_tup.7.clone();
+			let negative_cache = arg_tup.12.clone();
 			let dns = arg_tup.6.clone();
 			let max_encode = max_concurrent_encode;
 			let max_dl = arg_tup.1.max_concurrent_downloads;
@@ -1797,6 +1827,7 @@ fn main() {
 					let cpu_active = max_encode - encode_sem.available_permits();
 					let buf_used = max_buf - buf_sem.available_permits();
 					let (cache_entries, cache_bytes) = resp_cache.stats();
+					let negative_cache_entries = negative_cache.len();
 					let (cache_capacity_evictions, cache_expired_evictions) =
 						resp_cache.swap_reset_evictions();
 					let dns_entries = dns.len();
@@ -1816,6 +1847,7 @@ fn main() {
 						cache_bytes = cache_bytes as u64,
 						cache_capacity_evictions,
 						cache_expired_evictions,
+						negative_cache_entries = negative_cache_entries as u64,
 						dns_entries = dns_entries as u64,
 						dns_retry_attempts,
 						dns_retry_saved,
@@ -2996,6 +3028,48 @@ fn build_stale_response(
 	}
 	(axum::http::StatusCode::OK, headers, cached.body.clone()).into_response()
 }
+
+fn build_negative_response(
+	status: u16,
+	params: &RequestParams,
+	config: &ConfigFile,
+	dummy_img: &Arc<Vec<u8>>,
+) -> axum::response::Response {
+	let mut headers = HeaderMap::new();
+	if let Ok(value) = params.url.parse() {
+		headers.append("X-Remote-Url", value);
+	}
+	headers.append("X-Proxy-Error", format!("status:{status}").parse().unwrap());
+	headers.append("Cache-Control", "no-store".parse().unwrap());
+	headers.append("X-Content-Type-Options", "nosniff".parse().unwrap());
+	headers.append(
+		"Vary",
+		if config.encode_avif {
+			"Accept,Range".parse().unwrap()
+		} else {
+			"Range".parse().unwrap()
+		},
+	);
+	for line in &config.append_headers {
+		if let Some(idx) = line.find(':') {
+			if idx + 1 < line.len() {
+				if let Ok(name) = axum::http::HeaderName::from_str(&line[..idx]) {
+					if let Ok(value) = line[idx + 1..].parse() {
+						headers.append(name, value);
+					}
+				}
+			}
+		}
+	}
+	if params.fallback.is_some() {
+		headers.append("Content-Type", "image/png".parse().unwrap());
+		(axum::http::StatusCode::OK, headers, (**dummy_img).clone()).into_response()
+	} else {
+		let status =
+			axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+		(status, headers).into_response()
+	}
+}
 struct ActiveRequestGuard {
 	metrics: Arc<OtlpMetrics>,
 	started: Instant,
@@ -3058,6 +3132,7 @@ async fn get_file_inner(
 		buffer_budget,
 		global_stats,
 		host_throttle,
+		negative_cache,
 	): AppState,
 	axum::extract::Query(q): axum::extract::Query<RequestParams>,
 ) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
@@ -3312,6 +3387,33 @@ async fn get_file_inner(
 			return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 		}
 	};
+	let negative_key = reqwest::Url::parse(&q.url)
+		.map(|url| url.to_string())
+		.unwrap_or_else(|_| q.url.clone());
+	if !has_range {
+		if let Some(entry) = negative_cache.get(&negative_key) {
+			if let Ok(mut t) = timings.lock() {
+				t.cache_result = Some(CacheResult::Negative);
+			}
+			let response = build_negative_response(entry.status, &q, &config, &dummy_img);
+			if let Ok(t) = timings.lock() {
+				emit_summary(
+					&config,
+					&summary,
+					&t,
+					response.status().as_u16(),
+					true,
+					Some(if entry.status == 404 {
+						"status:404"
+					} else {
+						"status:410"
+					}),
+					&global_stats,
+				);
+			}
+			return Err(response);
+		}
+	}
 
 	// --- ダウンロードpermit取得(取得順序: DL permit → バイト予算 → CPU permit) ---
 	let wait_start = Instant::now();
@@ -3773,6 +3875,9 @@ async fn get_file_inner(
 	let remote_headers = resp.headers();
 	if let Ok(mut t) = timings.lock() {
 		t.upstream_status = Some(resp.status().as_u16());
+	}
+	if !has_range {
+		negative_cache.put(negative_key, resp.status().as_u16());
 	}
 	add_remote_header("Content-Disposition", &mut headers, remote_headers);
 	add_remote_header("Content-Type", &mut headers, remote_headers);
@@ -4952,6 +5057,48 @@ mod network_policy_tests {
 	}
 
 	#[test]
+	fn negative_cache_response_preserves_status_and_disables_client_caching() {
+		let config = base_config();
+		let params = RequestParams {
+			url: "https://example.com/missing.png".to_owned(),
+			r#static: None,
+			emoji: None,
+			avatar: None,
+			preview: None,
+			badge: None,
+			fallback: None,
+		};
+		let response = build_negative_response(404, &params, &config, &Arc::new(vec![1, 2, 3]));
+		assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+		assert_eq!(
+			response.headers().get("X-Proxy-Error").unwrap(),
+			"status:404"
+		);
+		assert_eq!(response.headers().get("Cache-Control").unwrap(), "no-store");
+	}
+
+	#[test]
+	fn negative_cache_response_honors_fallback() {
+		let config = base_config();
+		let params = RequestParams {
+			url: "https://example.com/gone.png".to_owned(),
+			r#static: None,
+			emoji: None,
+			avatar: None,
+			preview: None,
+			badge: None,
+			fallback: Some("1".to_owned()),
+		};
+		let response = build_negative_response(410, &params, &config, &Arc::new(vec![1, 2, 3]));
+		assert_eq!(response.status(), axum::http::StatusCode::OK);
+		assert_eq!(response.headers().get("Content-Type").unwrap(), "image/png");
+		assert_eq!(
+			response.headers().get("X-Proxy-Error").unwrap(),
+			"status:410"
+		);
+	}
+
+	#[test]
 	fn host_throttle_reduces_rate_on_429_and_recovers_on_success() {
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
@@ -5086,6 +5233,9 @@ mod network_policy_tests {
 			cache_max_bytes: default_cache_max_bytes(),
 			cache_entry_max_bytes: default_cache_entry_max_bytes(),
 			cache_ttl_secs: default_cache_ttl_secs(),
+			negative_cache_404_ttl_secs: default_negative_cache_404_ttl_secs(),
+			negative_cache_410_ttl_secs: default_negative_cache_410_ttl_secs(),
+			negative_cache_max_entries: default_negative_cache_max_entries(),
 			passthrough_max_bytes: default_passthrough_max_bytes(),
 			dns_negative_ttl_secs: default_dns_negative_ttl_secs(),
 			dns_timeout_ms: default_dns_timeout_ms(),

@@ -91,6 +91,7 @@ pub enum CacheResult {
 	Hit,
 	Miss,
 	Joined,
+	Negative,
 	/// キャッシュ無効、または Range リクエスト等でキャッシュ対象外。
 	Bypass,
 	/// TTL切れのstaleエントリをフェッチ失敗時に返した。
@@ -102,6 +103,7 @@ impl std::fmt::Display for CacheResult {
 			CacheResult::Hit => write!(f, "hit"),
 			CacheResult::Miss => write!(f, "miss"),
 			CacheResult::Joined => write!(f, "joined"),
+			CacheResult::Negative => write!(f, "negative"),
 			CacheResult::Bypass => write!(f, "bypass"),
 			CacheResult::Stale => write!(f, "stale"),
 		}
@@ -324,5 +326,121 @@ impl Drop for FlightGuard {
 				inflight.remove(&self.key);
 			}
 		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NegativeEntry {
+	pub status: u16,
+	expires_at: Instant,
+}
+
+pub struct NegativeCacheConfig {
+	pub enabled: bool,
+	pub max_entries: usize,
+	pub not_found_ttl: Duration,
+	pub gone_ttl: Duration,
+}
+
+pub struct NegativeCache {
+	config: NegativeCacheConfig,
+	entries: Mutex<IndexMap<String, NegativeEntry>>,
+}
+
+impl NegativeCache {
+	pub fn new(config: NegativeCacheConfig) -> Self {
+		Self {
+			config,
+			entries: Mutex::new(IndexMap::new()),
+		}
+	}
+
+	pub fn get(&self, url: &str) -> Option<NegativeEntry> {
+		if !self.config.enabled {
+			return None;
+		}
+		let mut entries = self.entries.lock().ok()?;
+		let entry = *entries.get(url)?;
+		if Instant::now() >= entry.expires_at {
+			entries.shift_remove(url);
+			return None;
+		}
+		let from = entries.get_index_of(url)?;
+		let to = entries.len() - 1;
+		entries.move_index(from, to);
+		Some(entry)
+	}
+
+	pub fn put(&self, url: String, status: u16) -> bool {
+		if !self.config.enabled || self.config.max_entries == 0 {
+			return false;
+		}
+		let ttl = match status {
+			404 => self.config.not_found_ttl,
+			410 => self.config.gone_ttl,
+			_ => return false,
+		};
+		if ttl.is_zero() {
+			return false;
+		}
+		let Ok(mut entries) = self.entries.lock() else {
+			return false;
+		};
+		entries.shift_remove(&url);
+		while entries.len() >= self.config.max_entries {
+			entries.shift_remove_index(0);
+		}
+		entries.insert(
+			url,
+			NegativeEntry {
+				status,
+				expires_at: Instant::now() + ttl,
+			},
+		);
+		true
+	}
+
+	pub fn len(&self) -> usize {
+		self.entries
+			.lock()
+			.map(|entries| entries.len())
+			.unwrap_or(0)
+	}
+}
+
+#[cfg(test)]
+mod negative_cache_tests {
+	use super::*;
+
+	#[test]
+	fn caches_only_404_and_410_with_status_specific_ttl() {
+		let cache = NegativeCache::new(NegativeCacheConfig {
+			enabled: true,
+			max_entries: 4,
+			not_found_ttl: Duration::ZERO,
+			gone_ttl: Duration::from_secs(60),
+		});
+		assert!(!cache.put("https://example.com/404".into(), 404));
+		assert!(cache.put("https://example.com/410".into(), 410));
+		assert!(!cache.put("https://example.com/429".into(), 429));
+		assert!(cache.get("https://example.com/404").is_none());
+		assert_eq!(cache.get("https://example.com/410").unwrap().status, 410);
+	}
+
+	#[test]
+	fn evicts_least_recently_used_entry_at_capacity() {
+		let cache = NegativeCache::new(NegativeCacheConfig {
+			enabled: true,
+			max_entries: 2,
+			not_found_ttl: Duration::from_secs(60),
+			gone_ttl: Duration::from_secs(60),
+		});
+		assert!(cache.put("https://example.com/a".into(), 404));
+		assert!(cache.put("https://example.com/b".into(), 404));
+		assert!(cache.get("https://example.com/a").is_some());
+		assert!(cache.put("https://example.com/c".into(), 404));
+		assert!(cache.get("https://example.com/b").is_none());
+		assert!(cache.get("https://example.com/a").is_some());
+		assert!(cache.get("https://example.com/c").is_some());
 	}
 }

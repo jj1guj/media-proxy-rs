@@ -1528,9 +1528,11 @@ mod tests {
 		default_cache_ttl_secs, default_connect_timeout_ms, default_dns_cache_max_entries,
 		default_dns_negative_ttl_secs, default_dns_timeout_ms, default_dns_ttl_secs,
 		default_fetch_retry_delay_ms, default_inflight_buffer_budget, default_jpeg_quality,
-		default_max_concurrent_downloads, default_otlp_export_interval_ms,
-		default_otlp_service_name, default_passthrough_max_bytes, default_slow_log_ms,
-		default_webp_method, ConfigFile, FilterType, GlobalStats, PhaseTimings, RequestParams,
+		default_max_concurrent_downloads, default_negative_cache_404_ttl_secs,
+		default_negative_cache_410_ttl_secs, default_negative_cache_max_entries,
+		default_otlp_export_interval_ms, default_otlp_service_name, default_passthrough_max_bytes,
+		default_slow_log_ms, default_webp_method, ConfigFile, FilterType, GlobalStats,
+		PhaseTimings, RequestParams,
 	};
 
 	fn png_chunk(ctype: &[u8; 4], data: &[u8]) -> Vec<u8> {
@@ -1809,6 +1811,9 @@ mod tests {
 				cache_max_bytes: default_cache_max_bytes(),
 				cache_entry_max_bytes: default_cache_entry_max_bytes(),
 				cache_ttl_secs: default_cache_ttl_secs(),
+				negative_cache_404_ttl_secs: default_negative_cache_404_ttl_secs(),
+				negative_cache_410_ttl_secs: default_negative_cache_410_ttl_secs(),
+				negative_cache_max_entries: default_negative_cache_max_entries(),
 				passthrough_max_bytes: default_passthrough_max_bytes(),
 				dns_negative_ttl_secs: default_dns_negative_ttl_secs(),
 				dns_timeout_ms: default_dns_timeout_ms(),
