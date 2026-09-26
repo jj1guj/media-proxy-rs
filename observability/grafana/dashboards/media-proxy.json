@@ -1676,7 +1676,7 @@
                     "kind": "DataQuery",
                     "spec": {
                       "editorMode": "code",
-                      "expr": "100 * sum(rate(media_proxy_cache_requests_total{result=~\"hit|joined\"}[1m])) / clamp_min(sum(rate(media_proxy_cache_requests_total{result=~\"hit|joined|miss\"}[1m])), 0.001)",
+                      "expr": "100 * sum(rate(media_proxy_cache_requests_total{result=~\"hit|joined\"}[1m])) / clamp_min(sum(rate(media_proxy_cache_requests_total{result=~\"hit|joined|miss|evicted\"}[1m])), 0.001)",
                       "legendFormat": "Hit rate",
                       "range": true
                     },

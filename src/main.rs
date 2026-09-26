@@ -864,6 +864,7 @@ struct GlobalStats {
 	errors: AtomicU64,
 	cache_hits: AtomicU64,
 	cache_misses: AtomicU64,
+	cache_evicted_reaccesses: AtomicU64,
 	ferr_connect: AtomicU64,
 	ferr_timeout: AtomicU64,
 	ferr_dns: AtomicU64,
@@ -928,6 +929,7 @@ impl GlobalStats {
 			errors: AtomicU64::new(0),
 			cache_hits: AtomicU64::new(0),
 			cache_misses: AtomicU64::new(0),
+			cache_evicted_reaccesses: AtomicU64::new(0),
 			ferr_connect: AtomicU64::new(0),
 			ferr_timeout: AtomicU64::new(0),
 			ferr_dns: AtomicU64::new(0),
@@ -1080,6 +1082,10 @@ impl GlobalStats {
 		}
 	}
 	fn observe_request(&self, timings: &PhaseTimings, is_static_path: bool) {
+		if matches!(timings.cache_result, Some(CacheResult::Evicted)) {
+			self.cache_evicted_reaccesses
+				.fetch_add(1, Ordering::Relaxed);
+		}
 		let dl_wait_ms = timings.dl_wait.as_millis() as u64;
 		let cpu_wait_ms = timings.cpu_wait.as_millis() as u64;
 		self.dl_wait_ms.fetch_add(dl_wait_ms, Ordering::Relaxed);
@@ -1104,7 +1110,7 @@ impl GlobalStats {
 				Some(CacheResult::Hit) => {
 					self.static_hits.fetch_add(1, Ordering::Relaxed);
 				}
-				Some(CacheResult::Miss) => {
+				Some(CacheResult::Miss | CacheResult::Evicted) => {
 					self.static_misses.fetch_add(1, Ordering::Relaxed);
 				}
 				Some(CacheResult::Joined) => {
@@ -1770,6 +1776,8 @@ fn main() {
 				loop {
 					interval.tick().await;
 					let (reqs, errs, hits, misses) = stats.swap_reset();
+					let cache_evicted_reaccesses =
+						stats.cache_evicted_reaccesses.swap(0, Ordering::Relaxed);
 					let (fc, ft, fd, fr, fb, fth, fo) = stats.swap_reset_ferr();
 					let (retry_att, retry_sav) = stats.swap_reset_retry();
 					let (http1, http2) = stats.swap_reset_http();
@@ -1837,6 +1845,7 @@ fn main() {
 						errors = errs,
 						cache_hits = hits,
 						cache_misses = misses,
+						cache_evicted_reaccesses,
 						dl_active = dl_active as u64,
 						dl_max = max_dl as u64,
 						cpu_active = cpu_active as u64,
@@ -2900,6 +2909,9 @@ fn emit_summary(
 		Some(CacheResult::Miss) => {
 			stats.cache_misses.fetch_add(1, Ordering::Relaxed);
 		}
+		Some(CacheResult::Evicted) => {
+			stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+		}
 		Some(CacheResult::Stale) => {
 			stats.cache_stale_served.fetch_add(1, Ordering::Relaxed);
 		}
@@ -3308,6 +3320,7 @@ async fn get_file_inner(
 		None
 	};
 
+	let was_capacity_evicted = !has_range && response_cache.was_capacity_evicted(&cache_key);
 	if let Ok(mut t) = timings.lock() {
 		if t.cache_result.is_none() {
 			t.cache_result = Some(if has_range {
@@ -3523,6 +3536,11 @@ async fn get_file_inner(
 				req
 			}
 		};
+		if was_capacity_evicted {
+			if let Ok(mut t) = timings.lock() {
+				t.cache_result = Some(CacheResult::Evicted);
+			}
+		}
 		let resp = match build_req().send().await {
 			Ok(resp) => {
 				if let Ok(mut t) = timings.lock() {
@@ -4711,7 +4729,12 @@ mod metrics_tests {
 		assert_eq!(stats.output_jpeg.load(Ordering::Relaxed), 1);
 		assert_eq!(stats.processed_input_bytes.load(Ordering::Relaxed), 1800);
 		assert_eq!(stats.processed_output_bytes.load(Ordering::Relaxed), 900);
-		for result in [CacheResult::Hit, CacheResult::Miss, CacheResult::Joined] {
+		for result in [
+			CacheResult::Hit,
+			CacheResult::Miss,
+			CacheResult::Joined,
+			CacheResult::Evicted,
+		] {
 			stats.observe_request(
 				&PhaseTimings {
 					cache_result: Some(result),
@@ -4720,10 +4743,11 @@ mod metrics_tests {
 				true,
 			);
 		}
-		assert_eq!(stats.static_requests.load(Ordering::Relaxed), 3);
+		assert_eq!(stats.static_requests.load(Ordering::Relaxed), 4);
 		assert_eq!(stats.static_hits.load(Ordering::Relaxed), 1);
-		assert_eq!(stats.static_misses.load(Ordering::Relaxed), 1);
+		assert_eq!(stats.static_misses.load(Ordering::Relaxed), 2);
 		assert_eq!(stats.static_joined.load(Ordering::Relaxed), 1);
+		assert_eq!(stats.cache_evicted_reaccesses.load(Ordering::Relaxed), 1);
 		stats.record_static_insertion(1234);
 		assert_eq!(stats.static_cache_insertions.load(Ordering::Relaxed), 1);
 		assert_eq!(stats.static_output_bytes.load(Ordering::Relaxed), 1234);
@@ -5530,11 +5554,18 @@ mod cache_tests {
 		);
 		// key1 は追い出されているはず
 		assert!(cache.get(&key1).is_none());
+		assert!(cache.was_capacity_evicted(&key1));
+		assert!(!cache.was_capacity_evicted(&key2));
 		assert!(cache.get(&key2).is_some());
 		assert_eq!(cache.cumulative_evictions(), (1, 0));
 		assert_eq!(cache.swap_reset_evictions(), (1, 0));
 		assert_eq!(cache.swap_reset_evictions(), (0, 0));
 		assert_eq!(cache.cumulative_evictions(), (1, 0));
+		cache.put(
+			key1.clone(),
+			CacheEntry::new(200, None, None, None, vec![0; 300]),
+		);
+		assert!(!cache.was_capacity_evicted(&key1));
 	}
 	#[test]
 	fn singleflight_count_tracks_active_guards() {

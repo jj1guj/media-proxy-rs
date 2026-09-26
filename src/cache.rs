@@ -7,6 +7,9 @@ use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
 
+const EVICTION_HISTORY_MAX_ENTRIES: usize = 65_536;
+const EVICTION_HISTORY_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// キャッシュキー: 正規化URL + 画像系パラメータ + avif 有無。
 /// fallback はキーに含めない(結果に影響しないため)。
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -20,7 +23,7 @@ pub struct CacheKey {
 	pub accept_avif: bool,
 }
 impl CacheKey {
-	pub fn fingerprint(&self) -> String {
+	fn fingerprint_digest(&self) -> [u8; 16] {
 		let mut input = Vec::with_capacity(8 + self.url.len() + 6);
 		input.extend_from_slice(&(self.url.len() as u64).to_be_bytes());
 		input.extend_from_slice(self.url.as_bytes());
@@ -32,7 +35,17 @@ impl CacheKey {
 			self.badge as u8,
 			self.accept_avif as u8,
 		]);
-		fingerprint_bytes(&input)
+		let digest = Sha256::digest(&input);
+		let mut fingerprint = [0; 16];
+		fingerprint.copy_from_slice(&digest[..16]);
+		fingerprint
+	}
+
+	pub fn fingerprint(&self) -> String {
+		self.fingerprint_digest()
+			.iter()
+			.map(|byte| format!("{:02x}", byte))
+			.collect()
 	}
 }
 
@@ -92,6 +105,7 @@ pub enum CacheResult {
 	Miss,
 	Joined,
 	Negative,
+	Evicted,
 	/// キャッシュ無効、または Range リクエスト等でキャッシュ対象外。
 	Bypass,
 	/// TTL切れのstaleエントリをフェッチ失敗時に返した。
@@ -104,6 +118,7 @@ impl std::fmt::Display for CacheResult {
 			CacheResult::Miss => write!(f, "miss"),
 			CacheResult::Joined => write!(f, "joined"),
 			CacheResult::Negative => write!(f, "negative"),
+			CacheResult::Evicted => write!(f, "evicted"),
 			CacheResult::Bypass => write!(f, "bypass"),
 			CacheResult::Stale => write!(f, "stale"),
 		}
@@ -117,6 +132,8 @@ pub struct ResponseCache {
 	entries: Mutex<LruInner>,
 	/// singleflight: 処理中のキーに対する broadcast sender。
 	inflight: Mutex<HashMap<CacheKey, broadcast::Sender<Option<CacheEntry>>>>,
+	/// 容量追い出し後の再アクセスを識別する、本文を持たないキー指紋履歴。
+	evicted_keys: Mutex<IndexMap<[u8; 16], Instant>>,
 	capacity_evictions: AtomicU64,
 	expired_evictions: AtomicU64,
 	capacity_evictions_total: AtomicU64,
@@ -137,6 +154,7 @@ impl ResponseCache {
 				total_bytes: 0,
 			}),
 			inflight: Mutex::new(HashMap::new()),
+			evicted_keys: Mutex::new(IndexMap::new()),
 			capacity_evictions: AtomicU64::new(0),
 			expired_evictions: AtomicU64::new(0),
 			capacity_evictions_total: AtomicU64::new(0),
@@ -204,6 +222,9 @@ impl ResponseCache {
 		let Ok(mut inner) = self.entries.lock() else {
 			return false;
 		};
+		if let Ok(mut evicted_keys) = self.evicted_keys.lock() {
+			evicted_keys.shift_remove(&key.fingerprint_digest());
+		}
 		// 既存エントリがあれば削除してサイズ回収
 		if let Some(old) = inner.map.shift_remove(&key) {
 			inner.total_bytes = inner.total_bytes.saturating_sub(old.size);
@@ -223,8 +244,9 @@ impl ResponseCache {
 		}
 		// 容量に収まるまで先頭(最古)から追い出し
 		while inner.total_bytes + entry.size > self.config.max_bytes && !inner.map.is_empty() {
-			if let Some((_, evicted)) = inner.map.shift_remove_index(0) {
+			if let Some((evicted_key, evicted)) = inner.map.shift_remove_index(0) {
 				inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
+				self.record_capacity_eviction(&evicted_key);
 				self.capacity_evictions.fetch_add(1, Ordering::Relaxed);
 				self.capacity_evictions_total
 					.fetch_add(1, Ordering::Relaxed);
@@ -232,6 +254,39 @@ impl ResponseCache {
 		}
 		inner.total_bytes += entry.size;
 		inner.map.insert(key, entry);
+		true
+	}
+
+	fn record_capacity_eviction(&self, key: &CacheKey) {
+		let Ok(mut evicted_keys) = self.evicted_keys.lock() else {
+			return;
+		};
+		let fingerprint = key.fingerprint_digest();
+		evicted_keys.shift_remove(&fingerprint);
+		while evicted_keys.len() >= EVICTION_HISTORY_MAX_ENTRIES {
+			evicted_keys.shift_remove_index(0);
+		}
+		evicted_keys.insert(fingerprint, Instant::now());
+	}
+
+	pub fn was_capacity_evicted(&self, key: &CacheKey) -> bool {
+		if !self.config.enabled {
+			return false;
+		}
+		let Ok(mut evicted_keys) = self.evicted_keys.lock() else {
+			return false;
+		};
+		let fingerprint = key.fingerprint_digest();
+		let Some(evicted_at) = evicted_keys.get(&fingerprint).copied() else {
+			return false;
+		};
+		if evicted_at.elapsed() >= EVICTION_HISTORY_TTL {
+			evicted_keys.shift_remove(&fingerprint);
+			return false;
+		}
+		let from = evicted_keys.get_index_of(&fingerprint).unwrap();
+		let to = evicted_keys.len() - 1;
+		evicted_keys.move_index(from, to);
 		true
 	}
 

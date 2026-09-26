@@ -174,7 +174,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_decode_duration`          | Histogram     | decode時間                                     |
 | `media_proxy_encode_duration`          | Histogram     | encode時間                                     |
 
-キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative` の6種類です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
+キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative`、`evicted` の7種類です。`evicted`は過去24時間以内に容量不足で追い出されたキーが再び要求され、上流取得へ進んだことを示します。60秒ごとのINFO統計ログでは`cache_capacity_evictions`が追い出し件数、`cache_evicted_reaccesses`が追い出し後の上流再取得件数です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss + evicted)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
 
 | メトリクス                                   | 種別      | 内容                                   |
 | -------------------------------------------- | --------- | -------------------------------------- |
