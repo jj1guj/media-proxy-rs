@@ -2,7 +2,7 @@
   "bind_addr": "0.0.0.0:12766",
   "timeout": 30000,
   "user_agent": "https://github.com/jj1guj/media-proxy-rs",
-  "max_size": 67108864,
+  "max_size": 134217728,
   "proxy": null,
   "filter_type": "Triangle",
   "max_pixels": 2048,
