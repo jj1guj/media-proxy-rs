@@ -16,7 +16,7 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock, Semaphore};
 use tokio_stream::StreamExt;
 
 #[cfg(feature = "avif-decoder")]
@@ -35,12 +35,18 @@ const HOST_THROTTLE_FALLBACK_COOLDOWN: Duration = Duration::from_secs(5);
 const HOST_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(60);
 const HOST_THROTTLE_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 
+fn default_host_throttle_queue_capacity() -> usize {
+	64
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HostThrottleConfig {
 	requests_per_second: f64,
 	burst: u32,
 	max_wait_ms: u64,
 	max_hosts: usize,
+	#[serde(default = "default_host_throttle_queue_capacity")]
+	queue_capacity: usize,
 }
 
 struct HostThrottleState {
@@ -50,6 +56,21 @@ struct HostThrottleState {
 	cooldown_until: Instant,
 	consecutive_429: u32,
 	last_seen: Instant,
+	recovering: bool,
+	gate: Arc<AsyncMutex<()>>,
+	queue_slots: Arc<Semaphore>,
+}
+
+struct HostThrottlePermit {
+	waited: Duration,
+	throttled: bool,
+	_gate: Option<OwnedMutexGuard<()>>,
+}
+
+#[derive(Debug)]
+struct HostThrottleRejection {
+	waited: Duration,
+	retry_after: Duration,
 }
 
 struct HostThrottle {
@@ -59,6 +80,7 @@ struct HostThrottle {
 	burst: f64,
 	max_wait: Duration,
 	max_hosts: usize,
+	queue_capacity: usize,
 	states: AsyncMutex<HashMap<String, HostThrottleState>>,
 }
 
@@ -76,15 +98,25 @@ impl HostThrottle {
 		if config.max_hosts == 0 {
 			return Err("host_throttle.max_hosts must be greater than 0".to_owned());
 		}
+		if config.queue_capacity == 0 {
+			return Err("host_throttle.queue_capacity must be greater than 0".to_owned());
+		}
 		Ok(Self::with_limits(
 			config.requests_per_second,
 			config.burst,
 			Duration::from_millis(config.max_wait_ms),
 			config.max_hosts,
+			config.queue_capacity,
 		))
 	}
 
-	fn with_limits(rate_per_second: f64, burst: u32, max_wait: Duration, max_hosts: usize) -> Self {
+	fn with_limits(
+		rate_per_second: f64,
+		burst: u32,
+		max_wait: Duration,
+		max_hosts: usize,
+		queue_capacity: usize,
+	) -> Self {
 		Self {
 			max_rate_per_second: rate_per_second,
 			min_rate_per_second: rate_per_second.min(0.25),
@@ -92,6 +124,7 @@ impl HostThrottle {
 			burst: f64::from(burst),
 			max_wait,
 			max_hosts,
+			queue_capacity,
 			states: AsyncMutex::new(HashMap::new()),
 		}
 	}
@@ -125,21 +158,72 @@ impl HostThrottle {
 			cooldown_until: now,
 			consecutive_429: 0,
 			last_seen: now,
+			recovering: false,
+			gate: Arc::new(AsyncMutex::new(())),
+			queue_slots: Arc::new(Semaphore::new(self.queue_capacity)),
 		})
 	}
 
-	async fn acquire(&self, url: &reqwest::Url) -> Result<Duration, Duration> {
+	async fn acquire(
+		&self,
+		url: &reqwest::Url,
+		wait_budget: Duration,
+	) -> Result<HostThrottlePermit, HostThrottleRejection> {
 		let Some(host) = Self::host_key(url) else {
-			return Ok(Duration::ZERO);
+			return Ok(HostThrottlePermit {
+				waited: Duration::ZERO,
+				throttled: false,
+				_gate: None,
+			});
 		};
 
 		let started = Instant::now();
+		let (gate, queue_slots, retry_after) = {
+			let mut states = self.states.lock().await;
+			let now = Instant::now();
+			let state = self.state_for_host(&mut states, &host, now);
+			state.last_seen = now;
+			if !state.recovering {
+				return Ok(HostThrottlePermit {
+					waited: Duration::ZERO,
+					throttled: false,
+					_gate: None,
+				});
+			}
+			(
+				state.gate.clone(),
+				state.queue_slots.clone(),
+				state.cooldown_until.saturating_duration_since(now),
+			)
+		};
+		let max_wait = self.max_wait.min(wait_budget);
+		let _queue_slot = queue_slots
+			.try_acquire_owned()
+			.map_err(|_| HostThrottleRejection {
+				waited: Duration::ZERO,
+				retry_after: retry_after.max(Duration::from_secs(1)),
+			})?;
+		let gate_guard = tokio::time::timeout(max_wait, gate.lock_owned())
+			.await
+			.map_err(|_| HostThrottleRejection {
+				waited: started.elapsed(),
+				retry_after: Duration::from_secs(1),
+			})?;
 		loop {
 			let sleep_for = {
 				let mut states = self.states.lock().await;
 				let now = Instant::now();
 				let state = self.state_for_host(&mut states, &host, now);
-				let refill_seconds = now.duration_since(state.last_refill).as_secs_f64();
+				if !state.recovering {
+					return Ok(HostThrottlePermit {
+						waited: started.elapsed(),
+						throttled: true,
+						_gate: None,
+					});
+				}
+				let refill_seconds = now
+					.saturating_duration_since(state.last_refill)
+					.as_secs_f64();
 				state.tokens =
 					(state.tokens + refill_seconds * state.rate_per_second).min(self.burst);
 				state.last_refill = now;
@@ -147,7 +231,11 @@ impl HostThrottle {
 
 				if now >= state.cooldown_until && state.tokens >= 1.0 {
 					state.tokens -= 1.0;
-					return Ok(started.elapsed());
+					return Ok(HostThrottlePermit {
+						waited: started.elapsed(),
+						throttled: true,
+						_gate: Some(gate_guard),
+					});
 				}
 
 				let cooldown_wait = state.cooldown_until.saturating_duration_since(now);
@@ -160,9 +248,12 @@ impl HostThrottle {
 			};
 
 			let elapsed = started.elapsed();
-			let remaining = self.max_wait.saturating_sub(elapsed);
+			let remaining = max_wait.saturating_sub(elapsed);
 			if sleep_for > remaining || remaining.is_zero() {
-				return Err(elapsed);
+				return Err(HostThrottleRejection {
+					waited: elapsed,
+					retry_after: sleep_for.max(Duration::from_secs(1)),
+				});
 			}
 			tokio::time::sleep(sleep_for).await;
 		}
@@ -173,6 +264,7 @@ impl HostThrottle {
 		url: &reqwest::Url,
 		status: reqwest::StatusCode,
 		headers: &reqwest::header::HeaderMap,
+		was_throttled: bool,
 	) {
 		let Some(host) = Self::host_key(url) else {
 			return;
@@ -183,9 +275,10 @@ impl HostThrottle {
 		let state = self.state_for_host(&mut states, &host, now);
 		state.last_seen = now;
 		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			state.recovering = true;
 			state.consecutive_429 = state.consecutive_429.saturating_add(1);
 			state.rate_per_second = (state.rate_per_second * 0.5).max(self.min_rate_per_second);
-			state.tokens = 0.0;
+			state.tokens = 1.0;
 			let retry_after = parse_retry_after(headers).unwrap_or_else(|| {
 				let shift = state.consecutive_429.saturating_sub(1).min(4);
 				let exponential = (HOST_THROTTLE_FALLBACK_COOLDOWN * (1 << shift))
@@ -204,10 +297,14 @@ impl HostThrottle {
 				consecutive_429 = state.consecutive_429,
 				"host throttle cooldown activated"
 			);
-		} else if status.is_success() {
+		} else if status.is_success() && state.recovering && was_throttled {
 			state.consecutive_429 = 0;
 			state.rate_per_second =
 				(state.rate_per_second + self.recovery_per_success).min(self.max_rate_per_second);
+			if state.rate_per_second >= self.max_rate_per_second {
+				state.recovering = false;
+				state.tokens = self.burst;
+			}
 		}
 	}
 
@@ -220,6 +317,18 @@ impl HostThrottle {
 			.get(&host)
 			.map(|state| state.rate_per_second)
 	}
+
+	#[cfg(test)]
+	async fn is_recovering(&self, url: &reqwest::Url) -> bool {
+		let Some(host) = Self::host_key(url) else {
+			return false;
+		};
+		self.states
+			.lock()
+			.await
+			.get(&host)
+			.is_some_and(|state| state.recovering)
+	}
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -230,6 +339,23 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 	let retry_at = httpdate::parse_http_date(value).ok()?;
 	let duration = retry_at.duration_since(SystemTime::now()).ok()?;
 	(!duration.is_zero()).then_some(duration)
+}
+
+fn throttle_wait_budget(config: &ConfigFile, request_started: Instant) -> Duration {
+	let request_timeout = Duration::from_millis(config.timeout);
+	let fetch_reserve = Duration::from_millis(config.connect_timeout_ms.min(config.timeout));
+	request_timeout
+		.saturating_sub(request_started.elapsed())
+		.saturating_sub(fetch_reserve)
+}
+
+fn response_retry_after(wait: Duration) -> axum::http::HeaderValue {
+	let seconds = wait
+		.as_secs()
+		.saturating_add(u64::from(wait.subsec_nanos() > 0))
+		.max(1);
+	axum::http::HeaderValue::from_str(&seconds.to_string())
+		.unwrap_or_else(|_| axum::http::HeaderValue::from_static("1"))
 }
 
 struct OtlpMetrics {
@@ -864,19 +990,19 @@ impl GlobalStats {
 			}
 		}
 	}
-	fn observe_host_throttle(&self, result: &Result<Duration, Duration>) {
+	fn observe_host_throttle(&self, result: &Result<HostThrottlePermit, HostThrottleRejection>) {
 		let (outcome, wait) = match result {
-			Ok(wait) if wait.is_zero() => {
+			Ok(permit) if !permit.throttled => {
 				self.throttle_passed.fetch_add(1, Ordering::Relaxed);
-				("passed", *wait)
+				("passed", permit.waited)
 			}
-			Ok(wait) => {
+			Ok(permit) => {
 				self.throttle_waited.fetch_add(1, Ordering::Relaxed);
-				("waited", *wait)
+				("waited", permit.waited)
 			}
-			Err(wait) => {
+			Err(rejection) => {
 				self.throttle_rejected.fetch_add(1, Ordering::Relaxed);
-				("rejected", *wait)
+				("rejected", rejection.waited)
 			}
 		};
 		let wait_ms = wait.as_millis() as u64;
@@ -2874,6 +3000,7 @@ async fn get_file_inner(
 	): AppState,
 	axum::extract::Query(q): axum::extract::Query<RequestParams>,
 ) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+	let request_started = Instant::now();
 	let timings = Arc::new(Mutex::new(PhaseTimings::default()));
 
 	// Range リクエストはキャッシュ対象外
@@ -3182,37 +3309,43 @@ async fn get_file_inner(
 	let mut partial_image_response = None;
 	let mut throttle_wait_total = Duration::ZERO;
 	let resp = loop {
-		let throttle_wait = if let Some(throttle) = &host_throttle {
-			throttle.acquire(&current_url).await
-		} else {
-			Ok(Duration::ZERO)
-		};
-		if host_throttle.is_some() {
-			global_stats.observe_host_throttle(&throttle_wait);
-		}
-		let throttle_wait = match throttle_wait {
-			Ok(wait) => wait,
-			Err(wait) => {
-				if let Ok(mut t) = timings.lock() {
-					t.wait += wait;
-					t.fetch_err = Some("throttle:wait_timeout".to_owned());
-				}
-				headers.append("X-Proxy-Error", "HostThrottleTimeout".parse().unwrap());
-				headers.append("Retry-After", "1".parse().unwrap());
-				if let Ok(t) = timings.lock() {
-					emit_summary(
-						&config,
-						&summary,
-						&t,
-						503,
-						true,
-						Some("HostThrottleTimeout"),
-						&global_stats,
+		let mut throttle_permit = if let Some(throttle) = &host_throttle {
+			let result = throttle
+				.acquire(&current_url, throttle_wait_budget(&config, request_started))
+				.await;
+			global_stats.observe_host_throttle(&result);
+			match result {
+				Ok(permit) => Some(permit),
+				Err(rejection) => {
+					if let Ok(mut t) = timings.lock() {
+						t.wait += rejection.waited;
+						t.fetch_err = Some("throttle:wait_timeout".to_owned());
+					}
+					headers.append("X-Proxy-Error", "HostThrottleTimeout".parse().unwrap());
+					headers.append("Retry-After", response_retry_after(rejection.retry_after));
+					if let Ok(t) = timings.lock() {
+						emit_summary(
+							&config,
+							&summary,
+							&t,
+							503,
+							true,
+							Some("HostThrottleTimeout"),
+							&global_stats,
+						);
+					}
+					return Err(
+						(axum::http::StatusCode::SERVICE_UNAVAILABLE, headers).into_response()
 					);
 				}
-				return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers).into_response());
 			}
+		} else {
+			None
 		};
+		let throttle_wait = throttle_permit
+			.as_ref()
+			.map(|permit| permit.waited)
+			.unwrap_or_default();
 		throttle_wait_total += throttle_wait;
 		if let Ok(mut t) = timings.lock() {
 			t.wait += throttle_wait;
@@ -3239,6 +3372,7 @@ async fn get_file_inner(
 				partial_image_response.take().unwrap()
 			}
 			Err(e) => {
+				drop(throttle_permit.take());
 				let first_err = classify_reqwest_error(&e);
 				let is_connect_phase = e.is_connect() || e.is_timeout();
 				// 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
@@ -3251,39 +3385,47 @@ async fn get_file_inner(
 						metrics.fetch_retry_attempts.add(1, &[]);
 					}
 					tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
-					let retry_throttle_wait = if let Some(throttle) = &host_throttle {
-						throttle.acquire(&current_url).await
-					} else {
-						Ok(Duration::ZERO)
-					};
-					if host_throttle.is_some() {
-						global_stats.observe_host_throttle(&retry_throttle_wait);
-					}
-					let retry_throttle_wait = match retry_throttle_wait {
-						Ok(wait) => wait,
-						Err(wait) => {
-							if let Ok(mut t) = timings.lock() {
-								t.wait += wait;
-								t.fetch_err = Some("throttle:wait_timeout".to_owned());
-								t.retried = true;
-							}
-							headers.append("X-Proxy-Error", "HostThrottleTimeout".parse().unwrap());
-							headers.append("Retry-After", "1".parse().unwrap());
-							if let Ok(t) = timings.lock() {
-								emit_summary(
-									&config,
-									&summary,
-									&t,
-									503,
-									true,
-									Some("HostThrottleTimeout"),
-									&global_stats,
+					if let Some(throttle) = &host_throttle {
+						let result = throttle
+							.acquire(&current_url, throttle_wait_budget(&config, request_started))
+							.await;
+						global_stats.observe_host_throttle(&result);
+						throttle_permit = match result {
+							Ok(permit) => Some(permit),
+							Err(rejection) => {
+								if let Ok(mut t) = timings.lock() {
+									t.wait += rejection.waited;
+									t.fetch_err = Some("throttle:wait_timeout".to_owned());
+									t.retried = true;
+								}
+								headers.append(
+									"X-Proxy-Error",
+									"HostThrottleTimeout".parse().unwrap(),
 								);
+								headers.append(
+									"Retry-After",
+									response_retry_after(rejection.retry_after),
+								);
+								if let Ok(t) = timings.lock() {
+									emit_summary(
+										&config,
+										&summary,
+										&t,
+										503,
+										true,
+										Some("HostThrottleTimeout"),
+										&global_stats,
+									);
+								}
+								return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers)
+									.into_response());
 							}
-							return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers)
-								.into_response());
-						}
-					};
+						};
+					}
+					let retry_throttle_wait = throttle_permit
+						.as_ref()
+						.map(|permit| permit.waited)
+						.unwrap_or_default();
 					throttle_wait_total += retry_throttle_wait;
 					if let Ok(mut t) = timings.lock() {
 						t.wait += retry_throttle_wait;
@@ -3392,10 +3534,14 @@ async fn get_file_inner(
 			}
 		};
 		if let Some(throttle) = &host_throttle {
+			let was_throttled = throttle_permit
+				.as_ref()
+				.is_some_and(|permit| permit.throttled);
 			throttle
-				.observe_response(&current_url, resp.status(), resp.headers())
+				.observe_response(&current_url, resp.status(), resp.headers(), was_throttled)
 				.await;
 		}
+		drop(throttle_permit.take());
 		let is_image_response = resp
 			.headers()
 			.get(reqwest::header::CONTENT_TYPE)
@@ -4505,7 +4651,18 @@ mod metrics_tests {
 			.as_ref()
 			.unwrap()
 			.record_completion(503, true, Duration::from_millis(30));
-		stats.observe_host_throttle(&Ok(Duration::from_millis(10)));
+		stats.observe_host_throttle(&Ok(HostThrottlePermit {
+			waited: Duration::from_millis(10),
+			throttled: true,
+			_gate: None,
+		}));
+		stats.observe_host_throttle(&Ok(HostThrottlePermit {
+			waited: Duration::ZERO,
+			throttled: false,
+			_gate: None,
+		}));
+		assert_eq!(stats.throttle_passed.load(Ordering::Relaxed), 1);
+		assert_eq!(stats.throttle_waited.load(Ordering::Relaxed), 1);
 		{
 			let _active = ActiveRequestGuard::new(stats.otlp.as_ref().unwrap().clone());
 		}
@@ -4635,31 +4792,51 @@ mod network_policy_tests {
 	use super::*;
 
 	#[test]
-	fn host_throttle_enforces_burst_and_retry_after() {
+	fn host_throttle_bypasses_until_429_then_waits_and_recovers() {
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
 			.build()
 			.unwrap();
 		runtime.block_on(async {
-			let throttle = HostThrottle::with_limits(1.0, 2, Duration::from_millis(5), 16);
+			let throttle = HostThrottle::with_limits(1.0, 2, Duration::from_secs(2), 16, 8);
 			let target = reqwest::Url::parse("https://throttled.example/image.webp").unwrap();
 			let other = reqwest::Url::parse("https://example.com/image.webp").unwrap();
 
-			assert!(throttle.acquire(&target).await.is_ok());
-			assert!(throttle.acquire(&target).await.is_ok());
-			assert!(throttle.acquire(&target).await.is_err());
-			assert!(throttle.acquire(&other).await.is_ok());
-			assert!(throttle.acquire(&other).await.is_ok());
-			assert!(throttle.acquire(&other).await.is_err());
+			for _ in 0..10 {
+				let permit = throttle
+					.acquire(&target, Duration::from_secs(2))
+					.await
+					.unwrap();
+				assert!(!permit.throttled);
+			}
 
 			let mut headers = reqwest::header::HeaderMap::new();
 			headers.insert(reqwest::header::RETRY_AFTER, "1".parse().unwrap());
 			throttle
-				.observe_response(&target, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers)
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+				)
 				.await;
-			assert!(throttle.acquire(&target).await.is_err());
-			let unaffected = reqwest::Url::parse("https://unaffected.example/image.webp").unwrap();
-			assert!(throttle.acquire(&unaffected).await.is_ok());
+			assert!(throttle.is_recovering(&target).await);
+			let started = Instant::now();
+			let permit = throttle
+				.acquire(&target, Duration::from_secs(2))
+				.await
+				.unwrap();
+			assert!(permit.throttled);
+			assert!(started.elapsed() >= Duration::from_millis(900));
+			let unaffected = throttle
+				.acquire(&other, Duration::from_millis(1))
+				.await
+				.unwrap();
+			assert!(!unaffected.throttled);
+			throttle
+				.observe_response(&target, reqwest::StatusCode::OK, &headers, true)
+				.await;
+			drop(permit);
 		});
 	}
 
@@ -4689,24 +4866,99 @@ mod network_policy_tests {
 			.build()
 			.unwrap();
 		runtime.block_on(async {
-			let throttle = HostThrottle::with_limits(2.0, 30, Duration::from_secs(5), 16);
+			let throttle = HostThrottle::with_limits(2.0, 30, Duration::from_secs(5), 16, 64);
 			let target = reqwest::Url::parse("https://adaptive.example/image.webp").unwrap();
 			let headers = reqwest::header::HeaderMap::new();
 
 			throttle
-				.observe_response(&target, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers)
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+				)
 				.await;
 			assert_eq!(throttle.rate_for(&target).await, Some(1.0));
 			throttle
-				.observe_response(&target, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers)
+				.observe_response(&target, reqwest::StatusCode::OK, &headers, false)
+				.await;
+			assert_eq!(throttle.rate_for(&target).await, Some(1.0));
+			assert!(throttle.is_recovering(&target).await);
+			throttle
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					true,
+				)
 				.await;
 			assert_eq!(throttle.rate_for(&target).await, Some(0.5));
 
-			throttle
-				.observe_response(&target, reqwest::StatusCode::OK, &headers)
-				.await;
-			assert!(throttle.rate_for(&target).await.unwrap() > 0.5);
+			for _ in 0..120 {
+				throttle
+					.observe_response(&target, reqwest::StatusCode::OK, &headers, true)
+					.await;
+			}
+			assert_eq!(throttle.rate_for(&target).await, Some(2.0));
+			assert!(!throttle.is_recovering(&target).await);
 		});
+	}
+
+	#[test]
+	fn host_throttle_fetches_image_after_cooldown() {
+		use std::io::Read as _;
+
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let address = listener.local_addr().unwrap();
+		let server = std::thread::spawn(move || {
+			for status in [429, 200] {
+				let (mut stream, _) = listener.accept().unwrap();
+				let mut request = [0_u8; 1024];
+				let _ = stream.read(&mut request).unwrap();
+				let response = if status == 429 {
+					"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+				} else {
+					"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 5\r\nConnection: close\r\n\r\nimage"
+				};
+				stream.write_all(response.as_bytes()).unwrap();
+			}
+		});
+
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let throttle = HostThrottle::with_limits(1.0, 2, Duration::from_secs(2), 16, 8);
+			let target = reqwest::Url::parse(&format!("http://{address}/image.png")).unwrap();
+			let client = reqwest::Client::new();
+
+			let first_permit = throttle
+				.acquire(&target, Duration::from_secs(2))
+				.await
+				.unwrap();
+			let first = client.get(target.clone()).send().await.unwrap();
+			assert_eq!(first.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+			throttle
+				.observe_response(&target, first.status(), first.headers(), false)
+				.await;
+			drop(first_permit);
+
+			let started = Instant::now();
+			let second_permit = throttle
+				.acquire(&target, Duration::from_secs(2))
+				.await
+				.unwrap();
+			assert!(started.elapsed() >= Duration::from_millis(900));
+			let second = client.get(target.clone()).send().await.unwrap();
+			assert_eq!(second.status(), reqwest::StatusCode::OK);
+			throttle
+				.observe_response(&target, second.status(), second.headers(), true)
+				.await;
+			assert_eq!(second.bytes().await.unwrap().as_ref(), b"image");
+			drop(second_permit);
+		});
+		server.join().unwrap();
 	}
 
 	#[test]
