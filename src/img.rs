@@ -55,11 +55,9 @@ fn decode_embedded_ico_png(
 		if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
 			continue;
 		}
-		let dimensions = image::ImageReader::with_format(
-			std::io::Cursor::new(data),
-			image::ImageFormat::Png,
-		)
-		.into_dimensions();
+		let dimensions =
+			image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Png)
+				.into_dimensions();
 		if let Ok((width, height)) = dimensions {
 			if dimensions_allowed_for(max_decode_pixels, width as u64, height as u64) {
 				candidates.push((width as u64 * height as u64, data));
@@ -70,10 +68,8 @@ fn decode_embedded_ico_png(
 
 	let mut last_error = "no supported embedded PNG".to_owned();
 	for (_, data) in candidates {
-		let mut reader = image::ImageReader::with_format(
-			std::io::Cursor::new(data),
-			image::ImageFormat::Png,
-		);
+		let mut reader =
+			image::ImageReader::with_format(std::io::Cursor::new(data), image::ImageFormat::Png);
 		let mut limits = image::Limits::default();
 		limits.max_alloc = Some(max_alloc);
 		reader.limits(limits);
@@ -1212,14 +1208,10 @@ impl RequestContext {
 					match reader.decode() {
 						Ok(image) => Ok(image),
 						Err(error) if *codec == image::ImageFormat::Ico => {
-							decode_embedded_ico_png(
-								&self.src_bytes,
-								max_decode_pixels,
-								max_alloc,
-							)
-							.map_err(|fallback_error| {
-								format!("{error:?}; IcoPngFallback_{fallback_error}")
-							})
+							decode_embedded_ico_png(&self.src_bytes, max_decode_pixels, max_alloc)
+								.map_err(|fallback_error| {
+									format!("{error:?}; IcoPngFallback_{fallback_error}")
+								})
 						}
 						Err(error) => Err(format!("{error:?}")),
 					}
@@ -1591,11 +1583,9 @@ mod tests {
 	#[test]
 	fn ico_with_non_rgba_png_uses_embedded_png_fallback() {
 		let ico = build_ico_with_grayscale_png();
-		let standard_decode = image::ImageReader::with_format(
-			std::io::Cursor::new(&ico),
-			image::ImageFormat::Ico,
-		)
-		.decode();
+		let standard_decode =
+			image::ImageReader::with_format(std::io::Cursor::new(&ico), image::ImageFormat::Ico)
+				.decode();
 		assert!(standard_decode.is_err());
 
 		let decoded = decode_embedded_ico_png(&ico, 4, 16).unwrap();

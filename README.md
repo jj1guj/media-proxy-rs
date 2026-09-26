@@ -147,7 +147,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 すべての追加項目は `#[serde(default)]` 付きのため、既存の config.json をそのまま使えます。
 
-`host_throttle`を設定した場合、`requests_per_second`、`burst`、`max_wait_ms`、`max_hosts`が必須です。各ホストに独立したToken Bucketを割り当て、429応答に`Retry-After`があれば、その期間は該当ホストへの送信を停止します。
+`host_throttle`を設定した場合、`requests_per_second`、`burst`、`max_wait_ms`、`max_hosts`が必須です。各ホストに独立したToken Bucketを割り当てます。`requests_per_second`は平常時の最大レートです。429応答ごとに該当ホストのレートを半減（下限0.25件/秒）し、成功応答ごとに最大レートへ漸増します。有効な`Retry-After`があればその期間は送信を停止し、0秒または期限切れの場合は5〜60秒の指数バックオフとジッターを使用します。過度なキュー待ちを避けるため、`max_wait_ms`は5000程度を推奨します。
 
 ### OTLP基本メトリクス
 
@@ -189,29 +189,31 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_buffer_limit_bytes`             | Gauge     | 処理中バッファ上限                     |
 | `media_proxy_buffer_wait_duration`           | Histogram | バッファ予算セマフォ待機時間           |
 
-出力形式の属性 `format` は `jpeg`、`png`、`webp`、`avif`、`other` の5種類です。圧縮率は `media_proxy_output_bytes_total / media_proxy_input_bytes_total`、パススルー率は `media_proxy_passthrough_total / media_proxy_requests_total` で算出します。処理エラーの `category` は `decode`、`encode`、`policy`、`size`、`internal`、fetchエラーは `dns`、`connect`、`timeout`、`reset`、`body`、`other` の固定分類です。
+出力形式の属性 `format` は `jpeg`、`png`、`webp`、`avif`、`other` の5種類です。圧縮率は `media_proxy_output_bytes_total / media_proxy_input_bytes_total`、パススルー率は `media_proxy_passthrough_total / media_proxy_requests_total` で算出します。処理エラーの `category` は `decode`、`encode`、`policy`、`size`、`internal`、fetchエラーは `dns`、`connect`、`timeout`、`reset`、`body`、`throttle`、`other` の固定分類です。流量制御結果の`result`は`passed`、`waited`、`rejected`の3種類で、ホスト名は属性に含めません。
 
-| メトリクス                                 | 種別    | 内容                                 |
-| ------------------------------------------ | ------- | ------------------------------------ |
-| `media_proxy_outputs_total`                | Counter | 出力形式別累積数                     |
-| `media_proxy_input_bytes_total`            | Counter | 処理入力バイト累積数                 |
-| `media_proxy_output_bytes_total`           | Counter | 処理出力バイト累積数                 |
-| `media_proxy_passthrough_total`            | Counter | パススルー累積数                     |
-| `media_proxy_processing_errors_total`      | Counter | 画像処理・ポリシーエラー分類別累積数 |
-| `media_proxy_fetch_errors_total`           | Counter | fetchエラー分類別累積数              |
-| `media_proxy_fetch_retry_attempts_total`   | Counter | fetchリトライ累積数                  |
-| `media_proxy_fetch_retry_successes_total`  | Counter | fetchリトライ成功累積数              |
-| `media_proxy_dns_cache_requests_total`     | Counter | DNSキャッシュ結果別累積数            |
-| `media_proxy_dns_cache_entries`            | Gauge   | DNSキャッシュエントリ数              |
-| `media_proxy_dns_cache_capacity_entries`   | Gauge   | DNSキャッシュエントリ上限            |
-| `media_proxy_dns_retry_attempts_total`     | Counter | DNSリトライ累積数                    |
-| `media_proxy_dns_retry_successes_total`    | Counter | DNSリトライ成功累積数                |
-| `media_proxy_stale_served_total`           | Counter | staleキャッシュ提供累積数            |
-| `media_proxy_animations_total`             | Counter | アニメーション処理累積数             |
-| `media_proxy_animation_frames_total`       | Counter | アニメーション処理フレーム累積数     |
-| `media_proxy_animation_input_bytes_total`  | Counter | アニメーション入力バイト累積数       |
-| `media_proxy_animation_output_bytes_total` | Counter | アニメーション出力バイト累積数       |
-| `media_proxy_uptime`                       | Gauge   | プロセス起動からの経過秒数           |
+| メトリクス                                 | 種別      | 内容                                 |
+| ------------------------------------------ | --------- | ------------------------------------ |
+| `media_proxy_outputs_total`                | Counter   | 出力形式別累積数                     |
+| `media_proxy_input_bytes_total`            | Counter   | 処理入力バイト累積数                 |
+| `media_proxy_output_bytes_total`           | Counter   | 処理出力バイト累積数                 |
+| `media_proxy_passthrough_total`            | Counter   | パススルー累積数                     |
+| `media_proxy_processing_errors_total`      | Counter   | 画像処理・ポリシーエラー分類別累積数 |
+| `media_proxy_fetch_errors_total`           | Counter   | fetchエラー分類別累積数              |
+| `media_proxy_host_throttle_requests_total` | Counter   | 流量制御結果別の累積数               |
+| `media_proxy_host_throttle_wait_duration`  | Histogram | 流量制御の待機時間                   |
+| `media_proxy_fetch_retry_attempts_total`   | Counter   | fetchリトライ累積数                  |
+| `media_proxy_fetch_retry_successes_total`  | Counter   | fetchリトライ成功累積数              |
+| `media_proxy_dns_cache_requests_total`     | Counter   | DNSキャッシュ結果別累積数            |
+| `media_proxy_dns_cache_entries`            | Gauge     | DNSキャッシュエントリ数              |
+| `media_proxy_dns_cache_capacity_entries`   | Gauge     | DNSキャッシュエントリ上限            |
+| `media_proxy_dns_retry_attempts_total`     | Counter   | DNSリトライ累積数                    |
+| `media_proxy_dns_retry_successes_total`    | Counter   | DNSリトライ成功累積数                |
+| `media_proxy_stale_served_total`           | Counter   | staleキャッシュ提供累積数            |
+| `media_proxy_animations_total`             | Counter   | アニメーション処理累積数             |
+| `media_proxy_animation_frames_total`       | Counter   | アニメーション処理フレーム累積数     |
+| `media_proxy_animation_input_bytes_total`  | Counter   | アニメーション入力バイト累積数       |
+| `media_proxy_animation_output_bytes_total` | Counter   | アニメーション出力バイト累積数       |
+| `media_proxy_uptime`                       | Gauge     | プロセス起動からの経過秒数           |
 
 DNSキャッシュ結果の属性 `result` は `hit`、`stale`、`miss` の3種類です。
 

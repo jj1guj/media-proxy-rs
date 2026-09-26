@@ -33,7 +33,7 @@
   "host_throttle": {
     "requests_per_second": 1.0,
     "burst": 30,
-    "max_wait_ms": 15000,
+    "max_wait_ms": 5000,
     "max_hosts": 4096
   },
   "cache_stale_max_secs": 86400,

@@ -45,6 +45,7 @@ struct HostThrottleConfig {
 
 struct HostThrottleState {
 	tokens: f64,
+	rate_per_second: f64,
 	last_refill: Instant,
 	cooldown_until: Instant,
 	consecutive_429: u32,
@@ -52,7 +53,9 @@ struct HostThrottleState {
 }
 
 struct HostThrottle {
-	rate_per_second: f64,
+	max_rate_per_second: f64,
+	min_rate_per_second: f64,
+	recovery_per_success: f64,
 	burst: f64,
 	max_wait: Duration,
 	max_hosts: usize,
@@ -83,7 +86,9 @@ impl HostThrottle {
 
 	fn with_limits(rate_per_second: f64, burst: u32, max_wait: Duration, max_hosts: usize) -> Self {
 		Self {
-			rate_per_second,
+			max_rate_per_second: rate_per_second,
+			min_rate_per_second: rate_per_second.min(0.25),
+			recovery_per_success: rate_per_second / 120.0,
 			burst: f64::from(burst),
 			max_wait,
 			max_hosts,
@@ -115,6 +120,7 @@ impl HostThrottle {
 		}
 		states.entry(host.to_owned()).or_insert(HostThrottleState {
 			tokens: self.burst,
+			rate_per_second: self.max_rate_per_second,
 			last_refill: now,
 			cooldown_until: now,
 			consecutive_429: 0,
@@ -135,7 +141,7 @@ impl HostThrottle {
 				let state = self.state_for_host(&mut states, &host, now);
 				let refill_seconds = now.duration_since(state.last_refill).as_secs_f64();
 				state.tokens =
-					(state.tokens + refill_seconds * self.rate_per_second).min(self.burst);
+					(state.tokens + refill_seconds * state.rate_per_second).min(self.burst);
 				state.last_refill = now;
 				state.last_seen = now;
 
@@ -148,7 +154,7 @@ impl HostThrottle {
 				let token_wait = if state.tokens >= 1.0 {
 					Duration::ZERO
 				} else {
-					Duration::from_secs_f64((1.0 - state.tokens) / self.rate_per_second)
+					Duration::from_secs_f64((1.0 - state.tokens) / state.rate_per_second)
 				};
 				cooldown_wait.max(token_wait)
 			};
@@ -178,6 +184,8 @@ impl HostThrottle {
 		state.last_seen = now;
 		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
 			state.consecutive_429 = state.consecutive_429.saturating_add(1);
+			state.rate_per_second = (state.rate_per_second * 0.5).max(self.min_rate_per_second);
+			state.tokens = 0.0;
 			let retry_after = parse_retry_after(headers).unwrap_or_else(|| {
 				let shift = state.consecutive_429.saturating_sub(1).min(4);
 				let exponential = (HOST_THROTTLE_FALLBACK_COOLDOWN * (1 << shift))
@@ -192,26 +200,36 @@ impl HostThrottle {
 			tracing::warn!(
 				host,
 				cooldown_ms = retry_after.as_millis() as u64,
+				rate_per_second = state.rate_per_second,
 				consecutive_429 = state.consecutive_429,
 				"host throttle cooldown activated"
 			);
 		} else if status.is_success() {
 			state.consecutive_429 = 0;
+			state.rate_per_second =
+				(state.rate_per_second + self.recovery_per_success).min(self.max_rate_per_second);
 		}
+	}
+
+	#[cfg(test)]
+	async fn rate_for(&self, url: &reqwest::Url) -> Option<f64> {
+		let host = Self::host_key(url)?;
+		self.states
+			.lock()
+			.await
+			.get(&host)
+			.map(|state| state.rate_per_second)
 	}
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 	let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
 	if let Ok(seconds) = value.trim().parse::<u64>() {
-		return Some(Duration::from_secs(seconds));
+		return (seconds > 0).then(|| Duration::from_secs(seconds));
 	}
 	let retry_at = httpdate::parse_http_date(value).ok()?;
-	Some(
-		retry_at
-			.duration_since(SystemTime::now())
-			.unwrap_or_default(),
-	)
+	let duration = retry_at.duration_since(SystemTime::now()).ok()?;
+	(!duration.is_zero()).then_some(duration)
 }
 
 struct OtlpMetrics {
@@ -249,6 +267,8 @@ struct OtlpMetrics {
 	passthrough: Counter<u64>,
 	processing_errors: Counter<u64>,
 	fetch_errors: Counter<u64>,
+	host_throttle_requests: Counter<u64>,
+	host_throttle_wait_duration: Histogram<f64>,
 	fetch_retry_attempts: Counter<u64>,
 	fetch_retry_successes: Counter<u64>,
 	dns_cache_requests: Counter<u64>,
@@ -326,6 +346,13 @@ impl OtlpMetrics {
 				.u64_counter("media_proxy_processing_errors_total")
 				.build(),
 			fetch_errors: meter.u64_counter("media_proxy_fetch_errors_total").build(),
+			host_throttle_requests: meter
+				.u64_counter("media_proxy_host_throttle_requests_total")
+				.build(),
+			host_throttle_wait_duration: duration_histogram(
+				&meter,
+				"media_proxy_host_throttle_wait_duration",
+			),
 			fetch_retry_attempts: meter
 				.u64_counter("media_proxy_fetch_retry_attempts_total")
 				.build(),
@@ -637,6 +664,7 @@ fn fetch_error_category(detail: &str) -> &'static str {
 		"timeout" => "timeout",
 		"reset" => "reset",
 		"body" => "body",
+		"throttle" => "throttle",
 		_ => "other",
 	}
 }
@@ -654,7 +682,13 @@ struct GlobalStats {
 	ferr_dns: AtomicU64,
 	ferr_reset: AtomicU64,
 	ferr_body: AtomicU64,
+	ferr_throttle: AtomicU64,
 	ferr_other: AtomicU64,
+	throttle_passed: AtomicU64,
+	throttle_waited: AtomicU64,
+	throttle_rejected: AtomicU64,
+	throttle_wait_ms: AtomicU64,
+	throttle_wait_max_ms: AtomicU64,
 	retry_attempts: AtomicU64,
 	retry_saved: AtomicU64,
 	http1_responses: AtomicU64,
@@ -712,7 +746,13 @@ impl GlobalStats {
 			ferr_dns: AtomicU64::new(0),
 			ferr_reset: AtomicU64::new(0),
 			ferr_body: AtomicU64::new(0),
+			ferr_throttle: AtomicU64::new(0),
 			ferr_other: AtomicU64::new(0),
+			throttle_passed: AtomicU64::new(0),
+			throttle_waited: AtomicU64::new(0),
+			throttle_rejected: AtomicU64::new(0),
+			throttle_wait_ms: AtomicU64::new(0),
+			throttle_wait_max_ms: AtomicU64::new(0),
 			retry_attempts: AtomicU64::new(0),
 			retry_saved: AtomicU64::new(0),
 			http1_responses: AtomicU64::new(0),
@@ -773,13 +813,14 @@ impl GlobalStats {
 		)
 	}
 	/// fetch_err カウンタをリセットし値を返す。
-	fn swap_reset_ferr(&self) -> (u64, u64, u64, u64, u64, u64) {
+	fn swap_reset_ferr(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
 		(
 			self.ferr_connect.swap(0, Ordering::Relaxed),
 			self.ferr_timeout.swap(0, Ordering::Relaxed),
 			self.ferr_dns.swap(0, Ordering::Relaxed),
 			self.ferr_reset.swap(0, Ordering::Relaxed),
 			self.ferr_body.swap(0, Ordering::Relaxed),
+			self.ferr_throttle.swap(0, Ordering::Relaxed),
 			self.ferr_other.swap(0, Ordering::Relaxed),
 		)
 	}
@@ -815,9 +856,40 @@ impl GlobalStats {
 			"body" => {
 				self.ferr_body.fetch_add(1, Ordering::Relaxed);
 			}
+			"throttle" => {
+				self.ferr_throttle.fetch_add(1, Ordering::Relaxed);
+			}
 			_ => {
 				self.ferr_other.fetch_add(1, Ordering::Relaxed);
 			}
+		}
+	}
+	fn observe_host_throttle(&self, result: &Result<Duration, Duration>) {
+		let (outcome, wait) = match result {
+			Ok(wait) if wait.is_zero() => {
+				self.throttle_passed.fetch_add(1, Ordering::Relaxed);
+				("passed", *wait)
+			}
+			Ok(wait) => {
+				self.throttle_waited.fetch_add(1, Ordering::Relaxed);
+				("waited", *wait)
+			}
+			Err(wait) => {
+				self.throttle_rejected.fetch_add(1, Ordering::Relaxed);
+				("rejected", *wait)
+			}
+		};
+		let wait_ms = wait.as_millis() as u64;
+		self.throttle_wait_ms.fetch_add(wait_ms, Ordering::Relaxed);
+		self.throttle_wait_max_ms
+			.fetch_max(wait_ms, Ordering::Relaxed);
+		if let Some(metrics) = &self.otlp {
+			metrics
+				.host_throttle_requests
+				.add(1, &[KeyValue::new("result", outcome)]);
+			metrics
+				.host_throttle_wait_duration
+				.record(wait.as_secs_f64(), &[KeyValue::new("result", outcome)]);
 		}
 	}
 	fn observe_request(&self, timings: &PhaseTimings, is_static_path: bool) {
@@ -1481,10 +1553,16 @@ fn main() {
 				loop {
 					interval.tick().await;
 					let (reqs, errs, hits, misses) = stats.swap_reset();
-					let (fc, ft, fd, fr, fb, fo) = stats.swap_reset_ferr();
+					let (fc, ft, fd, fr, fb, fth, fo) = stats.swap_reset_ferr();
 					let (retry_att, retry_sav) = stats.swap_reset_retry();
 					let (http1, http2) = stats.swap_reset_http();
 					let stale_served = stats.cache_stale_served.swap(0, Ordering::Relaxed);
+					let throttle_passed = stats.throttle_passed.swap(0, Ordering::Relaxed);
+					let throttle_waited = stats.throttle_waited.swap(0, Ordering::Relaxed);
+					let throttle_rejected = stats.throttle_rejected.swap(0, Ordering::Relaxed);
+					let throttle_wait_ms = stats.throttle_wait_ms.swap(0, Ordering::Relaxed);
+					let throttle_wait_max_ms =
+						stats.throttle_wait_max_ms.swap(0, Ordering::Relaxed);
 					let upstream_2xx = stats.upstream_2xx.swap(0, Ordering::Relaxed);
 					let upstream_3xx = stats.upstream_3xx.swap(0, Ordering::Relaxed);
 					let upstream_404 = stats.upstream_404.swap(0, Ordering::Relaxed);
@@ -1559,7 +1637,13 @@ fn main() {
 						ferr_dns = fd,
 						ferr_reset = fr,
 						ferr_body = fb,
+						ferr_throttle = fth,
 						ferr_other = fo,
+						throttle_passed,
+						throttle_waited,
+						throttle_rejected,
+						throttle_wait_ms,
+						throttle_wait_max_ms,
 						retry_attempts = retry_att,
 						retry_saved = retry_sav,
 						http1_responses = http1,
@@ -3098,11 +3182,15 @@ async fn get_file_inner(
 	let mut partial_image_response = None;
 	let mut throttle_wait_total = Duration::ZERO;
 	let resp = loop {
-		let throttle_wait = match if let Some(throttle) = &host_throttle {
+		let throttle_wait = if let Some(throttle) = &host_throttle {
 			throttle.acquire(&current_url).await
 		} else {
 			Ok(Duration::ZERO)
-		} {
+		};
+		if host_throttle.is_some() {
+			global_stats.observe_host_throttle(&throttle_wait);
+		}
+		let throttle_wait = match throttle_wait {
 			Ok(wait) => wait,
 			Err(wait) => {
 				if let Ok(mut t) = timings.lock() {
@@ -3163,11 +3251,15 @@ async fn get_file_inner(
 						metrics.fetch_retry_attempts.add(1, &[]);
 					}
 					tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
-					let retry_throttle_wait = match if let Some(throttle) = &host_throttle {
+					let retry_throttle_wait = if let Some(throttle) = &host_throttle {
 						throttle.acquire(&current_url).await
 					} else {
 						Ok(Duration::ZERO)
-					} {
+					};
+					if host_throttle.is_some() {
+						global_stats.observe_host_throttle(&retry_throttle_wait);
+					}
+					let retry_throttle_wait = match retry_throttle_wait {
 						Ok(wait) => wait,
 						Err(wait) => {
 							if let Ok(mut t) = timings.lock() {
@@ -4413,6 +4505,7 @@ mod metrics_tests {
 			.as_ref()
 			.unwrap()
 			.record_completion(503, true, Duration::from_millis(30));
+		stats.observe_host_throttle(&Ok(Duration::from_millis(10)));
 		{
 			let _active = ActiveRequestGuard::new(stats.otlp.as_ref().unwrap().clone());
 		}
@@ -4467,6 +4560,8 @@ mod metrics_tests {
 			"media_proxy_passthrough_total",
 			"media_proxy_processing_errors_total",
 			"media_proxy_fetch_errors_total",
+			"media_proxy_host_throttle_requests_total",
+			"media_proxy_host_throttle_wait_duration",
 			"media_proxy_fetch_retry_attempts_total",
 			"media_proxy_fetch_retry_successes_total",
 			"media_proxy_dns_cache_requests_total",
@@ -4530,6 +4625,7 @@ mod metrics_tests {
 		assert_eq!(fetch_error_category("timeout"), "timeout");
 		assert_eq!(fetch_error_category("reset"), "reset");
 		assert_eq!(fetch_error_category("body"), "body");
+		assert_eq!(fetch_error_category("throttle:wait_timeout"), "throttle");
 		assert_eq!(fetch_error_category("unexpected:detail"), "other");
 	}
 }
@@ -4570,6 +4666,9 @@ mod network_policy_tests {
 	#[test]
 	fn retry_after_supports_seconds_and_http_dates() {
 		let mut headers = reqwest::header::HeaderMap::new();
+		headers.insert(reqwest::header::RETRY_AFTER, "0".parse().unwrap());
+		assert_eq!(parse_retry_after(&headers), None);
+
 		headers.insert(reqwest::header::RETRY_AFTER, "12".parse().unwrap());
 		assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(12)));
 
@@ -4581,6 +4680,33 @@ mod network_policy_tests {
 		let parsed = parse_retry_after(&headers).unwrap();
 		assert!(parsed >= Duration::from_secs(29));
 		assert!(parsed <= Duration::from_secs(30));
+	}
+
+	#[test]
+	fn host_throttle_reduces_rate_on_429_and_recovers_on_success() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let throttle = HostThrottle::with_limits(2.0, 30, Duration::from_secs(5), 16);
+			let target = reqwest::Url::parse("https://adaptive.example/image.webp").unwrap();
+			let headers = reqwest::header::HeaderMap::new();
+
+			throttle
+				.observe_response(&target, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers)
+				.await;
+			assert_eq!(throttle.rate_for(&target).await, Some(1.0));
+			throttle
+				.observe_response(&target, reqwest::StatusCode::TOO_MANY_REQUESTS, &headers)
+				.await;
+			assert_eq!(throttle.rate_for(&target).await, Some(0.5));
+
+			throttle
+				.observe_response(&target, reqwest::StatusCode::OK, &headers)
+				.await;
+			assert!(throttle.rate_for(&target).await.unwrap() > 0.5);
+		});
 	}
 
 	#[test]
