@@ -34,6 +34,7 @@ use cache::{CacheKey, CacheResult, ResponseCache};
 const HOST_THROTTLE_FALLBACK_COOLDOWN: Duration = Duration::from_secs(5);
 const HOST_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(60);
 const HOST_THROTTLE_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
+const HOST_THROTTLE_RECOVERY_SUCCESSES: u32 = 3;
 
 fn default_host_throttle_queue_capacity() -> usize {
 	64
@@ -55,6 +56,7 @@ struct HostThrottleState {
 	last_refill: Instant,
 	cooldown_until: Instant,
 	consecutive_429: u32,
+	recovery_successes: u32,
 	last_seen: Instant,
 	recovering: bool,
 	gate: Arc<AsyncMutex<()>>,
@@ -76,7 +78,6 @@ struct HostThrottleRejection {
 struct HostThrottle {
 	max_rate_per_second: f64,
 	min_rate_per_second: f64,
-	recovery_per_success: f64,
 	burst: f64,
 	max_wait: Duration,
 	max_hosts: usize,
@@ -120,7 +121,6 @@ impl HostThrottle {
 		Self {
 			max_rate_per_second: rate_per_second,
 			min_rate_per_second: rate_per_second.min(0.25),
-			recovery_per_success: rate_per_second / 120.0,
 			burst: f64::from(burst),
 			max_wait,
 			max_hosts,
@@ -157,6 +157,7 @@ impl HostThrottle {
 			last_refill: now,
 			cooldown_until: now,
 			consecutive_429: 0,
+			recovery_successes: 0,
 			last_seen: now,
 			recovering: false,
 			gate: Arc::new(AsyncMutex::new(())),
@@ -275,7 +276,12 @@ impl HostThrottle {
 		let state = self.state_for_host(&mut states, &host, now);
 		state.last_seen = now;
 		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			let starts_new_cooldown = !state.recovering || now >= state.cooldown_until;
 			state.recovering = true;
+			state.recovery_successes = 0;
+			if !starts_new_cooldown {
+				return;
+			}
 			state.consecutive_429 = state.consecutive_429.saturating_add(1);
 			state.rate_per_second = (state.rate_per_second * 0.5).max(self.min_rate_per_second);
 			state.tokens = 1.0;
@@ -299,10 +305,10 @@ impl HostThrottle {
 			);
 		} else if status.is_success() && state.recovering && was_throttled {
 			state.consecutive_429 = 0;
-			state.rate_per_second =
-				(state.rate_per_second + self.recovery_per_success).min(self.max_rate_per_second);
-			if state.rate_per_second >= self.max_rate_per_second {
+			state.recovery_successes = state.recovery_successes.saturating_add(1);
+			if state.recovery_successes >= HOST_THROTTLE_RECOVERY_SUCCESSES {
 				state.recovering = false;
+				state.rate_per_second = self.max_rate_per_second;
 				state.tokens = self.burst;
 			}
 		}
@@ -3497,6 +3503,15 @@ async fn get_file_inner(
 						t.wait += rejection.waited;
 						t.fetch_err = Some("throttle:wait_timeout".to_owned());
 					}
+					if !has_range {
+						if let Some(stale) = response_cache.get_stale(&cache_key) {
+							let resp = build_stale_response(&stale, &config, &timings);
+							if let Ok(t) = timings.lock() {
+								emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+							}
+							return Err(resp);
+						}
+					}
 					headers.append("X-Proxy-Error", "HostThrottleTimeout".parse().unwrap());
 					headers.append("Retry-After", response_retry_after(rejection.retry_after));
 					if let Ok(t) = timings.lock() {
@@ -3578,6 +3593,21 @@ async fn get_file_inner(
 									t.wait += rejection.waited;
 									t.fetch_err = Some("throttle:wait_timeout".to_owned());
 									t.retried = true;
+								}
+								if let Some(stale) = response_cache.get_stale(&cache_key) {
+									let resp = build_stale_response(&stale, &config, &timings);
+									if let Ok(t) = timings.lock() {
+										emit_summary(
+											&config,
+											&summary,
+											&t,
+											200,
+											true,
+											None,
+											&global_stats,
+										);
+									}
+									return Err(resp);
 								}
 								headers.append(
 									"X-Proxy-Error",
@@ -5143,6 +5173,15 @@ mod network_policy_tests {
 				.await;
 			assert_eq!(throttle.rate_for(&target).await, Some(1.0));
 			throttle
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+				)
+				.await;
+			assert_eq!(throttle.rate_for(&target).await, Some(1.0));
+			throttle
 				.observe_response(&target, reqwest::StatusCode::OK, &headers, false)
 				.await;
 			assert_eq!(throttle.rate_for(&target).await, Some(1.0));
@@ -5155,9 +5194,9 @@ mod network_policy_tests {
 					true,
 				)
 				.await;
-			assert_eq!(throttle.rate_for(&target).await, Some(0.5));
+			assert_eq!(throttle.rate_for(&target).await, Some(1.0));
 
-			for _ in 0..120 {
+			for _ in 0..HOST_THROTTLE_RECOVERY_SUCCESSES {
 				throttle
 					.observe_response(&target, reqwest::StatusCode::OK, &headers, true)
 					.await;
