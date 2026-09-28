@@ -37,7 +37,9 @@
     "burst": 16,
     "max_wait_ms": 15000,
     "max_hosts": 4096,
-    "queue_capacity": 256
+    "queue_capacity": 256,
+    "observation_hosts": ["media.misskeyusercontent.com"],
+    "observation_interval_ms": 10000
   },
   "cache_stale_max_secs": 86400,
   "otlp_metrics_endpoint": "http://alloy:4318/v1/metrics",

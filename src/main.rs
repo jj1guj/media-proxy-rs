@@ -40,6 +40,10 @@ fn default_host_throttle_queue_capacity() -> usize {
 	64
 }
 
+fn default_host_throttle_observation_interval_ms() -> u64 {
+	10_000
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HostThrottleConfig {
 	requests_per_second: f64,
@@ -48,6 +52,22 @@ struct HostThrottleConfig {
 	max_hosts: usize,
 	#[serde(default = "default_host_throttle_queue_capacity")]
 	queue_capacity: usize,
+	#[serde(default)]
+	observation_hosts: Vec<String>,
+	#[serde(default = "default_host_throttle_observation_interval_ms")]
+	observation_interval_ms: u64,
+}
+
+#[derive(Default)]
+struct HostThrottleWindow {
+	sends: u64,
+	responses_2xx: u64,
+	responses_429: u64,
+	responses_other: u64,
+	throttled: u64,
+	rejected: u64,
+	wait_ms: u64,
+	queue_peak: usize,
 }
 
 struct HostThrottleState {
@@ -61,6 +81,7 @@ struct HostThrottleState {
 	recovering: bool,
 	gate: Arc<AsyncMutex<()>>,
 	queue_slots: Arc<Semaphore>,
+	window: HostThrottleWindow,
 }
 
 struct HostThrottlePermit {
@@ -82,7 +103,26 @@ struct HostThrottle {
 	max_wait: Duration,
 	max_hosts: usize,
 	queue_capacity: usize,
+	observation_hosts: HashSet<String>,
+	observation_interval: Duration,
 	states: AsyncMutex<HashMap<String, HostThrottleState>>,
+}
+
+struct HostThrottleObservation {
+	host: String,
+	sends: u64,
+	responses_2xx: u64,
+	responses_429: u64,
+	responses_other: u64,
+	throttled: u64,
+	rejected: u64,
+	wait_ms: u64,
+	queue_depth: usize,
+	queue_peak: usize,
+	rate_per_second: f64,
+	tokens: f64,
+	cooldown_remaining_ms: u64,
+	recovering: bool,
 }
 
 impl HostThrottle {
@@ -102,13 +142,24 @@ impl HostThrottle {
 		if config.queue_capacity == 0 {
 			return Err("host_throttle.queue_capacity must be greater than 0".to_owned());
 		}
-		Ok(Self::with_limits(
+		if config.observation_interval_ms == 0 {
+			return Err("host_throttle.observation_interval_ms must be greater than 0".to_owned());
+		}
+		let mut throttle = Self::with_limits(
 			config.requests_per_second,
 			config.burst,
 			Duration::from_millis(config.max_wait_ms),
 			config.max_hosts,
 			config.queue_capacity,
-		))
+		);
+		throttle.observation_hosts = config
+			.observation_hosts
+			.iter()
+			.map(|host| host.trim().to_ascii_lowercase())
+			.filter(|host| !host.is_empty())
+			.collect();
+		throttle.observation_interval = Duration::from_millis(config.observation_interval_ms);
+		Ok(throttle)
 	}
 
 	fn with_limits(
@@ -125,6 +176,10 @@ impl HostThrottle {
 			max_wait,
 			max_hosts,
 			queue_capacity,
+			observation_hosts: HashSet::new(),
+			observation_interval: Duration::from_millis(
+				default_host_throttle_observation_interval_ms(),
+			),
 			states: AsyncMutex::new(HashMap::new()),
 		}
 	}
@@ -162,7 +217,54 @@ impl HostThrottle {
 			recovering: false,
 			gate: Arc::new(AsyncMutex::new(())),
 			queue_slots: Arc::new(Semaphore::new(self.queue_capacity)),
+			window: HostThrottleWindow::default(),
 		})
+	}
+
+	fn observation_interval(&self) -> Option<Duration> {
+		(!self.observation_hosts.is_empty()).then_some(self.observation_interval)
+	}
+
+	async fn record_rejection(&self, host: &str, waited: Duration) {
+		if let Some(state) = self.states.lock().await.get_mut(host) {
+			state.window.rejected = state.window.rejected.saturating_add(1);
+			state.window.wait_ms = state
+				.window
+				.wait_ms
+				.saturating_add(waited.as_millis() as u64);
+		}
+	}
+
+	async fn take_observations(&self) -> Vec<HostThrottleObservation> {
+		let mut states = self.states.lock().await;
+		let now = Instant::now();
+		let mut observations = Vec::with_capacity(self.observation_hosts.len());
+		for host in &self.observation_hosts {
+			let Some(state) = states.get_mut(host) else {
+				continue;
+			};
+			let window = std::mem::take(&mut state.window);
+			observations.push(HostThrottleObservation {
+				host: host.clone(),
+				sends: window.sends,
+				responses_2xx: window.responses_2xx,
+				responses_429: window.responses_429,
+				responses_other: window.responses_other,
+				throttled: window.throttled,
+				rejected: window.rejected,
+				wait_ms: window.wait_ms,
+				queue_depth: self.queue_capacity - state.queue_slots.available_permits(),
+				queue_peak: window.queue_peak,
+				rate_per_second: state.rate_per_second,
+				tokens: state.tokens,
+				cooldown_remaining_ms: state
+					.cooldown_until
+					.saturating_duration_since(now)
+					.as_millis() as u64,
+				recovering: state.recovering,
+			});
+		}
+		observations
 	}
 
 	async fn acquire(
@@ -185,6 +287,7 @@ impl HostThrottle {
 			let state = self.state_for_host(&mut states, &host, now);
 			state.last_seen = now;
 			if !state.recovering {
+				state.window.sends = state.window.sends.saturating_add(1);
 				return Ok(HostThrottlePermit {
 					waited: Duration::ZERO,
 					throttled: false,
@@ -198,26 +301,49 @@ impl HostThrottle {
 			)
 		};
 		let max_wait = self.max_wait.min(wait_budget);
-		let _queue_slot = queue_slots
-			.try_acquire_owned()
-			.map_err(|_| HostThrottleRejection {
-				waited: Duration::ZERO,
-				retry_after: retry_after.max(Duration::from_secs(1)),
-			})?;
-		let gate_guard = tokio::time::timeout(max_wait, gate.lock_owned())
-			.await
-			.map_err(|_| HostThrottleRejection {
-				waited: started.elapsed(),
-				retry_after: Duration::from_secs(1),
-			})?;
+		let queue_slots_for_depth = queue_slots.clone();
+		let _queue_slot = match queue_slots.try_acquire_owned() {
+			Ok(slot) => slot,
+			Err(_) => {
+				self.record_rejection(&host, Duration::ZERO).await;
+				return Err(HostThrottleRejection {
+					waited: Duration::ZERO,
+					retry_after: retry_after.max(Duration::from_secs(1)),
+				});
+			}
+		};
+		{
+			let queue_depth = self.queue_capacity - queue_slots_for_depth.available_permits();
+			if let Some(state) = self.states.lock().await.get_mut(&host) {
+				state.window.queue_peak = state.window.queue_peak.max(queue_depth);
+			}
+		}
+		let gate_guard = match tokio::time::timeout(max_wait, gate.lock_owned()).await {
+			Ok(guard) => guard,
+			Err(_) => {
+				let waited = started.elapsed();
+				self.record_rejection(&host, waited).await;
+				return Err(HostThrottleRejection {
+					waited,
+					retry_after: Duration::from_secs(1),
+				});
+			}
+		};
 		loop {
 			let sleep_for = {
 				let mut states = self.states.lock().await;
 				let now = Instant::now();
 				let state = self.state_for_host(&mut states, &host, now);
 				if !state.recovering {
+					let waited = started.elapsed();
+					state.window.sends = state.window.sends.saturating_add(1);
+					state.window.throttled = state.window.throttled.saturating_add(1);
+					state.window.wait_ms = state
+						.window
+						.wait_ms
+						.saturating_add(waited.as_millis() as u64);
 					return Ok(HostThrottlePermit {
-						waited: started.elapsed(),
+						waited,
 						throttled: true,
 						_gate: None,
 					});
@@ -232,8 +358,15 @@ impl HostThrottle {
 
 				if now >= state.cooldown_until && state.tokens >= 1.0 {
 					state.tokens -= 1.0;
+					let waited = started.elapsed();
+					state.window.sends = state.window.sends.saturating_add(1);
+					state.window.throttled = state.window.throttled.saturating_add(1);
+					state.window.wait_ms = state
+						.window
+						.wait_ms
+						.saturating_add(waited.as_millis() as u64);
 					return Ok(HostThrottlePermit {
-						waited: started.elapsed(),
+						waited,
 						throttled: true,
 						_gate: Some(gate_guard),
 					});
@@ -251,6 +384,7 @@ impl HostThrottle {
 			let elapsed = started.elapsed();
 			let remaining = max_wait.saturating_sub(elapsed);
 			if sleep_for > remaining || remaining.is_zero() {
+				self.record_rejection(&host, elapsed).await;
 				return Err(HostThrottleRejection {
 					waited: elapsed,
 					retry_after: sleep_for.max(Duration::from_secs(1)),
@@ -275,6 +409,13 @@ impl HostThrottle {
 		let now = Instant::now();
 		let state = self.state_for_host(&mut states, &host, now);
 		state.last_seen = now;
+		if status.is_success() {
+			state.window.responses_2xx = state.window.responses_2xx.saturating_add(1);
+		} else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			state.window.responses_429 = state.window.responses_429.saturating_add(1);
+		} else {
+			state.window.responses_other = state.window.responses_other.saturating_add(1);
+		}
 		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
 			let starts_new_cooldown = !state.recovering || now >= state.cooldown_until;
 			state.recovering = true;
@@ -1729,6 +1870,37 @@ fn main() {
 		negative_cache,
 	);
 	rt.block_on(async {
+		if let Some(throttle) = arg_tup.11.clone() {
+			if let Some(interval_duration) = throttle.observation_interval() {
+				tokio::spawn(async move {
+					let mut interval = tokio::time::interval(interval_duration);
+					interval.tick().await;
+					loop {
+						interval.tick().await;
+						for observation in throttle.take_observations().await {
+							tracing::info!(
+								host = observation.host,
+								window_ms = interval_duration.as_millis() as u64,
+								sends = observation.sends,
+								responses_2xx = observation.responses_2xx,
+								responses_429 = observation.responses_429,
+								responses_other = observation.responses_other,
+								throttled = observation.throttled,
+								rejected = observation.rejected,
+								wait_ms = observation.wait_ms,
+								queue_depth = observation.queue_depth as u64,
+								queue_peak = observation.queue_peak as u64,
+								rate_per_second = observation.rate_per_second,
+								tokens = observation.tokens,
+								cooldown_remaining_ms = observation.cooldown_remaining_ms,
+								recovering = observation.recovering,
+								"host_throttle_window"
+							);
+						}
+					}
+				});
+			}
+		}
 		if let Some(metrics) = arg_tup.10.otlp.clone() {
 			let response_cache = arg_tup.7.clone();
 			let dns_cache = arg_tup.6.clone();
@@ -5203,6 +5375,57 @@ mod network_policy_tests {
 			}
 			assert_eq!(throttle.rate_for(&target).await, Some(2.0));
 			assert!(!throttle.is_recovering(&target).await);
+		});
+	}
+
+	#[test]
+	fn host_throttle_observation_records_and_resets_window() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut throttle = HostThrottle::with_limits(1.0, 2, Duration::from_millis(10), 16, 8);
+			throttle
+				.observation_hosts
+				.insert("observed.example".to_owned());
+			let target = reqwest::Url::parse("https://observed.example/image.webp").unwrap();
+			let mut headers = reqwest::header::HeaderMap::new();
+			headers.insert(reqwest::header::RETRY_AFTER, "1".parse().unwrap());
+
+			let permit = throttle
+				.acquire(&target, Duration::from_millis(10))
+				.await
+				.unwrap();
+			throttle
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+				)
+				.await;
+			drop(permit);
+			assert!(throttle
+				.acquire(&target, Duration::from_millis(10))
+				.await
+				.is_err());
+
+			let observations = throttle.take_observations().await;
+			assert_eq!(observations.len(), 1);
+			let observation = &observations[0];
+			assert_eq!(observation.host, "observed.example");
+			assert_eq!(observation.sends, 1);
+			assert_eq!(observation.responses_429, 1);
+			assert_eq!(observation.rejected, 1);
+			assert_eq!(observation.queue_peak, 1);
+			assert!(observation.recovering);
+
+			let reset = throttle.take_observations().await;
+			assert_eq!(reset[0].sends, 0);
+			assert_eq!(reset[0].responses_429, 0);
+			assert_eq!(reset[0].rejected, 0);
+			assert_eq!(reset[0].queue_peak, 0);
 		});
 	}
 
