@@ -40,7 +40,8 @@
     "max_hosts": 4096,
     "queue_capacity": 256,
     "observation_hosts": [],
-    "observation_interval_ms": 10000
+    "observation_interval_ms": 10000,
+    "proactive_hosts": {}
   },
   "cache_stale_max_secs": 86400,
   "otlp_metrics_endpoint": null,

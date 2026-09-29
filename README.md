@@ -154,6 +154,26 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 `observation_hosts`にホスト名を指定すると、`observation_interval_ms`（既定10000ms）ごとに`host_throttle_window`ログを出力します。ログにはホスト別の上流送信数、2xx・429・その他応答数、制御下通過数、拒否数、合計待機時間、現在・最大キュー深度、現在レート、トークン数、クールダウン残時間、回復状態が含まれます。空配列の場合は出力しません。
 
+`proactive_hosts`には予防制御を観測するホストと設定をマップ形式で指定します。キーはscheme・path・portを含まないホスト名で、大文字小文字を区別せず完全一致します。ワイルドカードや暗黙のサブドメイン一致は行いません。対象ホストは`observation_hosts`にも自動追加されます。現在指定できる`mode`は`shadow`のみで、実リクエストの待機・拒否は行わず、仮想Token Bucketの判定結果だけを記録します。
+
+```json
+"proactive_hosts": {
+  "media.example.com": {
+    "initial_requests_per_second": 2.0,
+    "min_requests_per_second": 0.5,
+    "max_requests_per_second": 2.5,
+    "burst": 5,
+    "decrease_factor": 0.7,
+    "increase_step": 0.1,
+    "increase_interval_secs": 60,
+    "quiet_period_secs": 120,
+    "mode": "shadow"
+  }
+}
+```
+
+上流429で新しいクールダウンが始まるたびに仮想レートへ`decrease_factor`を乗算し、`min_requests_per_second`を下限とします。429なしで`quiet_period_secs`が経過した後、成功応答時に`increase_interval_secs`間隔で`increase_step`を加算し、`max_requests_per_second`を上限とします。`host_throttle_window`の`shadow_passed`、`shadow_waited`、`shadow_rejected`は即時通過・待機後通過・拒否になる仮想判定数です。`shadow_wait_ms`は予測待機時間の合計、`shadow_queue_peak`は仮想最大待機数、`shadow_rate_per_second`と`shadow_tokens`は現在の学習状態です。
+
 上流の404/410は正規化した元URL単位でネガティブキャッシュされ、異なる画像変換からの再取得も抑止します。期限切れエントリは返さず、Rangeリクエストと429を含むその他のステータスは保存しません。ヒットはリクエストログと`media_proxy_cache_requests_total`の`result=negative`、保持件数は定期統計ログの`negative_cache_entries`で確認できます。
 
 ### OTLP基本メトリクス

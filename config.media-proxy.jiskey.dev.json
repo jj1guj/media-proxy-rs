@@ -39,7 +39,20 @@
     "max_hosts": 4096,
     "queue_capacity": 256,
     "observation_hosts": ["media.misskeyusercontent.com"],
-    "observation_interval_ms": 10000
+    "observation_interval_ms": 10000,
+    "proactive_hosts": {
+      "media.misskeyusercontent.com": {
+        "initial_requests_per_second": 2.0,
+        "min_requests_per_second": 0.5,
+        "max_requests_per_second": 2.5,
+        "burst": 5,
+        "decrease_factor": 0.7,
+        "increase_step": 0.1,
+        "increase_interval_secs": 60,
+        "quiet_period_secs": 120,
+        "mode": "shadow"
+      }
+    }
   },
   "cache_stale_max_secs": 86400,
   "otlp_metrics_endpoint": "http://alloy:4318/v1/metrics",

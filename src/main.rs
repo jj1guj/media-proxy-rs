@@ -44,6 +44,25 @@ fn default_host_throttle_observation_interval_ms() -> u64 {
 	10_000
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProactiveThrottleMode {
+	Shadow,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ProactiveHostConfig {
+	initial_requests_per_second: f64,
+	min_requests_per_second: f64,
+	max_requests_per_second: f64,
+	burst: u32,
+	decrease_factor: f64,
+	increase_step: f64,
+	increase_interval_secs: u64,
+	quiet_period_secs: u64,
+	mode: ProactiveThrottleMode,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct HostThrottleConfig {
 	requests_per_second: f64,
@@ -56,6 +75,8 @@ struct HostThrottleConfig {
 	observation_hosts: Vec<String>,
 	#[serde(default = "default_host_throttle_observation_interval_ms")]
 	observation_interval_ms: u64,
+	#[serde(default)]
+	proactive_hosts: HashMap<String, ProactiveHostConfig>,
 }
 
 #[derive(Default)]
@@ -68,6 +89,19 @@ struct HostThrottleWindow {
 	rejected: u64,
 	wait_ms: u64,
 	queue_peak: usize,
+	shadow_passed: u64,
+	shadow_waited: u64,
+	shadow_rejected: u64,
+	shadow_wait_ms: u64,
+	shadow_queue_peak: usize,
+}
+
+struct ProactiveShadowState {
+	rate_per_second: f64,
+	tokens: f64,
+	last_refill: Instant,
+	stable_since: Instant,
+	last_increase: Instant,
 }
 
 struct HostThrottleState {
@@ -82,6 +116,7 @@ struct HostThrottleState {
 	gate: Arc<AsyncMutex<()>>,
 	queue_slots: Arc<Semaphore>,
 	window: HostThrottleWindow,
+	proactive_shadow: Option<ProactiveShadowState>,
 }
 
 struct HostThrottlePermit {
@@ -105,6 +140,7 @@ struct HostThrottle {
 	queue_capacity: usize,
 	observation_hosts: HashSet<String>,
 	observation_interval: Duration,
+	proactive_hosts: HashMap<String, ProactiveHostConfig>,
 	states: AsyncMutex<HashMap<String, HostThrottleState>>,
 }
 
@@ -123,6 +159,14 @@ struct HostThrottleObservation {
 	tokens: f64,
 	cooldown_remaining_ms: u64,
 	recovering: bool,
+	shadow_enabled: bool,
+	shadow_passed: u64,
+	shadow_waited: u64,
+	shadow_rejected: u64,
+	shadow_wait_ms: u64,
+	shadow_queue_peak: usize,
+	shadow_rate_per_second: f64,
+	shadow_tokens: f64,
 }
 
 impl HostThrottle {
@@ -145,6 +189,55 @@ impl HostThrottle {
 		if config.observation_interval_ms == 0 {
 			return Err("host_throttle.observation_interval_ms must be greater than 0".to_owned());
 		}
+		let mut proactive_hosts = HashMap::with_capacity(config.proactive_hosts.len());
+		for (configured_host, proactive) in &config.proactive_hosts {
+			let host = configured_host.trim().to_ascii_lowercase();
+			if host.is_empty() || host.contains("://") || host.contains('/') || host.contains(':') {
+				return Err(format!(
+					"host_throttle.proactive_hosts key must be a hostname without scheme, path, or port: {configured_host}"
+				));
+			}
+			if proactive_hosts.contains_key(&host) {
+				return Err(format!(
+					"host_throttle.proactive_hosts contains duplicate normalized host: {host}"
+				));
+			}
+			if !proactive.initial_requests_per_second.is_finite()
+				|| !proactive.min_requests_per_second.is_finite()
+				|| !proactive.max_requests_per_second.is_finite()
+				|| proactive.min_requests_per_second <= 0.0
+				|| proactive.initial_requests_per_second < proactive.min_requests_per_second
+				|| proactive.initial_requests_per_second > proactive.max_requests_per_second
+			{
+				return Err(format!(
+					"host_throttle.proactive_hosts.{host} rates must satisfy 0 < min <= initial <= max"
+				));
+			}
+			if proactive.burst == 0 {
+				return Err(format!(
+					"host_throttle.proactive_hosts.{host}.burst must be greater than 0"
+				));
+			}
+			if !proactive.decrease_factor.is_finite()
+				|| proactive.decrease_factor <= 0.0
+				|| proactive.decrease_factor >= 1.0
+			{
+				return Err(format!(
+					"host_throttle.proactive_hosts.{host}.decrease_factor must be between 0 and 1"
+				));
+			}
+			if !proactive.increase_step.is_finite() || proactive.increase_step <= 0.0 {
+				return Err(format!(
+					"host_throttle.proactive_hosts.{host}.increase_step must be greater than 0"
+				));
+			}
+			if proactive.increase_interval_secs == 0 || proactive.quiet_period_secs == 0 {
+				return Err(format!(
+					"host_throttle.proactive_hosts.{host} intervals must be greater than 0"
+				));
+			}
+			proactive_hosts.insert(host, proactive.clone());
+		}
 		let mut throttle = Self::with_limits(
 			config.requests_per_second,
 			config.burst,
@@ -158,7 +251,11 @@ impl HostThrottle {
 			.map(|host| host.trim().to_ascii_lowercase())
 			.filter(|host| !host.is_empty())
 			.collect();
+		throttle
+			.observation_hosts
+			.extend(proactive_hosts.keys().cloned());
 		throttle.observation_interval = Duration::from_millis(config.observation_interval_ms);
+		throttle.proactive_hosts = proactive_hosts;
 		Ok(throttle)
 	}
 
@@ -180,6 +277,7 @@ impl HostThrottle {
 			observation_interval: Duration::from_millis(
 				default_host_throttle_observation_interval_ms(),
 			),
+			proactive_hosts: HashMap::new(),
 			states: AsyncMutex::new(HashMap::new()),
 		}
 	}
@@ -206,19 +304,30 @@ impl HostThrottle {
 				}
 			}
 		}
-		states.entry(host.to_owned()).or_insert(HostThrottleState {
-			tokens: self.burst,
-			rate_per_second: self.max_rate_per_second,
-			last_refill: now,
-			cooldown_until: now,
-			consecutive_429: 0,
-			recovery_successes: 0,
-			last_seen: now,
-			recovering: false,
-			gate: Arc::new(AsyncMutex::new(())),
-			queue_slots: Arc::new(Semaphore::new(self.queue_capacity)),
-			window: HostThrottleWindow::default(),
-		})
+		states
+			.entry(host.to_owned())
+			.or_insert_with(|| HostThrottleState {
+				proactive_shadow: self.proactive_hosts.get(host).map(|config| {
+					ProactiveShadowState {
+						rate_per_second: config.initial_requests_per_second,
+						tokens: f64::from(config.burst),
+						last_refill: now,
+						stable_since: now,
+						last_increase: now,
+					}
+				}),
+				tokens: self.burst,
+				rate_per_second: self.max_rate_per_second,
+				last_refill: now,
+				cooldown_until: now,
+				consecutive_429: 0,
+				recovery_successes: 0,
+				last_seen: now,
+				recovering: false,
+				gate: Arc::new(AsyncMutex::new(())),
+				queue_slots: Arc::new(Semaphore::new(self.queue_capacity)),
+				window: HostThrottleWindow::default(),
+			})
 	}
 
 	fn observation_interval(&self) -> Option<Duration> {
@@ -235,6 +344,82 @@ impl HostThrottle {
 		}
 	}
 
+	fn observe_proactive_shadow_request(
+		state: &mut HostThrottleState,
+		config: &ProactiveHostConfig,
+		now: Instant,
+		max_wait: Duration,
+		queue_capacity: usize,
+	) {
+		if config.mode != ProactiveThrottleMode::Shadow {
+			return;
+		}
+		let (Some(shadow), window) = (&mut state.proactive_shadow, &mut state.window) else {
+			return;
+		};
+		let refill_seconds = now
+			.saturating_duration_since(shadow.last_refill)
+			.as_secs_f64();
+		shadow.tokens =
+			(shadow.tokens + refill_seconds * shadow.rate_per_second).min(f64::from(config.burst));
+		shadow.last_refill = now;
+
+		if shadow.tokens >= 1.0 {
+			shadow.tokens -= 1.0;
+			window.shadow_passed = window.shadow_passed.saturating_add(1);
+			return;
+		}
+
+		let wait = Duration::try_from_secs_f64((1.0 - shadow.tokens) / shadow.rate_per_second)
+			.unwrap_or(Duration::MAX);
+		let queued = (-shadow.tokens).ceil().max(0.0) as usize;
+		if wait <= max_wait && queued < queue_capacity {
+			shadow.tokens -= 1.0;
+			window.shadow_waited = window.shadow_waited.saturating_add(1);
+			window.shadow_wait_ms = window
+				.shadow_wait_ms
+				.saturating_add(wait.as_millis() as u64);
+			window.shadow_queue_peak = window
+				.shadow_queue_peak
+				.max((-shadow.tokens).ceil().max(0.0) as usize);
+		} else {
+			window.shadow_rejected = window.shadow_rejected.saturating_add(1);
+		}
+	}
+
+	fn observe_proactive_shadow_response(
+		state: &mut HostThrottleState,
+		config: &ProactiveHostConfig,
+		status: reqwest::StatusCode,
+		now: Instant,
+		starts_new_429_incident: bool,
+	) {
+		if config.mode != ProactiveThrottleMode::Shadow {
+			return;
+		}
+		let Some(shadow) = &mut state.proactive_shadow else {
+			return;
+		};
+		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			shadow.stable_since = now;
+			if starts_new_429_incident {
+				shadow.rate_per_second = (shadow.rate_per_second * config.decrease_factor)
+					.max(config.min_requests_per_second);
+				shadow.tokens = 0.0;
+				shadow.last_refill = now;
+			}
+		} else if status.is_success()
+			&& now.duration_since(shadow.stable_since)
+				>= Duration::from_secs(config.quiet_period_secs)
+			&& now.duration_since(shadow.last_increase)
+				>= Duration::from_secs(config.increase_interval_secs)
+		{
+			shadow.rate_per_second =
+				(shadow.rate_per_second + config.increase_step).min(config.max_requests_per_second);
+			shadow.last_increase = now;
+		}
+	}
+
 	async fn take_observations(&self) -> Vec<HostThrottleObservation> {
 		let mut states = self.states.lock().await;
 		let now = Instant::now();
@@ -244,6 +429,7 @@ impl HostThrottle {
 				continue;
 			};
 			let window = std::mem::take(&mut state.window);
+			let shadow = state.proactive_shadow.as_ref();
 			observations.push(HostThrottleObservation {
 				host: host.clone(),
 				sends: window.sends,
@@ -262,6 +448,14 @@ impl HostThrottle {
 					.saturating_duration_since(now)
 					.as_millis() as u64,
 				recovering: state.recovering,
+				shadow_enabled: shadow.is_some(),
+				shadow_passed: window.shadow_passed,
+				shadow_waited: window.shadow_waited,
+				shadow_rejected: window.shadow_rejected,
+				shadow_wait_ms: window.shadow_wait_ms,
+				shadow_queue_peak: window.shadow_queue_peak,
+				shadow_rate_per_second: shadow.map_or(0.0, |shadow| shadow.rate_per_second),
+				shadow_tokens: shadow.map_or(0.0, |shadow| shadow.tokens),
 			});
 		}
 		observations
@@ -281,11 +475,22 @@ impl HostThrottle {
 		};
 
 		let started = Instant::now();
+		let max_wait = self.max_wait.min(wait_budget);
+		let proactive_config = self.proactive_hosts.get(&host).cloned();
 		let (gate, queue_slots, retry_after) = {
 			let mut states = self.states.lock().await;
 			let now = Instant::now();
 			let state = self.state_for_host(&mut states, &host, now);
 			state.last_seen = now;
+			if let Some(config) = &proactive_config {
+				Self::observe_proactive_shadow_request(
+					state,
+					config,
+					now,
+					max_wait,
+					self.queue_capacity,
+				);
+			}
 			if !state.recovering {
 				state.window.sends = state.window.sends.saturating_add(1);
 				return Ok(HostThrottlePermit {
@@ -300,7 +505,6 @@ impl HostThrottle {
 				state.cooldown_until.saturating_duration_since(now),
 			)
 		};
-		let max_wait = self.max_wait.min(wait_budget);
 		let queue_slots_for_depth = queue_slots.clone();
 		let _queue_slot = match queue_slots.try_acquire_owned() {
 			Ok(slot) => slot,
@@ -407,8 +611,20 @@ impl HostThrottle {
 
 		let mut states = self.states.lock().await;
 		let now = Instant::now();
+		let proactive_config = self.proactive_hosts.get(&host).cloned();
 		let state = self.state_for_host(&mut states, &host, now);
 		state.last_seen = now;
+		let starts_new_429_incident = status == reqwest::StatusCode::TOO_MANY_REQUESTS
+			&& (!state.recovering || now >= state.cooldown_until);
+		if let Some(config) = &proactive_config {
+			Self::observe_proactive_shadow_response(
+				state,
+				config,
+				status,
+				now,
+				starts_new_429_incident,
+			);
+		}
 		if status.is_success() {
 			state.window.responses_2xx = state.window.responses_2xx.saturating_add(1);
 		} else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1894,6 +2110,14 @@ fn main() {
 								tokens = observation.tokens,
 								cooldown_remaining_ms = observation.cooldown_remaining_ms,
 								recovering = observation.recovering,
+								proactive_shadow = observation.shadow_enabled,
+								shadow_passed = observation.shadow_passed,
+								shadow_waited = observation.shadow_waited,
+								shadow_rejected = observation.shadow_rejected,
+								shadow_wait_ms = observation.shadow_wait_ms,
+								shadow_queue_peak = observation.shadow_queue_peak as u64,
+								shadow_rate_per_second = observation.shadow_rate_per_second,
+								shadow_tokens = observation.shadow_tokens,
 								"host_throttle_window"
 							);
 						}
@@ -5186,6 +5410,185 @@ mod metrics_tests {
 mod network_policy_tests {
 	use super::*;
 
+	fn proactive_host_config() -> ProactiveHostConfig {
+		ProactiveHostConfig {
+			initial_requests_per_second: 2.0,
+			min_requests_per_second: 0.5,
+			max_requests_per_second: 2.5,
+			burst: 1,
+			decrease_factor: 0.5,
+			increase_step: 0.1,
+			increase_interval_secs: 60,
+			quiet_period_secs: 120,
+			mode: ProactiveThrottleMode::Shadow,
+		}
+	}
+
+	fn throttle_config(host: &str) -> HostThrottleConfig {
+		HostThrottleConfig {
+			requests_per_second: 8.0,
+			burst: 16,
+			max_wait_ms: 15_000,
+			max_hosts: 4096,
+			queue_capacity: 1,
+			observation_hosts: vec![],
+			observation_interval_ms: 10_000,
+			proactive_hosts: HashMap::from([(host.to_owned(), proactive_host_config())]),
+		}
+	}
+
+	#[test]
+	fn proactive_host_config_normalizes_and_validates_exact_hosts() {
+		let throttle = HostThrottle::new(&throttle_config(" Media.Example ")).unwrap();
+		assert!(throttle.proactive_hosts.contains_key("media.example"));
+		assert!(throttle.observation_hosts.contains("media.example"));
+
+		assert!(HostThrottle::new(&throttle_config("https://media.example")).is_err());
+		let mut invalid_rate = throttle_config("media.example");
+		invalid_rate
+			.proactive_hosts
+			.get_mut("media.example")
+			.unwrap()
+			.min_requests_per_second = 3.0;
+		assert!(HostThrottle::new(&invalid_rate).is_err());
+	}
+
+	#[test]
+	fn proactive_shadow_classifies_without_changing_real_traffic() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let throttle = HostThrottle::new(&throttle_config("media.example")).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			let subdomain = reqwest::Url::parse("https://sub.media.example/image.webp").unwrap();
+
+			for _ in 0..3 {
+				let permit = throttle
+					.acquire(&target, Duration::from_secs(2))
+					.await
+					.unwrap();
+				assert!(!permit.throttled);
+			}
+			let unaffected = throttle
+				.acquire(&subdomain, Duration::from_secs(2))
+				.await
+				.unwrap();
+			assert!(!unaffected.throttled);
+
+			let observations = throttle.take_observations().await;
+			assert_eq!(observations.len(), 1);
+			let observation = &observations[0];
+			assert_eq!(observation.host, "media.example");
+			assert_eq!(observation.sends, 3);
+			assert_eq!(observation.shadow_passed, 1);
+			assert_eq!(observation.shadow_waited, 1);
+			assert_eq!(observation.shadow_rejected, 1);
+			assert!(observation.shadow_wait_ms >= 499);
+			assert_eq!(observation.shadow_queue_peak, 1);
+
+			let mut extreme_config = throttle_config("slow.example");
+			let proactive = extreme_config
+				.proactive_hosts
+				.get_mut("slow.example")
+				.unwrap();
+			proactive.initial_requests_per_second = f64::MIN_POSITIVE;
+			proactive.min_requests_per_second = f64::MIN_POSITIVE;
+			proactive.max_requests_per_second = f64::MIN_POSITIVE;
+			let extreme_throttle = HostThrottle::new(&extreme_config).unwrap();
+			let slow = reqwest::Url::parse("https://slow.example/image.webp").unwrap();
+			for _ in 0..2 {
+				extreme_throttle
+					.acquire(&slow, Duration::from_secs(2))
+					.await
+					.unwrap();
+			}
+			let extreme_observations = extreme_throttle.take_observations().await;
+			assert_eq!(extreme_observations[0].shadow_passed, 1);
+			assert_eq!(extreme_observations[0].shadow_rejected, 1);
+		});
+	}
+
+	#[test]
+	fn proactive_shadow_aimd_deduplicates_and_respects_rate_bounds() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let throttle = HostThrottle::new(&throttle_config("media.example")).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			let headers = reqwest::header::HeaderMap::new();
+
+			throttle
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+				)
+				.await;
+			throttle
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+				)
+				.await;
+			{
+				let states = throttle.states.lock().await;
+				assert_eq!(
+					states["media.example"]
+						.proactive_shadow
+						.as_ref()
+						.unwrap()
+						.rate_per_second,
+					1.0
+				);
+			}
+
+			{
+				let mut states = throttle.states.lock().await;
+				states.get_mut("media.example").unwrap().cooldown_until = Instant::now();
+			}
+			throttle
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+				)
+				.await;
+			{
+				let mut states = throttle.states.lock().await;
+				let shadow = states
+					.get_mut("media.example")
+					.unwrap()
+					.proactive_shadow
+					.as_mut()
+					.unwrap();
+				assert_eq!(shadow.rate_per_second, 0.5);
+				shadow.stable_since = Instant::now() - Duration::from_secs(120);
+				shadow.last_increase = Instant::now() - Duration::from_secs(60);
+				shadow.rate_per_second = 2.45;
+			}
+			throttle
+				.observe_response(&target, reqwest::StatusCode::OK, &headers, false)
+				.await;
+			let states = throttle.states.lock().await;
+			assert_eq!(
+				states["media.example"]
+					.proactive_shadow
+					.as_ref()
+					.unwrap()
+					.rate_per_second,
+				2.5
+			);
+		});
+	}
+
 	#[test]
 	fn host_throttle_bypasses_until_429_then_waits_and_recovers() {
 		let runtime = tokio::runtime::Builder::new_current_thread()
@@ -5492,6 +5895,37 @@ mod network_policy_tests {
 		value.as_object_mut().unwrap().remove("host_throttle");
 		let config: ConfigFile = serde_json::from_value(value).unwrap();
 		assert!(config.host_throttle.is_none());
+	}
+
+	#[test]
+	fn proactive_hosts_default_for_existing_host_throttle_config() {
+		let config: HostThrottleConfig = serde_json::from_value(serde_json::json!({
+			"requests_per_second": 8.0,
+			"burst": 16,
+			"max_wait_ms": 15000,
+			"max_hosts": 4096,
+			"queue_capacity": 256,
+			"observation_hosts": [],
+			"observation_interval_ms": 10000
+		}))
+		.unwrap();
+		assert!(config.proactive_hosts.is_empty());
+		assert!(HostThrottle::new(&config).is_ok());
+	}
+
+	#[test]
+	fn operational_config_enables_proactive_shadow_host() {
+		let config: ConfigFile =
+			serde_json::from_str(include_str!("../config.media-proxy.jiskey.dev.json")).unwrap();
+		let throttle = HostThrottle::new(config.host_throttle.as_ref().unwrap()).unwrap();
+		let proactive = throttle
+			.proactive_hosts
+			.get("media.misskeyusercontent.com")
+			.unwrap();
+		assert_eq!(proactive.initial_requests_per_second, 2.0);
+		assert_eq!(proactive.min_requests_per_second, 0.5);
+		assert_eq!(proactive.max_requests_per_second, 2.5);
+		assert_eq!(proactive.mode, ProactiveThrottleMode::Shadow);
 	}
 
 	fn test_dns_cache(timeout: Duration) -> DnsCache {
