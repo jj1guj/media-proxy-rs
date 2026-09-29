@@ -785,7 +785,8 @@ fn response_retry_after(wait: Duration) -> axum::http::HeaderValue {
 struct OtlpMetrics {
 	requests: Counter<u64>,
 	errors: Counter<u64>,
-	domain_requests: Counter<u64>,
+	caller_domain_requests: Counter<u64>,
+	target_domain_requests: Counter<u64>,
 	requests_active: UpDownCounter<i64>,
 	upstream_responses: Counter<u64>,
 	request_duration: Histogram<f64>,
@@ -839,8 +840,11 @@ impl OtlpMetrics {
 		Self {
 			requests: meter.u64_counter("media_proxy_requests_total").build(),
 			errors: meter.u64_counter("media_proxy_errors_total").build(),
-			domain_requests: meter
-				.u64_counter("media_proxy_domain_requests_total")
+			caller_domain_requests: meter
+				.u64_counter("media_proxy_caller_domain_requests_total")
+				.build(),
+			target_domain_requests: meter
+				.u64_counter("media_proxy_target_domain_requests_total")
 				.build(),
 			requests_active: meter
 				.i64_up_down_counter("media_proxy_requests_active")
@@ -950,10 +954,16 @@ impl OtlpMetrics {
 	}
 
 	fn record_domains(&self, caller_domain: &str, target_domain: &str, is_error: bool) {
-		self.domain_requests.add(
+		self.caller_domain_requests.add(
 			1,
 			&[
 				KeyValue::new("caller_domain", caller_domain.to_owned()),
+				KeyValue::new("error", is_error),
+			],
+		);
+		self.target_domain_requests.add(
+			1,
+			&[
 				KeyValue::new("target_domain", target_domain.to_owned()),
 				KeyValue::new("error", is_error),
 			],
@@ -5304,7 +5314,8 @@ mod metrics_tests {
 		for name in [
 			"media_proxy_requests_total",
 			"media_proxy_errors_total",
-			"media_proxy_domain_requests_total",
+			"media_proxy_caller_domain_requests_total",
+			"media_proxy_target_domain_requests_total",
 			"media_proxy_requests_active",
 			"media_proxy_upstream_responses_total",
 			"media_proxy_request_duration",
@@ -5369,6 +5380,52 @@ mod metrics_tests {
 			2
 		);
 		drop(stats);
+		provider.shutdown().expect("provider should shut down");
+	}
+
+	#[test]
+	fn domain_metrics_do_not_multiply_caller_and_target_cardinality() {
+		let exporter = InMemoryMetricExporter::default();
+		let provider = SdkMeterProvider::builder()
+			.with_periodic_exporter(exporter.clone())
+			.build();
+		let metrics = OtlpMetrics::new(&provider);
+
+		for index in 0..2500 {
+			metrics.record_domains(
+				&format!("caller-{}.example", index % 50),
+				&format!("target-{}.example", index / 50),
+				false,
+			);
+		}
+
+		provider.force_flush().expect("metrics should flush");
+		let exports = exporter
+			.get_finished_metrics()
+			.expect("metrics should be exported");
+		let metrics = exports
+			.last()
+			.expect("one metrics export")
+			.scope_metrics()
+			.flat_map(|scope| scope.metrics())
+			.collect::<Vec<_>>();
+		for name in [
+			"media_proxy_caller_domain_requests_total",
+			"media_proxy_target_domain_requests_total",
+		] {
+			let metric = metrics
+				.iter()
+				.find(|metric| metric.name() == name)
+				.expect("domain counter");
+			let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+				panic!("domain counter should export as a u64 sum");
+			};
+			assert_eq!(sum.data_points().count(), 50);
+			assert!(sum.data_points().all(|data_point| data_point
+				.attributes()
+				.all(|attribute| attribute.key.as_str() != "otel.metric.overflow")));
+		}
+
 		provider.shutdown().expect("provider should shut down");
 	}
 

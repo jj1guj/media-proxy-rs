@@ -180,21 +180,22 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 `otlp_metrics_endpoint` を設定すると、以下のメトリクスをOTLP/HTTPで送信します。時間の単位は秒です。ステータス属性は `status_class` (`1xx`〜`5xx`、`other`) のみで、URL、ドメイン、IP、キャッシュキー、エラー詳細は属性に含めません。
 
-| メトリクス                             | 種別          | 内容                                           |
-| -------------------------------------- | ------------- | ---------------------------------------------- |
-| `media_proxy_requests_total`           | Counter       | 完了リクエスト累積数（最終ステータスクラス別） |
-| `media_proxy_errors_total`             | Counter       | エラー累積数（最終ステータスクラス別）         |
-| `media_proxy_domain_requests_total`    | Counter       | caller／targetドメイン・成否別リクエスト累積数 |
-| `media_proxy_requests_active`          | UpDownCounter | 処理中リクエスト数                             |
-| `media_proxy_upstream_responses_total` | Counter       | 上流レスポンス累積数（ステータスクラス別）     |
-| `media_proxy_request_duration`         | Histogram     | リクエスト合計レイテンシ                       |
-| `media_proxy_url_check_duration`       | Histogram     | URL／ポリシーチェック時間                      |
-| `media_proxy_download_wait_duration`   | Histogram     | ダウンロード枠待機時間                         |
-| `media_proxy_upstream_ttfb_duration`   | Histogram     | 上流TTFB                                       |
-| `media_proxy_upstream_body_duration`   | Histogram     | 上流body受信時間                               |
-| `media_proxy_cpu_wait_duration`        | Histogram     | CPU枠待機時間                                  |
-| `media_proxy_decode_duration`          | Histogram     | decode時間                                     |
-| `media_proxy_encode_duration`          | Histogram     | encode時間                                     |
+| メトリクス                                 | 種別          | 内容                                           |
+| ------------------------------------------ | ------------- | ---------------------------------------------- |
+| `media_proxy_requests_total`               | Counter       | 完了リクエスト累積数（最終ステータスクラス別） |
+| `media_proxy_errors_total`                 | Counter       | エラー累積数（最終ステータスクラス別）         |
+| `media_proxy_caller_domain_requests_total` | Counter       | callerドメイン・成否別リクエスト累積数         |
+| `media_proxy_target_domain_requests_total` | Counter       | targetドメイン・成否別リクエスト累積数         |
+| `media_proxy_requests_active`              | UpDownCounter | 処理中リクエスト数                             |
+| `media_proxy_upstream_responses_total`     | Counter       | 上流レスポンス累積数（ステータスクラス別）     |
+| `media_proxy_request_duration`             | Histogram     | リクエスト合計レイテンシ                       |
+| `media_proxy_url_check_duration`           | Histogram     | URL／ポリシーチェック時間                      |
+| `media_proxy_download_wait_duration`       | Histogram     | ダウンロード枠待機時間                         |
+| `media_proxy_upstream_ttfb_duration`       | Histogram     | 上流TTFB                                       |
+| `media_proxy_upstream_body_duration`       | Histogram     | 上流body受信時間                               |
+| `media_proxy_cpu_wait_duration`            | Histogram     | CPU枠待機時間                                  |
+| `media_proxy_decode_duration`              | Histogram     | decode時間                                     |
+| `media_proxy_encode_duration`              | Histogram     | encode時間                                     |
 
 キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative`、`evicted` の7種類です。`evicted`は過去24時間以内に容量不足で追い出されたキーが再び要求され、上流取得へ進んだことを示します。60秒ごとのINFO統計ログでは`cache_capacity_evictions`が追い出し件数、`cache_evicted_reaccesses`が追い出し後の上流再取得件数です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss + evicted)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
 
