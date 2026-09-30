@@ -44,7 +44,7 @@
       "media.misskeyusercontent.com": {
         "initial_requests_per_second": 2.0,
         "min_requests_per_second": 0.5,
-        "max_requests_per_second": 2.5,
+        "max_requests_per_second": 8.0,
         "burst": 5,
         "decrease_factor": 0.7,
         "increase_step": 0.1,

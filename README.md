@@ -161,7 +161,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
   "media.example.com": {
     "initial_requests_per_second": 2.0,
     "min_requests_per_second": 0.5,
-    "max_requests_per_second": 2.5,
+    "max_requests_per_second": 8.0,
     "burst": 5,
     "decrease_factor": 0.7,
     "increase_step": 0.1,
@@ -172,7 +172,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 }
 ```
 
-上流429で新しいクールダウンが始まるたびに仮想レートへ`decrease_factor`を乗算し、`min_requests_per_second`を下限とします。429なしで`quiet_period_secs`が経過した後、成功応答時に`increase_interval_secs`間隔で`increase_step`を加算し、`max_requests_per_second`を上限とします。`host_throttle_window`の`shadow_passed`、`shadow_waited`、`shadow_rejected`は即時通過・待機後通過・拒否になる仮想判定数です。`shadow_wait_ms`は予測待機時間の合計、`shadow_queue_peak`は仮想最大待機数、`shadow_rate_per_second`と`shadow_tokens`は現在の学習状態です。
+仮想的に即時通過した要求の429だけを学習に使用します。429エピソード開始時は仮想レートとburstへ`decrease_factor`を乗算し、レートは`min_requests_per_second`を下限とします。429なしで`quiet_period_secs`が経過した後は、仮想待機・拒否の割合に応じて`increase_interval_secs`間隔でレートを増加させます。`initial_requests_per_second`と`burst`は初期値、`min_requests_per_second`と`max_requests_per_second`は学習の安全境界です。実効burstは直近300個の有効な1秒要求数のp95に25%の余裕を加えて自動調整します。
+
+実効レート、推定上限、burstが変化した場合は`proactive_learning_adjusted`ログを出力します。`old_safe_rate`、`new_safe_rate`、`old_estimated_limit`、`new_estimated_limit`、`old_burst`、`new_burst`、`confidence`、`sample_count`、`rate_limit_episodes`、`reason`で変更内容と理由を確認できます。`host_throttle_window`の`shadow_passed`、`shadow_waited`、`shadow_rejected`は即時通過・待機後通過・拒否になる仮想判定数です。`shadow_wait_ms`は予測待機時間の合計、`shadow_queue_peak`は仮想最大待機数、`shadow_rate_per_second`と`shadow_tokens`は現在の学習状態です。
 
 上流の404/410は正規化した元URL単位でネガティブキャッシュされ、異なる画像変換からの再取得も抑止します。期限切れエントリは返さず、Rangeリクエストと429を含むその他のステータスは保存しません。ヒットはリクエストログと`media_proxy_cache_requests_total`の`result=negative`、保持件数は定期統計ログの`negative_cache_entries`で確認できます。
 
