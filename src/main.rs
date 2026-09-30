@@ -45,6 +45,8 @@ fn default_host_throttle_observation_interval_ms() -> u64 {
 }
 
 const PROACTIVE_SHADOW_MIN_UTILIZATION: f64 = 0.8;
+const PROACTIVE_SHADOW_UNSAFE_RATE_MARGIN: f64 = 0.9;
+const PROACTIVE_SHADOW_REQUIRED_QUALIFIED_WINDOWS: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +113,7 @@ struct ProactiveShadowState {
 	last_burst_adjustment: Instant,
 	sample_count: u64,
 	qualified_sample_count: u64,
+	qualified_windows_since_increase: u32,
 	rate_limit_episodes: u64,
 	burst_bucket_started: Instant,
 	burst_bucket_count: u32,
@@ -341,6 +344,7 @@ impl HostThrottle {
 						confidence = 0.0,
 						sample_count = 0,
 						qualified_sample_count = 0,
+						qualified_windows_since_increase = 0,
 						rate_limit_episodes = 0,
 						reason = "initialized",
 						"proactive_learning_adjusted"
@@ -357,6 +361,7 @@ impl HostThrottle {
 						last_burst_adjustment: now,
 						sample_count: 0,
 						qualified_sample_count: 0,
+						qualified_windows_since_increase: 0,
 						rate_limit_episodes: 0,
 						burst_bucket_started: now,
 						burst_bucket_count: 0,
@@ -422,6 +427,7 @@ impl HostThrottle {
 			confidence = Self::proactive_confidence(shadow),
 			sample_count = shadow.sample_count,
 			qualified_sample_count = shadow.qualified_sample_count,
+			qualified_windows_since_increase = shadow.qualified_windows_since_increase,
 			rate_limit_episodes = shadow.rate_limit_episodes,
 			reason,
 			"proactive_learning_adjusted"
@@ -472,6 +478,10 @@ impl HostThrottle {
 			shadow.qualified_sample_count = shadow
 				.qualified_sample_count
 				.saturating_add(window.shadow_passed_2xx);
+			if window.shadow_passed_2xx > 0 {
+				shadow.qualified_windows_since_increase =
+					shadow.qualified_windows_since_increase.saturating_add(1);
+			}
 		}
 
 		if now.duration_since(shadow.stable_since) < Duration::from_secs(config.quiet_period_secs) {
@@ -491,7 +501,7 @@ impl HostThrottle {
 			let index = ((samples.len() - 1) * 95) / 100;
 			let max_burst = u32::try_from(queue_capacity).unwrap_or(u32::MAX).max(1);
 			let target = ((f64::from(samples[index]) * 1.25).ceil() as u32).clamp(1, max_burst);
-			if target >= shadow.learned_burst.saturating_add(2) {
+			if shadow.rate_limit_episodes == 0 && target >= shadow.learned_burst.saturating_add(2) {
 				shadow.learned_burst = target;
 				reason = "observed_burst";
 			} else if shadow.burst_samples.len() >= 60
@@ -505,25 +515,15 @@ impl HostThrottle {
 
 		if window.shadow_passed_2xx > 0
 			&& has_load_evidence
+			&& shadow.qualified_windows_since_increase
+				>= PROACTIVE_SHADOW_REQUIRED_QUALIFIED_WINDOWS
 			&& now.duration_since(shadow.last_increase) >= adjustment_interval
 		{
-			let pressure = if decisions == 0 {
-				0.0
-			} else {
-				(constrained as f64 / decisions as f64).min(0.25)
-			};
-			let increase = config.increase_step.max(shadow.rate_per_second * pressure);
-			if shadow.rate_per_second >= shadow.estimated_limit - f64::EPSILON {
-				shadow.estimated_limit =
-					(shadow.estimated_limit + increase).min(config.max_requests_per_second);
-			}
-			shadow.rate_per_second = (shadow.rate_per_second + increase)
+			shadow.rate_per_second = (shadow.rate_per_second + config.increase_step)
 				.min(shadow.estimated_limit)
 				.min(config.max_requests_per_second);
 			shadow.last_increase = now;
-			if pressure > 0.0 {
-				reason = "shadow_pressure";
-			}
+			shadow.qualified_windows_since_increase = 0;
 		}
 
 		shadow.tokens = shadow.tokens.min(f64::from(shadow.learned_burst));
@@ -619,7 +619,7 @@ impl HostThrottle {
 					.max(config.min_requests_per_second);
 				shadow.estimated_limit = shadow
 					.estimated_limit
-					.min(old_rate)
+					.min(old_rate * PROACTIVE_SHADOW_UNSAFE_RATE_MARGIN)
 					.max(config.min_requests_per_second);
 				shadow.learned_burst = ((f64::from(shadow.learned_burst) * config.decrease_factor)
 					.floor() as u32)
@@ -629,6 +629,7 @@ impl HostThrottle {
 				shadow.cooldown_until = now + incident_cooldown;
 				shadow.last_burst_adjustment = now;
 				shadow.rate_limit_episodes = shadow.rate_limit_episodes.saturating_add(1);
+				shadow.qualified_windows_since_increase = 0;
 				shadow.burst_samples.clear();
 				Self::log_proactive_adjustment(
 					host,
@@ -5899,13 +5900,31 @@ mod network_policy_tests {
 				)
 				.await;
 			{
-				let states = throttle.states.lock().await;
+				let mut states = throttle.states.lock().await;
 				let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
 				assert_eq!(shadow.rate_per_second, 1.0);
-				assert_eq!(shadow.estimated_limit, 2.0);
+				assert_eq!(shadow.estimated_limit, 1.8);
 				assert_eq!(shadow.learned_burst, 5);
 				assert_eq!(shadow.rate_limit_episodes, 1);
+				let shadow = states
+					.get_mut("media.example")
+					.unwrap()
+					.proactive_shadow
+					.as_mut()
+					.unwrap();
+				shadow.stable_since = Instant::now() - Duration::from_secs(121);
+				shadow.last_burst_adjustment = Instant::now() - Duration::from_secs(61);
+				shadow.burst_samples = VecDeque::from(vec![10; 10]);
 			}
+			throttle.take_observations().await;
+			assert_eq!(
+				throttle.states.lock().await["media.example"]
+					.proactive_shadow
+					.as_ref()
+					.unwrap()
+					.learned_burst,
+				5
+			);
 
 			{
 				let mut states = throttle.states.lock().await;
@@ -5931,8 +5950,9 @@ mod network_policy_tests {
 				assert_eq!(shadow.rate_limit_episodes, 2);
 				shadow.stable_since = Instant::now() - Duration::from_secs(120);
 				shadow.last_increase = Instant::now() - Duration::from_secs(60);
-				shadow.rate_per_second = 2.45;
-				shadow.estimated_limit = 2.5;
+				shadow.rate_per_second = 0.85;
+				shadow.estimated_limit = 0.9;
+				shadow.qualified_windows_since_increase = 2;
 			}
 			throttle
 				.observe_response(&target, reqwest::StatusCode::OK, &headers, false)
@@ -5945,8 +5965,33 @@ mod network_policy_tests {
 					.as_ref()
 					.unwrap()
 					.rate_per_second,
-				2.5
+				0.9
 			);
+			assert_eq!(
+				states["media.example"]
+					.proactive_shadow
+					.as_ref()
+					.unwrap()
+					.estimated_limit,
+				0.9
+			);
+			drop(states);
+			{
+				let mut states = throttle.states.lock().await;
+				let state = states.get_mut("media.example").unwrap();
+				state.window.shadow_waited = 1;
+				let shadow = state.proactive_shadow.as_mut().unwrap();
+				shadow.last_increase = Instant::now() - Duration::from_secs(60);
+				shadow.qualified_windows_since_increase = 2;
+			}
+			throttle
+				.observe_response(&target, reqwest::StatusCode::OK, &headers, false)
+				.await;
+			throttle.take_observations().await;
+			let states = throttle.states.lock().await;
+			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
+			assert_eq!(shadow.rate_per_second, 0.9);
+			assert_eq!(shadow.estimated_limit, 0.9);
 		});
 	}
 
@@ -5976,13 +6021,14 @@ mod network_policy_tests {
 				shadow.stable_since = Instant::now() - Duration::from_secs(121);
 				shadow.last_increase = Instant::now() - Duration::from_secs(61);
 				shadow.last_burst_adjustment = Instant::now() - Duration::from_secs(61);
+				shadow.qualified_windows_since_increase = 2;
 				shadow.burst_samples = VecDeque::from(vec![8; 10]);
 			}
 
 			throttle.take_observations().await;
 			let states = throttle.states.lock().await;
 			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
-			assert_eq!(shadow.rate_per_second, 2.5);
+			assert_eq!(shadow.rate_per_second, 2.1);
 			assert_eq!(shadow.learned_burst, 10);
 			assert_eq!(shadow.sample_count, 1);
 			assert_eq!(shadow.qualified_sample_count, 10);
@@ -6052,6 +6098,7 @@ mod network_policy_tests {
 				let shadow = state.proactive_shadow.as_mut().unwrap();
 				shadow.stable_since = Instant::now() - Duration::from_secs(121);
 				shadow.last_increase = Instant::now() - Duration::from_secs(61);
+				shadow.qualified_windows_since_increase = 2;
 			}
 
 			throttle.take_observations().await;
