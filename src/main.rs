@@ -429,6 +429,22 @@ impl HostThrottle {
 				continue;
 			};
 			let window = std::mem::take(&mut state.window);
+			let queue_depth = self.queue_capacity - state.queue_slots.available_permits();
+			let has_activity = window.sends > 0
+				|| window.responses_2xx > 0
+				|| window.responses_429 > 0
+				|| window.responses_other > 0
+				|| window.throttled > 0
+				|| window.rejected > 0
+				|| window.wait_ms > 0
+				|| queue_depth > 0
+				|| window.shadow_passed > 0
+				|| window.shadow_waited > 0
+				|| window.shadow_rejected > 0
+				|| window.shadow_wait_ms > 0;
+			if !has_activity {
+				continue;
+			}
 			let shadow = state.proactive_shadow.as_ref();
 			observations.push(HostThrottleObservation {
 				host: host.clone(),
@@ -439,7 +455,7 @@ impl HostThrottle {
 				throttled: window.throttled,
 				rejected: window.rejected,
 				wait_ms: window.wait_ms,
-				queue_depth: self.queue_capacity - state.queue_slots.available_permits(),
+				queue_depth,
 				queue_peak: window.queue_peak,
 				rate_per_second: state.rate_per_second,
 				tokens: state.tokens,
@@ -653,11 +669,24 @@ impl HostThrottle {
 				exponential + Duration::from_millis(jitter_ms)
 			});
 			state.cooldown_until = state.cooldown_until.max(now + retry_after);
+			let snapshot = RateLimitHeaderSnapshot::from_headers(headers);
 			tracing::warn!(
 				host,
 				cooldown_ms = retry_after.as_millis() as u64,
 				rate_per_second = state.rate_per_second,
 				consecutive_429 = state.consecutive_429,
+				retry_after = snapshot.retry_after.as_deref().unwrap_or(""),
+				retry_after_ms = snapshot.retry_after_ms.unwrap_or(0),
+				retry_after_valid = snapshot.retry_after_ms.is_some(),
+				ratelimit_limit = snapshot.ratelimit_limit.as_deref().unwrap_or(""),
+				ratelimit_remaining = snapshot.ratelimit_remaining.as_deref().unwrap_or(""),
+				ratelimit_reset = snapshot.ratelimit_reset.as_deref().unwrap_or(""),
+				ratelimit_policy = snapshot.ratelimit_policy.as_deref().unwrap_or(""),
+				x_ratelimit_limit = snapshot.x_ratelimit_limit.as_deref().unwrap_or(""),
+				x_ratelimit_remaining = snapshot.x_ratelimit_remaining.as_deref().unwrap_or(""),
+				x_ratelimit_reset = snapshot.x_ratelimit_reset.as_deref().unwrap_or(""),
+				server = snapshot.server.as_deref().unwrap_or(""),
+				cf_ray = snapshot.cf_ray.as_deref().unwrap_or(""),
 				"host throttle cooldown activated"
 			);
 		} else if status.is_success() && state.recovering && was_throttled {
@@ -3054,13 +3083,13 @@ async fn check_url(
 	url: impl AsRef<str>,
 ) -> Result<(DnsHitStatus, u16, u16), CheckUrlError> {
 	let u = reqwest::Url::from_str(url.as_ref()).map_err(|error| {
-		tracing::warn!(url = ?url.as_ref(), %error, "URL validation failed");
+		tracing::debug!(url = ?url.as_ref(), %error, "URL validation failed");
 		CheckUrlError::InvalidUrl(error.to_string())
 	})?;
 	match u.scheme().to_lowercase().as_str() {
 		"http" | "https" => {}
 		scheme => {
-			tracing::warn!(url = ?url.as_ref(), scheme, "unsupported URL scheme");
+			tracing::debug!(url = ?url.as_ref(), scheme, "unsupported URL scheme");
 			return Err(CheckUrlError::UnsupportedScheme(scheme.to_owned()));
 		}
 	}
@@ -4150,7 +4179,7 @@ async fn get_file_inner(
 				}
 			}
 		};
-		if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+		if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && host_throttle.is_none() {
 			log_upstream_429(&current_url, resp.headers());
 		}
 		if let Some(throttle) = &host_throttle {
@@ -5882,10 +5911,7 @@ mod network_policy_tests {
 			assert!(observation.recovering);
 
 			let reset = throttle.take_observations().await;
-			assert_eq!(reset[0].sends, 0);
-			assert_eq!(reset[0].responses_429, 0);
-			assert_eq!(reset[0].rejected, 0);
-			assert_eq!(reset[0].queue_peak, 0);
+			assert!(reset.is_empty());
 		});
 	}
 
