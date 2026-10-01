@@ -16,7 +16,7 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::{Protocol, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, RwLock, Semaphore};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_stream::StreamExt;
 
 #[cfg(feature = "avif-decoder")]
@@ -131,6 +131,8 @@ struct HostThrottleState {
 	recovering: bool,
 	gate: Arc<AsyncMutex<()>>,
 	queue_slots: Arc<Semaphore>,
+	deadline_slots: Arc<Semaphore>,
+	deadline_next_send: Instant,
 	window: HostThrottleWindow,
 	proactive_shadow: Option<ProactiveShadowState>,
 }
@@ -147,6 +149,7 @@ struct HostThrottlePermit {
 	throttled: bool,
 	shadow_decision: Option<ProactiveShadowDecision>,
 	_gate: Option<OwnedMutexGuard<()>>,
+	_deadline_slot: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Debug)]
@@ -154,6 +157,23 @@ struct HostThrottleRejection {
 	waited: Duration,
 	retry_after: Duration,
 	shadow_decision: Option<ProactiveShadowDecision>,
+}
+
+#[derive(Clone, Copy)]
+enum DeadlineFallbackContext {
+	Initial,
+	Upstream429Retry,
+	ConnectRetry,
+}
+
+impl DeadlineFallbackContext {
+	fn timeout_result(self) -> &'static str {
+		match self {
+			Self::Initial => "initial_timeout",
+			Self::Upstream429Retry => "429_retry_timeout",
+			Self::ConnectRetry => "connect_retry_timeout",
+		}
+	}
 }
 
 struct HostThrottle {
@@ -379,6 +399,8 @@ impl HostThrottle {
 				recovering: false,
 				gate: Arc::new(AsyncMutex::new(())),
 				queue_slots: Arc::new(Semaphore::new(self.queue_capacity)),
+				deadline_slots: Arc::new(Semaphore::new(1)),
+				deadline_next_send: now,
 				window: HostThrottleWindow::default(),
 			})
 	}
@@ -732,6 +754,82 @@ impl HostThrottle {
 			.await
 	}
 
+	async fn acquire_for_deadline_fallback(
+		&self,
+		url: &reqwest::Url,
+		wait_budget: Duration,
+		shadow_decision: Option<ProactiveShadowDecision>,
+	) -> Result<HostThrottlePermit, HostThrottleRejection> {
+		let Some(host) = Self::host_key(url) else {
+			return Ok(HostThrottlePermit {
+				waited: Duration::ZERO,
+				throttled: false,
+				shadow_decision: None,
+				_gate: None,
+				_deadline_slot: None,
+			});
+		};
+		let started = Instant::now();
+		let deadline_slots = {
+			let mut states = self.states.lock().await;
+			let now = Instant::now();
+			self.state_for_host(&mut states, &host, now)
+				.deadline_slots
+				.clone()
+		};
+		let deadline_slot =
+			match tokio::time::timeout(wait_budget, deadline_slots.acquire_owned()).await {
+				Ok(Ok(slot)) => slot,
+				_ => {
+					let waited = started.elapsed();
+					self.record_rejection(&host, waited).await;
+					return Err(HostThrottleRejection {
+						waited,
+						retry_after: Duration::from_secs_f64(1.0 / self.max_rate_per_second),
+						shadow_decision,
+					});
+				}
+			};
+		let sleep_for = {
+			let mut states = self.states.lock().await;
+			let now = Instant::now();
+			let state = self.state_for_host(&mut states, &host, now);
+			state.deadline_next_send.saturating_duration_since(now)
+		};
+		if sleep_for > wait_budget.saturating_sub(started.elapsed()) {
+			let waited = started.elapsed();
+			self.record_rejection(&host, waited).await;
+			return Err(HostThrottleRejection {
+				waited,
+				retry_after: sleep_for.max(Duration::from_secs(1)),
+				shadow_decision,
+			});
+		}
+		tokio::time::sleep(sleep_for).await;
+		let waited = started.elapsed();
+		{
+			let mut states = self.states.lock().await;
+			let now = Instant::now();
+			let state = self.state_for_host(&mut states, &host, now);
+			state.deadline_next_send =
+				now + Duration::from_secs_f64(1.0 / self.max_rate_per_second);
+			state.last_seen = now;
+			state.window.sends = state.window.sends.saturating_add(1);
+			state.window.throttled = state.window.throttled.saturating_add(1);
+			state.window.wait_ms = state
+				.window
+				.wait_ms
+				.saturating_add(waited.as_millis() as u64);
+		}
+		Ok(HostThrottlePermit {
+			waited,
+			throttled: true,
+			shadow_decision,
+			_gate: None,
+			_deadline_slot: Some(deadline_slot),
+		})
+	}
+
 	async fn acquire_with_limit(
 		&self,
 		url: &reqwest::Url,
@@ -745,6 +843,7 @@ impl HostThrottle {
 				throttled: false,
 				shadow_decision: None,
 				_gate: None,
+				_deadline_slot: None,
 			});
 		};
 
@@ -776,6 +875,7 @@ impl HostThrottle {
 					throttled: false,
 					shadow_decision,
 					_gate: None,
+					_deadline_slot: None,
 				});
 			}
 			(
@@ -833,6 +933,7 @@ impl HostThrottle {
 						throttled: true,
 						shadow_decision,
 						_gate: None,
+						_deadline_slot: None,
 					});
 				}
 				let refill_seconds = now
@@ -857,6 +958,7 @@ impl HostThrottle {
 						throttled: true,
 						shadow_decision,
 						_gate: Some(gate_guard),
+						_deadline_slot: None,
 					});
 				}
 
@@ -1087,6 +1189,15 @@ fn throttle_wait_budget(config: &ConfigFile, request_started: Instant) -> Durati
 		.saturating_sub(fetch_reserve)
 }
 
+fn throttle_deadline_fallback_budget(config: &ConfigFile, request_started: Instant) -> Duration {
+	let request_timeout = Duration::from_millis(config.timeout);
+	let fetch_reserve =
+		Duration::from_millis(config.connect_timeout_ms.min(config.timeout).div_ceil(2));
+	request_timeout
+		.saturating_sub(request_started.elapsed())
+		.saturating_sub(fetch_reserve)
+}
+
 fn response_retry_after(wait: Duration) -> axum::http::HeaderValue {
 	let seconds = wait
 		.as_secs()
@@ -1138,6 +1249,8 @@ struct OtlpMetrics {
 	fetch_retry_successes: Counter<u64>,
 	upstream_429_rescue_attempts: Counter<u64>,
 	upstream_429_rescue_outcomes: Counter<u64>,
+	host_throttle_deadline_fallback_attempts: Counter<u64>,
+	host_throttle_deadline_fallback_outcomes: Counter<u64>,
 	dns_cache_requests: Counter<u64>,
 	dns_cache_entries: Gauge<u64>,
 	dns_cache_capacity_entries: Gauge<u64>,
@@ -1234,6 +1347,12 @@ impl OtlpMetrics {
 				.build(),
 			upstream_429_rescue_outcomes: meter
 				.u64_counter("media_proxy_upstream_429_rescue_outcomes_total")
+				.build(),
+			host_throttle_deadline_fallback_attempts: meter
+				.u64_counter("media_proxy_host_throttle_deadline_fallback_attempts_total")
+				.build(),
+			host_throttle_deadline_fallback_outcomes: meter
+				.u64_counter("media_proxy_host_throttle_deadline_fallback_outcomes_total")
 				.build(),
 			dns_cache_requests: meter
 				.u64_counter("media_proxy_dns_cache_requests_total")
@@ -1578,6 +1697,11 @@ struct GlobalStats {
 	upstream_429_retry_saved: AtomicU64,
 	upstream_429_stale_saved: AtomicU64,
 	upstream_429_unrescued: AtomicU64,
+	throttle_deadline_fallback_attempts: AtomicU64,
+	throttle_deadline_fallback_acquired: AtomicU64,
+	throttle_initial_wait_timeouts: AtomicU64,
+	throttle_429_retry_wait_timeouts: AtomicU64,
+	throttle_connect_retry_wait_timeouts: AtomicU64,
 	http1_responses: AtomicU64,
 	http2_responses: AtomicU64,
 	cache_stale_served: AtomicU64,
@@ -1647,6 +1771,11 @@ impl GlobalStats {
 			upstream_429_retry_saved: AtomicU64::new(0),
 			upstream_429_stale_saved: AtomicU64::new(0),
 			upstream_429_unrescued: AtomicU64::new(0),
+			throttle_deadline_fallback_attempts: AtomicU64::new(0),
+			throttle_deadline_fallback_acquired: AtomicU64::new(0),
+			throttle_initial_wait_timeouts: AtomicU64::new(0),
+			throttle_429_retry_wait_timeouts: AtomicU64::new(0),
+			throttle_connect_retry_wait_timeouts: AtomicU64::new(0),
 			http1_responses: AtomicU64::new(0),
 			http2_responses: AtomicU64::new(0),
 			cache_stale_served: AtomicU64::new(0),
@@ -1802,6 +1931,34 @@ impl GlobalStats {
 			metrics
 				.upstream_429_rescue_outcomes
 				.add(1, &[KeyValue::new("result", result)]);
+		}
+	}
+
+	fn observe_deadline_fallback<T>(
+		&self,
+		result: &Result<T, HostThrottleRejection>,
+		context: DeadlineFallbackContext,
+	) {
+		self.throttle_deadline_fallback_attempts
+			.fetch_add(1, Ordering::Relaxed);
+		let outcome = if result.is_ok() {
+			self.throttle_deadline_fallback_acquired
+				.fetch_add(1, Ordering::Relaxed);
+			"acquired"
+		} else {
+			match context {
+				DeadlineFallbackContext::Initial => &self.throttle_initial_wait_timeouts,
+				DeadlineFallbackContext::Upstream429Retry => &self.throttle_429_retry_wait_timeouts,
+				DeadlineFallbackContext::ConnectRetry => &self.throttle_connect_retry_wait_timeouts,
+			}
+			.fetch_add(1, Ordering::Relaxed);
+			context.timeout_result()
+		};
+		if let Some(metrics) = &self.otlp {
+			metrics.host_throttle_deadline_fallback_attempts.add(1, &[]);
+			metrics
+				.host_throttle_deadline_fallback_outcomes
+				.add(1, &[KeyValue::new("result", outcome)]);
 		}
 	}
 	fn observe_request(&self, timings: &PhaseTimings, is_static_path: bool) {
@@ -2588,6 +2745,21 @@ fn main() {
 						stats.upstream_429_stale_saved.swap(0, Ordering::Relaxed);
 					let upstream_429_unrescued =
 						stats.upstream_429_unrescued.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_attempts = stats
+						.throttle_deadline_fallback_attempts
+						.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_acquired = stats
+						.throttle_deadline_fallback_acquired
+						.swap(0, Ordering::Relaxed);
+					let throttle_initial_wait_timeouts = stats
+						.throttle_initial_wait_timeouts
+						.swap(0, Ordering::Relaxed);
+					let throttle_429_retry_wait_timeouts = stats
+						.throttle_429_retry_wait_timeouts
+						.swap(0, Ordering::Relaxed);
+					let throttle_connect_retry_wait_timeouts = stats
+						.throttle_connect_retry_wait_timeouts
+						.swap(0, Ordering::Relaxed);
 					let (http1, http2) = stats.swap_reset_http();
 					let stale_served = stats.cache_stale_served.swap(0, Ordering::Relaxed);
 					let throttle_passed = stats.throttle_passed.swap(0, Ordering::Relaxed);
@@ -2686,6 +2858,11 @@ fn main() {
 						upstream_429_retry_saved,
 						upstream_429_stale_saved,
 						upstream_429_unrescued,
+						throttle_deadline_fallback_attempts,
+						throttle_deadline_fallback_acquired,
+						throttle_initial_wait_timeouts,
+						throttle_429_retry_wait_timeouts,
+						throttle_connect_retry_wait_timeouts,
 						http1_responses = http1,
 						http2_responses = http2,
 						cache_stale_served = stale_served,
@@ -4336,7 +4513,6 @@ async fn get_file_inner(
 							throttle_wait_total += final_rejection.waited;
 							if let Ok(mut t) = timings.lock() {
 								t.wait += final_rejection.waited;
-								t.fetch_err = Some("throttle:wait_timeout".to_owned());
 							}
 							if !has_range {
 								if let Some(stale) = response_cache.get_stale(&cache_key) {
@@ -4356,24 +4532,64 @@ async fn get_file_inner(
 									return Err(resp);
 								}
 							}
-							headers.append("X-Proxy-Error", "HostThrottleTimeout".parse().unwrap());
-							headers.append(
-								"Retry-After",
-								response_retry_after(final_rejection.retry_after),
-							);
-							if let Ok(t) = timings.lock() {
-								emit_summary(
-									&config,
-									&summary,
-									&t,
-									503,
-									true,
-									Some("HostThrottleTimeout"),
-									&global_stats,
-								);
+							let fallback_context = if upstream_429_rescue.pending {
+								DeadlineFallbackContext::Upstream429Retry
+							} else {
+								DeadlineFallbackContext::Initial
+							};
+							let fallback = throttle
+								.acquire_for_deadline_fallback(
+									&current_url,
+									throttle_deadline_fallback_budget(&config, request_started),
+									final_rejection.shadow_decision,
+								)
+								.await;
+							global_stats.observe_deadline_fallback(&fallback, fallback_context);
+							global_stats.observe_host_throttle(&fallback);
+							match fallback {
+								Ok(permit) => Some(permit),
+								Err(fallback_rejection) => {
+									throttle_wait_total += fallback_rejection.waited;
+									let (fetch_error, summary_error) = match fallback_context {
+										DeadlineFallbackContext::Upstream429Retry => (
+											"throttle:429_retry_wait_timeout",
+											"HostThrottle429RetryWaitTimeout",
+										),
+										_ => (
+											"throttle:initial_wait_timeout",
+											"HostThrottleInitialWaitTimeout",
+										),
+									};
+									if let Ok(mut t) = timings.lock() {
+										t.wait += fallback_rejection.waited;
+										t.fetch_err = Some(fetch_error.to_owned());
+									}
+									headers.append(
+										"X-Proxy-Error",
+										"HostThrottleTimeout".parse().unwrap(),
+									);
+									headers.append(
+										"Retry-After",
+										response_retry_after(fallback_rejection.retry_after),
+									);
+									if let Ok(t) = timings.lock() {
+										emit_summary(
+											&config,
+											&summary,
+											&t,
+											503,
+											true,
+											Some(summary_error),
+											&global_stats,
+										);
+									}
+									return Err((
+										axum::http::StatusCode::SERVICE_UNAVAILABLE,
+										headers,
+									)
+										.into_response());
+								}
 							}
-							return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, headers)
-								.into_response());
 						}
 					}
 				}
@@ -4471,7 +4687,6 @@ async fn get_file_inner(
 										throttle_wait_total += final_rejection.waited;
 										if let Ok(mut t) = timings.lock() {
 											t.wait += final_rejection.waited;
-											t.fetch_err = Some("throttle:wait_timeout".to_owned());
 											t.retried = true;
 										}
 										if let Some(stale) = response_cache.get_stale(&cache_key) {
@@ -4491,30 +4706,61 @@ async fn get_file_inner(
 											}
 											return Err(resp);
 										}
-										headers.append(
-											"X-Proxy-Error",
-											"HostThrottleTimeout".parse().unwrap(),
+										let fallback = throttle
+											.acquire_for_deadline_fallback(
+												&current_url,
+												throttle_deadline_fallback_budget(
+													&config,
+													request_started,
+												),
+												final_rejection.shadow_decision,
+											)
+											.await;
+										global_stats.observe_deadline_fallback(
+											&fallback,
+											DeadlineFallbackContext::ConnectRetry,
 										);
-										headers.append(
-											"Retry-After",
-											response_retry_after(final_rejection.retry_after),
-										);
-										if let Ok(t) = timings.lock() {
-											emit_summary(
-												&config,
-												&summary,
-												&t,
-												503,
-												true,
-												Some("HostThrottleTimeout"),
-												&global_stats,
-											);
+										global_stats.observe_host_throttle(&fallback);
+										match fallback {
+											Ok(permit) => Some(permit),
+											Err(fallback_rejection) => {
+												throttle_wait_total += fallback_rejection.waited;
+												if let Ok(mut t) = timings.lock() {
+													t.wait += fallback_rejection.waited;
+													t.fetch_err = Some(
+														"throttle:connect_retry_wait_timeout"
+															.to_owned(),
+													);
+													t.retried = true;
+												}
+												headers.append(
+													"X-Proxy-Error",
+													"HostThrottleTimeout".parse().unwrap(),
+												);
+												headers.append(
+													"Retry-After",
+													response_retry_after(
+														fallback_rejection.retry_after,
+													),
+												);
+												if let Ok(t) = timings.lock() {
+													emit_summary(
+														&config,
+														&summary,
+														&t,
+														503,
+														true,
+														Some("HostThrottleConnectRetryWaitTimeout"),
+														&global_stats,
+													);
+												}
+												return Err((
+													axum::http::StatusCode::SERVICE_UNAVAILABLE,
+													headers,
+												)
+													.into_response());
+											}
 										}
-										return Err((
-											axum::http::StatusCode::SERVICE_UNAVAILABLE,
-											headers,
-										)
-											.into_response());
 									}
 								}
 							}
@@ -5824,16 +6070,20 @@ mod metrics_tests {
 			throttled: true,
 			shadow_decision: None,
 			_gate: None,
+			_deadline_slot: None,
 		}));
 		stats.observe_host_throttle(&Ok(HostThrottlePermit {
 			waited: Duration::ZERO,
 			throttled: false,
 			shadow_decision: None,
 			_gate: None,
+			_deadline_slot: None,
 		}));
 		let mut rescue = Upstream429RescueGuard::new(stats.clone());
 		rescue.start();
 		rescue.complete("retry_success");
+		let deadline_fallback: Result<(), HostThrottleRejection> = Ok(());
+		stats.observe_deadline_fallback(&deadline_fallback, DeadlineFallbackContext::Initial);
 		assert_eq!(stats.throttle_passed.load(Ordering::Relaxed), 1);
 		assert_eq!(stats.throttle_waited.load(Ordering::Relaxed), 1);
 		{
@@ -5897,6 +6147,8 @@ mod metrics_tests {
 			"media_proxy_fetch_retry_successes_total",
 			"media_proxy_upstream_429_rescue_attempts_total",
 			"media_proxy_upstream_429_rescue_outcomes_total",
+			"media_proxy_host_throttle_deadline_fallback_attempts_total",
+			"media_proxy_host_throttle_deadline_fallback_outcomes_total",
 			"media_proxy_dns_cache_requests_total",
 			"media_proxy_dns_cache_entries",
 			"media_proxy_dns_cache_capacity_entries",
@@ -5953,6 +6205,54 @@ mod metrics_tests {
 		assert_eq!(stats.upstream_429_retry_saved.load(Ordering::Relaxed), 1);
 		assert_eq!(stats.upstream_429_stale_saved.load(Ordering::Relaxed), 1);
 		assert_eq!(stats.upstream_429_unrescued.load(Ordering::Relaxed), 1);
+	}
+
+	#[test]
+	fn deadline_fallback_metrics_distinguish_wait_stages() {
+		let stats = GlobalStats::new();
+		let acquired: Result<(), HostThrottleRejection> = Ok(());
+		stats.observe_deadline_fallback(&acquired, DeadlineFallbackContext::Initial);
+		for context in [
+			DeadlineFallbackContext::Initial,
+			DeadlineFallbackContext::Upstream429Retry,
+			DeadlineFallbackContext::ConnectRetry,
+		] {
+			let rejected: Result<(), HostThrottleRejection> = Err(HostThrottleRejection {
+				waited: Duration::ZERO,
+				retry_after: Duration::from_secs(1),
+				shadow_decision: None,
+			});
+			stats.observe_deadline_fallback(&rejected, context);
+		}
+
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_attempts
+				.load(Ordering::Relaxed),
+			4
+		);
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_acquired
+				.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats.throttle_initial_wait_timeouts.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats
+				.throttle_429_retry_wait_timeouts
+				.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats
+				.throttle_connect_retry_wait_timeouts
+				.load(Ordering::Relaxed),
+			1
+		);
 	}
 
 	#[test]
@@ -6739,6 +7039,54 @@ mod network_policy_tests {
 					.sample_count,
 				2
 			);
+		});
+	}
+
+	#[test]
+	fn host_throttle_deadline_fallback_bypasses_cooldown_with_bounded_concurrency() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut config = throttle_config("media.example");
+			config.max_wait_ms = 1;
+			let throttle = Arc::new(HostThrottle::new(&config).unwrap());
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			let permit = throttle
+				.acquire(&target, Duration::from_millis(100))
+				.await
+				.unwrap();
+			throttle
+				.observe_response(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&reqwest::header::HeaderMap::new(),
+					false,
+				)
+				.await;
+			drop(permit);
+
+			let Err(rejection) = throttle.acquire(&target, Duration::from_millis(10)).await else {
+				panic!("normal throttle acquisition should time out");
+			};
+			let fallback = throttle
+				.acquire_for_deadline_fallback(
+					&target,
+					Duration::from_millis(50),
+					rejection.shadow_decision,
+				)
+				.await
+				.unwrap();
+			let second = throttle.clone();
+			let second_target = target.clone();
+			let blocked = tokio::spawn(async move {
+				second
+					.acquire_for_deadline_fallback(&second_target, Duration::from_millis(5), None)
+					.await
+			});
+			assert!(blocked.await.unwrap().is_err());
+			drop(fallback);
 		});
 	}
 
