@@ -150,7 +150,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 すべての追加項目は `#[serde(default)]` 付きのため、既存の config.json をそのまま使えます。
 
-`host_throttle`を設定した場合、通常時の送信は制限せず、429を返したホストだけサーキットブレーカーの対象にします。`requests_per_second`と`burst`は回復中の送信レートとバースト上限です。`max_wait_ms`はFIFOキューで待機できる上限で、5秒・10秒のクールダウンをジッター込みで待てる`15000`を推奨します。`max_hosts`は保持するホスト状態数、`queue_capacity`はホストごとの最大待機数です。`queue_capacity`を省略した場合は64です。新しいクールダウンを開始する429ごとにレートを半減（下限0.25件/秒）しますが、同じクールダウン中に到着した並行429は重複カウントしません。有効な`Retry-After`があればその期間は送信を停止し、0秒または期限切れの場合は5〜60秒の指数バックオフとジッターを使用します。クールダウン開始ログには上流の`Retry-After`、`RateLimit`、`X-RateLimit`、CDN識別ヘッダーも記録します。クールダウン終了後は送信を直列化し、3件連続で成功すると通常状態へ復帰します。キュー待機が失敗しても期限切れのレスポンスキャッシュが利用可能なら、503ではなくstale画像を返します。
+`host_throttle`を設定した場合、通常時の送信は制限せず、429を返したホストだけサーキットブレーカーの対象にします。`requests_per_second`と`burst`は回復中の送信レートとバースト上限です。`max_wait_ms`はFIFOキューで待機できる通常の上限で、5秒・10秒のクールダウンをジッター込みで待てる`15000`を推奨します。`max_hosts`は保持するホスト状態数、`queue_capacity`はホストごとの最大待機数です。`queue_capacity`を省略した場合は64です。新しいクールダウンを開始する429ごとにレートを半減（下限0.25件/秒）しますが、同じクールダウン中に到着した並行429は重複カウントしません。有効な`Retry-After`があればその期間は送信を停止し、0秒または期限切れの場合は5〜60秒の指数バックオフとジッターを使用します。クールダウン開始ログには上流の`Retry-After`、`RateLimit`、`X-RateLimit`、CDN識別ヘッダーも記録します。クールダウン終了後は送信を直列化し、3件連続で成功すると通常状態へ復帰します。
+
+上流が429を返した場合、Rangeリクエストを除いて、最初に期限切れレスポンスキャッシュを確認し、利用できなければクールダウンを待って1回だけ再試行します。`host_throttle`が無効な場合も`Retry-After`または既定のクールダウンを待機します。通常のキュー待機上限に達した場合もstaleを優先し、利用できなければリクエスト全体の残り期限まで待機を継続してから503を返します。60秒ごとの`periodic_stats`ログでは`upstream_429_rescue_attempts`、`upstream_429_retry_saved`、`upstream_429_stale_saved`、`upstream_429_unrescued`で救済結果を確認できます。
 
 `observation_hosts`にホスト名を指定すると、`observation_interval_ms`（既定10000ms）ごとに`host_throttle_window`ログを出力します。ログにはホスト別の上流送信数、2xx・429・その他応答数、制御下通過数、拒否数、合計待機時間、現在・最大キュー深度、現在レート、トークン数、クールダウン残時間、回復状態が含まれます。通信・応答・待機・拒否がなくキューも空の観測窓は出力しません。空配列の場合は出力しません。
 
@@ -221,31 +223,34 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 出力形式の属性 `format` は `jpeg`、`png`、`webp`、`avif`、`other` の5種類です。圧縮率は `media_proxy_output_bytes_total / media_proxy_input_bytes_total`、パススルー率は `media_proxy_passthrough_total / media_proxy_requests_total` で算出します。処理エラーの `category` は `decode`、`encode`、`policy`、`size`、`internal`、fetchエラーは `dns`、`connect`、`timeout`、`reset`、`body`、`throttle`、`other` の固定分類です。流量制御結果の`result`は`passed`、`waited`、`rejected`の3種類で、ホスト名は属性に含めません。
 
-| メトリクス                                 | 種別      | 内容                                 |
-| ------------------------------------------ | --------- | ------------------------------------ |
-| `media_proxy_outputs_total`                | Counter   | 出力形式別累積数                     |
-| `media_proxy_input_bytes_total`            | Counter   | 処理入力バイト累積数                 |
-| `media_proxy_output_bytes_total`           | Counter   | 処理出力バイト累積数                 |
-| `media_proxy_passthrough_total`            | Counter   | パススルー累積数                     |
-| `media_proxy_processing_errors_total`      | Counter   | 画像処理・ポリシーエラー分類別累積数 |
-| `media_proxy_fetch_errors_total`           | Counter   | fetchエラー分類別累積数              |
-| `media_proxy_host_throttle_requests_total` | Counter   | 流量制御結果別の累積数               |
-| `media_proxy_host_throttle_wait_duration`  | Histogram | 流量制御の待機時間                   |
-| `media_proxy_fetch_retry_attempts_total`   | Counter   | fetchリトライ累積数                  |
-| `media_proxy_fetch_retry_successes_total`  | Counter   | fetchリトライ成功累積数              |
-| `media_proxy_dns_cache_requests_total`     | Counter   | DNSキャッシュ結果別累積数            |
-| `media_proxy_dns_cache_entries`            | Gauge     | DNSキャッシュエントリ数              |
-| `media_proxy_dns_cache_capacity_entries`   | Gauge     | DNSキャッシュエントリ上限            |
-| `media_proxy_dns_retry_attempts_total`     | Counter   | DNSリトライ累積数                    |
-| `media_proxy_dns_retry_successes_total`    | Counter   | DNSリトライ成功累積数                |
-| `media_proxy_stale_served_total`           | Counter   | staleキャッシュ提供累積数            |
-| `media_proxy_animations_total`             | Counter   | アニメーション処理累積数             |
-| `media_proxy_animation_frames_total`       | Counter   | アニメーション処理フレーム累積数     |
-| `media_proxy_animation_input_bytes_total`  | Counter   | アニメーション入力バイト累積数       |
-| `media_proxy_animation_output_bytes_total` | Counter   | アニメーション出力バイト累積数       |
-| `media_proxy_uptime`                       | Gauge     | プロセス起動からの経過秒数           |
+| メトリクス                                       | 種別      | 内容                                 |
+| ------------------------------------------------ | --------- | ------------------------------------ |
+| `media_proxy_outputs_total`                      | Counter   | 出力形式別累積数                     |
+| `media_proxy_input_bytes_total`                  | Counter   | 処理入力バイト累積数                 |
+| `media_proxy_output_bytes_total`                 | Counter   | 処理出力バイト累積数                 |
+| `media_proxy_passthrough_total`                  | Counter   | パススルー累積数                     |
+| `media_proxy_processing_errors_total`            | Counter   | 画像処理・ポリシーエラー分類別累積数 |
+| `media_proxy_fetch_errors_total`                 | Counter   | fetchエラー分類別累積数              |
+| `media_proxy_host_throttle_requests_total`       | Counter   | 流量制御結果別の累積数               |
+| `media_proxy_host_throttle_wait_duration`        | Histogram | 流量制御の待機時間                   |
+| `media_proxy_fetch_retry_attempts_total`         | Counter   | fetchリトライ累積数                  |
+| `media_proxy_fetch_retry_successes_total`        | Counter   | fetchリトライ成功累積数              |
+| `media_proxy_upstream_429_rescue_attempts_total` | Counter   | 上流429救済試行累積数                |
+| `media_proxy_upstream_429_rescue_outcomes_total` | Counter   | 上流429救済結果別累積数              |
+| `media_proxy_dns_cache_requests_total`           | Counter   | DNSキャッシュ結果別累積数            |
+| `media_proxy_dns_cache_entries`                  | Gauge     | DNSキャッシュエントリ数              |
+| `media_proxy_dns_cache_capacity_entries`         | Gauge     | DNSキャッシュエントリ上限            |
+| `media_proxy_dns_retry_attempts_total`           | Counter   | DNSリトライ累積数                    |
+| `media_proxy_dns_retry_successes_total`          | Counter   | DNSリトライ成功累積数                |
+| `media_proxy_stale_served_total`                 | Counter   | staleキャッシュ提供累積数            |
+| `media_proxy_animations_total`                   | Counter   | アニメーション処理累積数             |
+| `media_proxy_animation_frames_total`             | Counter   | アニメーション処理フレーム累積数     |
+| `media_proxy_animation_input_bytes_total`        | Counter   | アニメーション入力バイト累積数       |
+| `media_proxy_animation_output_bytes_total`       | Counter   | アニメーション出力バイト累積数       |
+| `media_proxy_uptime`                             | Gauge     | プロセス起動からの経過秒数           |
 
 DNSキャッシュ結果の属性 `result` は `hit`、`stale`、`miss` の3種類です。
+上流429救済結果の属性`result`は`retry_success`、`stale`、`unrescued`の3種類です。
 
 ### ドメイン構造化ログ
 
