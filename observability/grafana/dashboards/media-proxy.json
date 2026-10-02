@@ -2478,7 +2478,7 @@
                     "kind": "DataQuery",
                     "spec": {
                       "editorMode": "code",
-                      "expr": "sum by (result) (rate(media_proxy_host_throttle_deadline_fallback_terminal_outcomes_total[1m]))",
+                      "expr": "sum by (result) (rate(media_proxy_host_throttle_deadline_fallback_terminal_outcomes_total[1m])) or label_replace(vector(0), \"result\", \"response_2xx\", \"\", \"\") or label_replace(vector(0), \"result\", \"response_429\", \"\", \"\") or label_replace(vector(0), \"result\", \"response_other\", \"\", \"\") or label_replace(vector(0), \"result\", \"connect_timeout\", \"\", \"\") or label_replace(vector(0), \"result\", \"body_error\", \"\", \"\") or label_replace(vector(0), \"result\", \"request_deadline_exceeded\", \"\", \"\")",
                       "legendFormat": "{{result}}",
                       "range": true
                     },
