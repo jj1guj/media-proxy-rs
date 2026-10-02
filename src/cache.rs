@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use axum::body::Bytes;
 use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 use tokio::sync::broadcast;
@@ -381,6 +382,231 @@ impl Drop for FlightGuard {
 				inflight.remove(&self.key);
 			}
 		}
+	}
+}
+
+#[derive(Clone)]
+pub struct SourceEntry {
+	pub content_type: Option<String>,
+	pub content_disposition: Option<String>,
+	pub body: Bytes,
+	created_at: Instant,
+	size: usize,
+}
+
+impl SourceEntry {
+	pub fn new(
+		content_type: Option<String>,
+		content_disposition: Option<String>,
+		body: Bytes,
+	) -> Self {
+		let size = body.len() + 256;
+		Self {
+			content_type,
+			content_disposition,
+			body,
+			created_at: Instant::now(),
+			size,
+		}
+	}
+}
+
+pub struct SourceCacheConfig {
+	pub enabled: bool,
+	pub max_bytes: usize,
+	pub entry_max_bytes: usize,
+	pub ttl: Duration,
+}
+
+pub struct SourceCache {
+	config: SourceCacheConfig,
+	entries: Mutex<SourceLruInner>,
+	inflight: Mutex<HashMap<String, broadcast::Sender<Option<SourceEntry>>>>,
+}
+
+struct SourceLruInner {
+	map: IndexMap<String, SourceEntry>,
+	total_bytes: usize,
+}
+
+pub enum SourceCacheLookup {
+	Bypass,
+	Hit(SourceEntry),
+	Leader(SourceFlightGuard),
+	Follower(broadcast::Receiver<Option<SourceEntry>>),
+}
+
+impl SourceCache {
+	pub fn new(config: SourceCacheConfig) -> Self {
+		Self {
+			config,
+			entries: Mutex::new(SourceLruInner {
+				map: IndexMap::new(),
+				total_bytes: 0,
+			}),
+			inflight: Mutex::new(HashMap::new()),
+		}
+	}
+
+	pub fn lookup_or_start(self: &Arc<Self>, key: String) -> SourceCacheLookup {
+		if !self.config.enabled {
+			return SourceCacheLookup::Bypass;
+		}
+		if let Ok(mut inner) = self.entries.lock() {
+			if let Some(entry) = inner.map.get(&key) {
+				if entry.created_at.elapsed() < self.config.ttl {
+					let entry = entry.clone();
+					let from = inner.map.get_index_of(&key).unwrap();
+					let to = inner.map.len() - 1;
+					inner.map.move_index(from, to);
+					return SourceCacheLookup::Hit(entry);
+				}
+				if let Some(expired) = inner.map.shift_remove(&key) {
+					inner.total_bytes = inner.total_bytes.saturating_sub(expired.size);
+				}
+			}
+		}
+		let Ok(mut inflight) = self.inflight.lock() else {
+			return SourceCacheLookup::Bypass;
+		};
+		if let Some(sender) = inflight.get(&key) {
+			return SourceCacheLookup::Follower(sender.subscribe());
+		}
+		let (sender, _) = broadcast::channel(1);
+		inflight.insert(key.clone(), sender.clone());
+		SourceCacheLookup::Leader(SourceFlightGuard {
+			key,
+			sender,
+			cache: Arc::clone(self),
+			completed: false,
+		})
+	}
+
+	fn put(&self, key: String, entry: SourceEntry) -> bool {
+		if !self.config.enabled
+			|| entry.size > self.config.entry_max_bytes
+			|| entry.size > self.config.max_bytes
+		{
+			return false;
+		}
+		let Ok(mut inner) = self.entries.lock() else {
+			return false;
+		};
+		if let Some(old) = inner.map.shift_remove(&key) {
+			inner.total_bytes = inner.total_bytes.saturating_sub(old.size);
+		}
+		while inner.total_bytes + entry.size > self.config.max_bytes && !inner.map.is_empty() {
+			if let Some((_, evicted)) = inner.map.shift_remove_index(0) {
+				inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
+			}
+		}
+		inner.total_bytes += entry.size;
+		inner.map.insert(key, entry);
+		true
+	}
+
+	pub fn complete_flight(
+		self: &Arc<Self>,
+		guard: &mut SourceFlightGuard,
+		entry: Option<SourceEntry>,
+	) {
+		if let Some(entry) = &entry {
+			self.put(guard.key.clone(), entry.clone());
+		}
+		let _ = guard.sender.send(entry);
+		guard.completed = true;
+		if let Ok(mut inflight) = self.inflight.lock() {
+			inflight.remove(&guard.key);
+		}
+	}
+
+	pub fn stats(&self) -> (usize, usize) {
+		self.entries
+			.lock()
+			.map(|inner| (inner.map.len(), inner.total_bytes))
+			.unwrap_or((0, 0))
+	}
+}
+
+pub struct SourceFlightGuard {
+	key: String,
+	sender: broadcast::Sender<Option<SourceEntry>>,
+	cache: Arc<SourceCache>,
+	completed: bool,
+}
+
+impl Drop for SourceFlightGuard {
+	fn drop(&mut self) {
+		if !self.completed {
+			let _ = self.sender.send(None);
+			if let Ok(mut inflight) = self.cache.inflight.lock() {
+				self.inflight_remove(&mut inflight);
+			}
+		}
+	}
+}
+
+impl SourceFlightGuard {
+	fn inflight_remove(
+		&self,
+		inflight: &mut HashMap<String, broadcast::Sender<Option<SourceEntry>>>,
+	) {
+		inflight.remove(&self.key);
+	}
+}
+
+#[cfg(test)]
+mod source_cache_tests {
+	use super::*;
+
+	fn cache(max_bytes: usize) -> Arc<SourceCache> {
+		Arc::new(SourceCache::new(SourceCacheConfig {
+			enabled: true,
+			max_bytes,
+			entry_max_bytes: max_bytes,
+			ttl: Duration::from_secs(60),
+		}))
+	}
+
+	#[tokio::test]
+	async fn shares_completed_source_with_followers() {
+		let cache = cache(4096);
+		let SourceCacheLookup::Leader(mut leader) =
+			cache.lookup_or_start("https://example.com/image".into())
+		else {
+			panic!("first lookup must lead");
+		};
+		let SourceCacheLookup::Follower(mut follower) =
+			cache.lookup_or_start("https://example.com/image".into())
+		else {
+			panic!("second lookup must follow");
+		};
+		let entry = SourceEntry::new(Some("image/png".into()), None, Bytes::from_static(b"png"));
+		cache.complete_flight(&mut leader, Some(entry));
+		assert_eq!(follower.recv().await.unwrap().unwrap().body, "png");
+		assert!(matches!(
+			cache.lookup_or_start("https://example.com/image".into()),
+			SourceCacheLookup::Hit(_)
+		));
+	}
+
+	#[test]
+	fn evicts_least_recently_used_source_to_fit_capacity() {
+		let cache = cache(520);
+		for key in ["a", "b"] {
+			let SourceCacheLookup::Leader(mut leader) = cache.lookup_or_start(key.into()) else {
+				panic!("lookup must lead");
+			};
+			cache.complete_flight(
+				&mut leader,
+				Some(SourceEntry::new(None, None, Bytes::from_static(b"12345"))),
+			);
+		}
+		assert_eq!(cache.stats().0, 1);
+		assert!(matches!(
+			cache.lookup_or_start("a".into()),
+			SourceCacheLookup::Leader(_)
+		));
 	}
 }
 

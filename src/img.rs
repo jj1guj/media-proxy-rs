@@ -1811,6 +1811,9 @@ mod tests {
 				cache_max_bytes: default_cache_max_bytes(),
 				cache_entry_max_bytes: default_cache_entry_max_bytes(),
 				cache_ttl_secs: default_cache_ttl_secs(),
+				source_cache_max_bytes: crate::default_source_cache_max_bytes(),
+				source_cache_entry_max_bytes: crate::default_source_cache_entry_max_bytes(),
+				source_cache_ttl_secs: crate::default_source_cache_ttl_secs(),
 				negative_cache_404_ttl_secs: default_negative_cache_404_ttl_secs(),
 				negative_cache_410_ttl_secs: default_negative_cache_410_ttl_secs(),
 				negative_cache_max_entries: default_negative_cache_max_entries(),
@@ -1857,6 +1860,15 @@ mod tests {
 			is_static_path: false,
 			global_stats: std::sync::Arc::new(GlobalStats::new()),
 			deadline_fallback_response_pending: false,
+			source_cache: std::sync::Arc::new(crate::cache::SourceCache::new(
+				crate::cache::SourceCacheConfig {
+					enabled: false,
+					max_bytes: 0,
+					entry_max_bytes: 0,
+					ttl: std::time::Duration::ZERO,
+				},
+			)),
+			source_flight_guard: None,
 		}
 	}
 

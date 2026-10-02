@@ -128,6 +128,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `cache_max_bytes`              | u64       | `134217728` (128MB) | キャッシュ合計バイト数上限                                                   |
 | `cache_entry_max_bytes`        | u64       | `5242880` (5MB)     | 1エントリの最大バイト数                                                      |
 | `cache_ttl_secs`               | u64       | `3600`              | キャッシュTTL(秒)                                                            |
+| `source_cache_max_bytes`       | u64       | `134217728` (128MB) | 元画像キャッシュの合計バイト数上限                                           |
+| `source_cache_entry_max_bytes` | u64       | `5242880` (5MB)     | 元画像キャッシュの1エントリ最大バイト数                                      |
+| `source_cache_ttl_secs`        | u64       | `3600`              | 元画像キャッシュTTL(秒)                                                      |
 | `negative_cache_404_ttl_secs`  | u64       | `3600`              | 上流404のネガティブキャッシュTTL(秒)。`0`で無効                              |
 | `negative_cache_410_ttl_secs`  | u64       | `86400`             | 上流410のネガティブキャッシュTTL(秒)。`0`で無効                              |
 | `negative_cache_max_entries`   | usize     | `16384`             | 404/410ネガティブキャッシュの最大URL数                                       |
@@ -203,7 +206,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_decode_duration`              | Histogram     | decode時間                                     |
 | `media_proxy_encode_duration`              | Histogram     | encode時間                                     |
 
-キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative`、`evicted` の7種類です。`evicted`は過去24時間以内に容量不足で追い出されたキーが再び要求され、上流取得へ進んだことを示します。60秒ごとのINFO統計ログでは`cache_capacity_evictions`が追い出し件数、`cache_evicted_reaccesses`が追い出し後の上流再取得件数です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss + evicted)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
+キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative`、`evicted` の7種類です。`evicted`は過去24時間以内に容量不足で追い出されたキーが再び要求され、上流取得へ進んだことを示します。60秒ごとのINFO統計ログでは`cache_capacity_evictions`が追い出し件数、`cache_evicted_reaccesses`が追い出し後の上流再取得件数です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss + evicted)` で算出します。元画像キャッシュは正規化URL単位で本文を保持し、`/image.webp`、`/static.webp`、`/avatar.webp`などの変換間で上流取得とsingleflightを共有します。元画像キャッシュ結果の`result`は`hit`、`miss`、`joined`、`bypass`の4種類です。GaugeはOTLP送信間隔ごとに更新されます。
 
 | メトリクス                                   | 種別      | 内容                                   |
 | -------------------------------------------- | --------- | -------------------------------------- |
@@ -214,6 +217,10 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_cache_capacity_evictions_total` | Counter   | 容量超過によるeviction累積数           |
 | `media_proxy_cache_expired_evictions_total`  | Counter   | 有効期間超過によるeviction累積数       |
 | `media_proxy_singleflight_active`            | Gauge     | singleflight処理中件数                 |
+| `media_proxy_source_cache_requests_total`    | Counter   | 元画像キャッシュ結果別リクエスト累積数 |
+| `media_proxy_source_cache_entries`           | Gauge     | 元画像キャッシュエントリ数             |
+| `media_proxy_source_cache_bytes`             | Gauge     | 元画像キャッシュ使用バイト数           |
+| `media_proxy_source_cache_capacity_bytes`    | Gauge     | 元画像キャッシュ容量上限               |
 | `media_proxy_static_requests_total`          | Counter   | `/static.webp`のキャッシュ結果別累積数 |
 | `media_proxy_downloads_active`               | Gauge     | ダウンロード同時処理数                 |
 | `media_proxy_downloads_limit`                | Gauge     | ダウンロード同時処理上限               |
