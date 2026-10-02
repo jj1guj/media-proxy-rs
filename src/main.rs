@@ -47,6 +47,7 @@ fn default_host_throttle_observation_interval_ms() -> u64 {
 const PROACTIVE_SHADOW_MIN_UTILIZATION: f64 = 0.8;
 const PROACTIVE_SHADOW_UNSAFE_RATE_MARGIN: f64 = 0.9;
 const PROACTIVE_SHADOW_REQUIRED_QUALIFIED_WINDOWS: u32 = 3;
+const PROACTIVE_SHADOW_FALLBACK_MIN_QUALIFIED_SAMPLES: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -132,7 +133,7 @@ struct HostThrottleState {
 	gate: Arc<AsyncMutex<()>>,
 	queue_slots: Arc<Semaphore>,
 	deadline_slots: Arc<Semaphore>,
-	deadline_next_send: Instant,
+	deadline_last_send: Option<Instant>,
 	window: HostThrottleWindow,
 	proactive_shadow: Option<ProactiveShadowState>,
 }
@@ -406,7 +407,7 @@ impl HostThrottle {
 				gate: Arc::new(AsyncMutex::new(())),
 				queue_slots: Arc::new(Semaphore::new(self.queue_capacity)),
 				deadline_slots: Arc::new(Semaphore::new(1)),
-				deadline_next_send: now,
+				deadline_last_send: None,
 				window: HostThrottleWindow::default(),
 			})
 	}
@@ -760,6 +761,17 @@ impl HostThrottle {
 			.await
 	}
 
+	fn deadline_fallback_rate(&self, state: &HostThrottleState) -> f64 {
+		let shadow_rate = state.proactive_shadow.as_ref().and_then(|shadow| {
+			(shadow.qualified_sample_count >= PROACTIVE_SHADOW_FALLBACK_MIN_QUALIFIED_SAMPLES
+				&& shadow.rate_limit_episodes > 0)
+				.then_some(shadow.rate_per_second)
+		});
+		self.max_rate_per_second
+			.min(state.rate_per_second)
+			.min(shadow_rate.unwrap_or(f64::INFINITY))
+	}
+
 	async fn acquire_for_deadline_fallback(
 		&self,
 		url: &reqwest::Url,
@@ -796,44 +808,52 @@ impl HostThrottle {
 					});
 				}
 			};
-		let sleep_for = {
-			let mut states = self.states.lock().await;
-			let now = Instant::now();
-			let state = self.state_for_host(&mut states, &host, now);
-			state.deadline_next_send.saturating_duration_since(now)
-		};
-		if sleep_for > wait_budget.saturating_sub(started.elapsed()) {
-			let waited = started.elapsed();
-			self.record_rejection(&host, waited).await;
-			return Err(HostThrottleRejection {
-				waited,
-				retry_after: sleep_for.max(Duration::from_secs(1)),
-				shadow_decision,
-			});
+		loop {
+			let sleep_for = {
+				let mut states = self.states.lock().await;
+				let now = Instant::now();
+				let state = self.state_for_host(&mut states, &host, now);
+				let interval = Duration::from_secs_f64(1.0 / self.deadline_fallback_rate(state));
+				let rate_ready_at = state
+					.deadline_last_send
+					.map_or(now, |last_send| last_send + interval);
+				let ready_at = rate_ready_at.max(state.cooldown_until);
+				if ready_at <= now {
+					let waited = started.elapsed();
+					state.deadline_last_send = Some(now);
+					state.last_seen = now;
+					state.window.sends = state.window.sends.saturating_add(1);
+					state.window.throttled = state.window.throttled.saturating_add(1);
+					state.window.wait_ms = state
+						.window
+						.wait_ms
+						.saturating_add(waited.as_millis() as u64);
+					None
+				} else {
+					Some(ready_at.saturating_duration_since(now))
+				}
+			};
+			let Some(sleep_for) = sleep_for else {
+				return Ok(HostThrottlePermit {
+					waited: started.elapsed(),
+					throttled: true,
+					shadow_decision,
+					_gate: None,
+					_deadline_slot: Some(deadline_slot),
+				});
+			};
+			let elapsed = started.elapsed();
+			let remaining = wait_budget.saturating_sub(elapsed);
+			if sleep_for > remaining || remaining.is_zero() {
+				self.record_rejection(&host, elapsed).await;
+				return Err(HostThrottleRejection {
+					waited: elapsed,
+					retry_after: sleep_for.max(Duration::from_secs(1)),
+					shadow_decision,
+				});
+			}
+			tokio::time::sleep(sleep_for).await;
 		}
-		tokio::time::sleep(sleep_for).await;
-		let waited = started.elapsed();
-		{
-			let mut states = self.states.lock().await;
-			let now = Instant::now();
-			let state = self.state_for_host(&mut states, &host, now);
-			state.deadline_next_send =
-				now + Duration::from_secs_f64(1.0 / self.max_rate_per_second);
-			state.last_seen = now;
-			state.window.sends = state.window.sends.saturating_add(1);
-			state.window.throttled = state.window.throttled.saturating_add(1);
-			state.window.wait_ms = state
-				.window
-				.wait_ms
-				.saturating_add(waited.as_millis() as u64);
-		}
-		Ok(HostThrottlePermit {
-			waited,
-			throttled: true,
-			shadow_decision,
-			_gate: None,
-			_deadline_slot: Some(deadline_slot),
-		})
 	}
 
 	async fn acquire_with_limit(
@@ -7223,7 +7243,7 @@ mod network_policy_tests {
 	}
 
 	#[test]
-	fn host_throttle_deadline_fallback_bypasses_cooldown_with_bounded_concurrency() {
+	fn host_throttle_deadline_fallback_respects_cooldown() {
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
 			.build()
@@ -7256,6 +7276,53 @@ mod network_policy_tests {
 					Duration::from_millis(50),
 					rejection.shadow_decision,
 				)
+				.await;
+			assert!(fallback.is_err());
+		});
+	}
+
+	#[test]
+	fn host_throttle_deadline_fallback_uses_safe_learned_rate_when_mature() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let throttle = HostThrottle::new(&throttle_config("media.example")).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle
+				.acquire(&target, Duration::from_millis(100))
+				.await
+				.unwrap();
+			let mut states = throttle.states.lock().await;
+			let state = states.get_mut("media.example").unwrap();
+			state.rate_per_second = 4.0;
+			let shadow = state.proactive_shadow.as_mut().unwrap();
+			shadow.rate_per_second = 0.5;
+			shadow.qualified_sample_count = PROACTIVE_SHADOW_FALLBACK_MIN_QUALIFIED_SAMPLES - 1;
+			assert_eq!(throttle.deadline_fallback_rate(state), 4.0);
+			state
+				.proactive_shadow
+				.as_mut()
+				.unwrap()
+				.qualified_sample_count = PROACTIVE_SHADOW_FALLBACK_MIN_QUALIFIED_SAMPLES;
+			assert_eq!(throttle.deadline_fallback_rate(state), 4.0);
+			state.proactive_shadow.as_mut().unwrap().rate_limit_episodes = 1;
+			assert_eq!(throttle.deadline_fallback_rate(state), 0.5);
+		});
+	}
+
+	#[test]
+	fn host_throttle_deadline_fallback_has_bounded_concurrency() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let throttle = Arc::new(HostThrottle::new(&throttle_config("media.example")).unwrap());
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			let fallback = throttle
+				.acquire_for_deadline_fallback(&target, Duration::from_millis(50), None)
 				.await
 				.unwrap();
 			let second = throttle.clone();
