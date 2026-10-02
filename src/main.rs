@@ -1741,6 +1741,7 @@ struct GlobalStats {
 	source_cache_hits: AtomicU64,
 	source_cache_misses: AtomicU64,
 	source_cache_joined: AtomicU64,
+	source_cache_stale_served: AtomicU64,
 	cache_evicted_reaccesses: AtomicU64,
 	ferr_connect: AtomicU64,
 	ferr_timeout: AtomicU64,
@@ -1824,6 +1825,7 @@ impl GlobalStats {
 			source_cache_hits: AtomicU64::new(0),
 			source_cache_misses: AtomicU64::new(0),
 			source_cache_joined: AtomicU64::new(0),
+			source_cache_stale_served: AtomicU64::new(0),
 			cache_evicted_reaccesses: AtomicU64::new(0),
 			ferr_connect: AtomicU64::new(0),
 			ferr_timeout: AtomicU64::new(0),
@@ -1916,6 +1918,7 @@ impl GlobalStats {
 			"hit" => &self.source_cache_hits,
 			"miss" => &self.source_cache_misses,
 			"joined" => &self.source_cache_joined,
+			"stale" => &self.source_cache_stale_served,
 			_ => {
 				if let Some(metrics) = &self.otlp {
 					metrics
@@ -1932,11 +1935,12 @@ impl GlobalStats {
 				.add(1, &[KeyValue::new("result", result)]);
 		}
 	}
-	fn swap_reset_source_cache(&self) -> (u64, u64, u64) {
+	fn swap_reset_source_cache(&self) -> (u64, u64, u64, u64) {
 		(
 			self.source_cache_hits.swap(0, Ordering::Relaxed),
 			self.source_cache_misses.swap(0, Ordering::Relaxed),
 			self.source_cache_joined.swap(0, Ordering::Relaxed),
+			self.source_cache_stale_served.swap(0, Ordering::Relaxed),
 		)
 	}
 	/// fetch_err カウンタをリセットし値を返す。
@@ -2301,6 +2305,9 @@ pub struct ConfigFile {
 	/// 元画像キャッシュTTL(秒、既定3600)。
 	#[serde(default = "default_source_cache_ttl_secs")]
 	source_cache_ttl_secs: u64,
+	/// 元画像stale-if-errorの保持上限(秒、既定86400=24時間)。0で無効。
+	#[serde(default = "default_source_cache_stale_max_secs")]
+	source_cache_stale_max_secs: u64,
 	/// 上流404のネガティブキャッシュTTL(秒、既定3600)。0で無効。
 	#[serde(default = "default_negative_cache_404_ttl_secs")]
 	negative_cache_404_ttl_secs: u64,
@@ -2389,6 +2396,9 @@ fn default_source_cache_entry_max_bytes() -> u64 {
 }
 fn default_source_cache_ttl_secs() -> u64 {
 	3600
+}
+fn default_source_cache_stale_max_secs() -> u64 {
+	86400
 }
 fn default_negative_cache_404_ttl_secs() -> u64 {
 	3600
@@ -2589,6 +2599,7 @@ fn main() {
 			source_cache_max_bytes:default_source_cache_max_bytes(),
 			source_cache_entry_max_bytes:default_source_cache_entry_max_bytes(),
 			source_cache_ttl_secs:default_source_cache_ttl_secs(),
+			source_cache_stale_max_secs:default_source_cache_stale_max_secs(),
 			negative_cache_404_ttl_secs:default_negative_cache_404_ttl_secs(),
 			negative_cache_410_ttl_secs:default_negative_cache_410_ttl_secs(),
 			negative_cache_max_entries:default_negative_cache_max_entries(),
@@ -2755,6 +2766,7 @@ fn main() {
 		max_bytes: config.source_cache_max_bytes as usize,
 		entry_max_bytes: config.source_cache_entry_max_bytes as usize,
 		ttl: Duration::from_secs(config.source_cache_ttl_secs),
+		stale_max: Duration::from_secs(config.source_cache_stale_max_secs),
 	}));
 	let negative_cache = Arc::new(cache::NegativeCache::new(cache::NegativeCacheConfig {
 		enabled: config.enable_cache,
@@ -2890,8 +2902,12 @@ fn main() {
 				loop {
 					interval.tick().await;
 					let (reqs, errs, hits, misses) = stats.swap_reset();
-					let (source_cache_hits, source_cache_misses, source_cache_joined) =
-						stats.swap_reset_source_cache();
+					let (
+						source_cache_hits,
+						source_cache_misses,
+						source_cache_joined,
+						source_cache_stale_served,
+					) = stats.swap_reset_source_cache();
 					let cache_evicted_reaccesses =
 						stats.cache_evicted_reaccesses.swap(0, Ordering::Relaxed);
 					let (fc, ft, fd, fr, fb, fth, fo) = stats.swap_reset_ferr();
@@ -3007,6 +3023,7 @@ fn main() {
 						source_cache_hits,
 						source_cache_misses,
 						source_cache_joined,
+						source_cache_stale_served,
 						cache_evicted_reaccesses,
 						dl_active = dl_active as u64,
 						dl_max = max_dl as u64,
@@ -4232,6 +4249,29 @@ fn build_stale_response(
 	(axum::http::StatusCode::OK, headers, cached.body.clone()).into_response()
 }
 
+fn source_entry_response(source: SourceEntry) -> reqwest::Response {
+	let mut response = axum::http::Response::builder().status(reqwest::StatusCode::OK);
+	if let Some(content_type) = source.content_type {
+		response = response.header(reqwest::header::CONTENT_TYPE, content_type);
+	}
+	if let Some(content_disposition) = source.content_disposition {
+		response = response.header(reqwest::header::CONTENT_DISPOSITION, content_disposition);
+	}
+	response.body(source.body).unwrap().into()
+}
+
+fn take_stale_source_response(
+	source_cache: &Arc<SourceCache>,
+	source_key: &str,
+	source_flight_guard: &mut Option<SourceFlightGuard>,
+) -> Option<reqwest::Response> {
+	let source = source_cache.get_stale(source_key)?;
+	if let Some(mut guard) = source_flight_guard.take() {
+		source_cache.complete_flight(&mut guard, Some(source.clone()));
+	}
+	Some(source_entry_response(source))
+}
+
 fn build_negative_response(
 	status: u16,
 	params: &RequestParams,
@@ -4535,8 +4575,12 @@ async fn get_file_inner(
 			"Range".parse().unwrap()
 		},
 	);
+	let negative_key = reqwest::Url::parse(&q.url)
+		.map(|url| url.to_string())
+		.unwrap_or_else(|_| q.url.clone());
+	let mut source_cache_stale = false;
 	let check_start = Instant::now();
-	match check_url(&network_policy, &dns_cache, &q.url).await {
+	let dns_stale_source = match check_url(&network_policy, &dns_cache, &q.url).await {
 		Ok((hit, v4_count, v6_count)) => {
 			if let Ok(mut t) = timings.lock() {
 				t.check = check_start.elapsed();
@@ -4544,6 +4588,7 @@ async fn get_file_inner(
 				t.dns_v4 = v4_count;
 				t.dns_v6 = v6_count;
 			}
+			None
 		}
 		Err(error) => {
 			if let Ok(mut t) = timings.lock() {
@@ -4559,8 +4604,7 @@ async fn get_file_inner(
 				"X-Proxy-Error",
 				reqwest::header::HeaderValue::from_static(error.as_header()),
 			);
-			// stale-if-error: DNS失敗(ポリシー拒否以外)ならstaleを試みる
-			if error.is_resolve_failed() && !has_range {
+			let stale_source = if error.is_resolve_failed() && !has_range {
 				if let Some(stale) = response_cache.get_stale(&cache_key) {
 					let resp = build_stale_response(&stale, &config, &timings);
 					if let Ok(t) = timings.lock() {
@@ -4568,34 +4612,41 @@ async fn get_file_inner(
 					}
 					return Err(resp);
 				}
-			}
-			let is_fallback = q.fallback.is_some();
-			if let Ok(t) = timings.lock() {
-				emit_summary(
-					&config,
-					&summary,
-					&t,
-					if is_fallback { 200 } else { 400 },
-					true,
-					Some(error.detail()),
-					&global_stats,
-				);
-			}
-			if is_fallback {
+				source_cache.get_stale(&negative_key)
+			} else {
+				None
+			};
+			if let Some(stale) = stale_source {
+				headers.remove("X-Proxy-Error");
+				global_stats.observe_source_cache("stale");
+				source_cache_stale = true;
+				Some(stale)
+			} else {
+				let is_fallback = q.fallback.is_some();
+				if let Ok(t) = timings.lock() {
+					emit_summary(
+						&config,
+						&summary,
+						&t,
+						if is_fallback { 200 } else { 400 },
+						true,
+						Some(error.detail()),
+						&global_stats,
+					);
+				}
+				if is_fallback {
+					headers.append("Cache-Control", "no-store".parse().unwrap());
+					headers.append("Content-Type", "image/png".parse().unwrap());
+					return Err(
+						(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
+					);
+				}
 				headers.append("Cache-Control", "no-store".parse().unwrap());
-				headers.append("Content-Type", "image/png".parse().unwrap());
-				return Err(
-					(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
-				);
+				return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 			}
-			headers.append("Cache-Control", "no-store".parse().unwrap());
-			return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 		}
 	};
-	let negative_key = reqwest::Url::parse(&q.url)
-		.map(|url| url.to_string())
-		.unwrap_or_else(|_| q.url.clone());
-	if !has_range {
+	if !has_range && dns_stale_source.is_none() {
 		if let Some(entry) = negative_cache.get(&negative_key) {
 			if let Ok(mut t) = timings.lock() {
 				t.cache_result = Some(CacheResult::Negative);
@@ -4620,7 +4671,9 @@ async fn get_file_inner(
 		}
 	}
 	let mut source_flight_guard = None;
-	let cached_source = if has_range {
+	let cached_source = if let Some(stale) = dns_stale_source {
+		Some(stale)
+	} else if has_range {
 		global_stats.observe_source_cache("bypass");
 		None
 	} else {
@@ -4642,7 +4695,13 @@ async fn get_file_inner(
 				SourceCacheLookup::Follower(mut receiver) => {
 					global_stats.observe_source_cache("joined");
 					match receiver.recv().await {
-						Ok(Some(entry)) => break Some(entry),
+						Ok(Some(result)) => {
+							if result.stale {
+								global_stats.observe_source_cache("stale");
+								source_cache_stale = true;
+							}
+							break Some(result.entry);
+						}
 						_ => continue,
 					}
 				}
@@ -4715,18 +4774,28 @@ async fn get_file_inner(
 	let mut upstream_429_rescue = Upstream429RescueGuard::new(global_stats.clone());
 	let mut upstream_429_retry_succeeded = false;
 	let mut deadline_fallback_response_pending = false;
-	let source_cache_hit = cached_source.is_some();
+	let mut source_cache_hit = cached_source.is_some();
 	let resp = if let Some(source) = cached_source {
-		let mut response = axum::http::Response::builder().status(reqwest::StatusCode::OK);
-		if let Some(content_type) = source.content_type {
-			response = response.header(reqwest::header::CONTENT_TYPE, content_type);
-		}
-		if let Some(content_disposition) = source.content_disposition {
-			response = response.header(reqwest::header::CONTENT_DISPOSITION, content_disposition);
-		}
-		response.body(source.body).unwrap().into()
+		source_entry_response(source)
 	} else {
-		loop {
+		'fetch: loop {
+			macro_rules! serve_source_stale {
+				() => {
+					if let Some(stale_response) = take_stale_source_response(
+						&source_cache,
+						&negative_key,
+						&mut source_flight_guard,
+					) {
+						global_stats.observe_source_cache("stale");
+						if upstream_429_rescue.pending {
+							upstream_429_rescue.complete("stale");
+						}
+						source_cache_hit = true;
+						source_cache_stale = true;
+						break 'fetch stale_response;
+					}
+				};
+			}
 			let mut throttle_permit = if let Some(throttle) = &host_throttle {
 				let result = throttle
 					.acquire(&current_url, throttle_wait_budget(&config, request_started))
@@ -4757,6 +4826,7 @@ async fn get_file_inner(
 								return Err(resp);
 							}
 						}
+						serve_source_stale!();
 						let recovery = throttle
 							.acquire_for_recovery(
 								&current_url,
@@ -4790,6 +4860,7 @@ async fn get_file_inner(
 										return Err(resp);
 									}
 								}
+								serve_source_stale!();
 								let fallback_context = if upstream_429_rescue.pending {
 									DeadlineFallbackContext::Upstream429Retry
 								} else {
@@ -4822,6 +4893,7 @@ async fn get_file_inner(
 											t.wait += fallback_rejection.waited;
 											t.fetch_err = Some(fetch_error.to_owned());
 										}
+										serve_source_stale!();
 										headers.append(
 											"X-Proxy-Error",
 											"HostThrottleTimeout".parse().unwrap(),
@@ -4944,6 +5016,7 @@ async fn get_file_inner(
 										}
 										return Err(resp);
 									}
+									serve_source_stale!();
 									let recovery = throttle
 										.acquire_for_recovery(
 											&current_url,
@@ -4979,6 +5052,7 @@ async fn get_file_inner(
 												}
 												return Err(resp);
 											}
+											serve_source_stale!();
 											let fallback = throttle
 												.acquire_for_deadline_fallback(
 													&current_url,
@@ -5007,6 +5081,7 @@ async fn get_file_inner(
 														);
 														t.retried = true;
 													}
+													serve_source_stale!();
 													headers.append(
 														"X-Proxy-Error",
 														"HostThrottleTimeout".parse().unwrap(),
@@ -5093,6 +5168,7 @@ async fn get_file_inner(
 										return Err(resp);
 									}
 								}
+								serve_source_stale!();
 								if let Ok(t) = timings.lock() {
 									emit_summary(
 										&config,
@@ -5146,6 +5222,7 @@ async fn get_file_inner(
 								return Err(resp);
 							}
 						}
+						serve_source_stale!();
 						if let Ok(t) = timings.lock() {
 							emit_summary(
 								&config,
@@ -5217,6 +5294,7 @@ async fn get_file_inner(
 					}
 					return Err(stale_response);
 				}
+				serve_source_stale!();
 				upstream_429_retries = 1;
 				global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
 				if let Some(metrics) = &global_stats.otlp {
@@ -5235,6 +5313,21 @@ async fn get_file_inner(
 				}
 				drop(resp);
 				continue;
+			}
+			if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+				serve_source_stale!();
+			}
+			if resp.status().is_server_error()
+				|| resp.status() == reqwest::StatusCode::REQUEST_TIMEOUT
+			{
+				if let Some(stale) = response_cache.get_stale(&cache_key) {
+					let stale_response = build_stale_response(&stale, &config, &timings);
+					if let Ok(t) = timings.lock() {
+						emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+					}
+					return Err(stale_response);
+				}
+				serve_source_stale!();
 			}
 			if upstream_429_retries > 0 && resp.status().is_success() {
 				upstream_429_retry_succeeded = true;
@@ -5372,6 +5465,9 @@ async fn get_file_inner(
 		}
 	};
 	drop(partial_image_response);
+	if source_cache_stale {
+		headers.append("X-Proxy-Source-Stale", "1".parse().unwrap());
+	}
 	fn add_remote_header(
 		key: &'static str,
 		headers: &mut HeaderMap,
@@ -5419,7 +5515,7 @@ async fn get_file_inner(
 		}
 	}
 	if !has_range && !source_cache_hit {
-		negative_cache.put(negative_key, resp.status().as_u16());
+		negative_cache.put(negative_key.clone(), resp.status().as_u16());
 	}
 	add_remote_header("Content-Disposition", &mut headers, remote_headers);
 	add_remote_header("Content-Type", &mut headers, remote_headers);
@@ -5467,6 +5563,7 @@ async fn get_file_inner(
 		global_stats: global_stats.clone(),
 		deadline_fallback_response_pending,
 		source_cache,
+		source_key: negative_key,
 		source_flight_guard,
 	}
 	.encode(resp, is_img)
@@ -5554,6 +5651,7 @@ struct RequestContext {
 	global_stats: Arc<GlobalStats>,
 	deadline_fallback_response_pending: bool,
 	source_cache: Arc<SourceCache>,
+	source_key: String,
 	source_flight_guard: Option<SourceFlightGuard>,
 }
 impl RequestContext {
@@ -5606,6 +5704,32 @@ impl RequestContext {
 		if self.response_cache.put(self.cache_key.clone(), entry) && self.is_static_path {
 			self.global_stats.record_static_insertion(body.len());
 		}
+	}
+	fn load_stale_source(&mut self) -> bool {
+		let Some(source) = self.source_cache.get_stale(&self.source_key) else {
+			return false;
+		};
+		self.headers.remove("Content-Type");
+		self.headers.remove("Content-Disposition");
+		if let Some(content_type) = &source.content_type {
+			if let Ok(value) = content_type.parse() {
+				self.headers.append("Content-Type", value);
+			}
+		}
+		if let Some(content_disposition) = &source.content_disposition {
+			if let Ok(value) = content_disposition.parse() {
+				self.headers.append("Content-Disposition", value);
+			}
+		}
+		self.headers
+			.append("X-Proxy-Source-Stale", "1".parse().unwrap());
+		self.src_bytes = source.body.to_vec();
+		self.codec = image::guess_format(&self.src_bytes).map_err(Some);
+		if let Some(mut guard) = self.source_flight_guard.take() {
+			self.source_cache.complete_flight(&mut guard, Some(source));
+		}
+		self.global_stats.observe_source_cache("stale");
+		true
 	}
 }
 impl RequestContext {
@@ -6140,6 +6264,11 @@ impl RequestContext {
 					}
 					self.headers
 						.append("X-Proxy-Error", "BodyReadFailed".parse().unwrap());
+					if self.load_stale_source() {
+						self.headers.remove("X-Proxy-Error");
+						self.mark_body_done(body_start.elapsed());
+						return Ok(());
+					}
 					return Err(
 						(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
 					);
@@ -7671,6 +7800,7 @@ mod network_policy_tests {
 			source_cache_max_bytes: default_source_cache_max_bytes(),
 			source_cache_entry_max_bytes: default_source_cache_entry_max_bytes(),
 			source_cache_ttl_secs: default_source_cache_ttl_secs(),
+			source_cache_stale_max_secs: default_source_cache_stale_max_secs(),
 			negative_cache_404_ttl_secs: default_negative_cache_404_ttl_secs(),
 			negative_cache_410_ttl_secs: default_negative_cache_410_ttl_secs(),
 			negative_cache_max_entries: default_negative_cache_max_entries(),

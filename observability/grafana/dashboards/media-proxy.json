@@ -571,6 +571,27 @@
                   },
                   "refId": "D"
                 }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "sum(rate(media_proxy_source_cache_requests_total{result=\"stale\"}[1m]))",
+                      "legendFormat": "Source stale rescues",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "E"
+                }
               }
             ],
             "queryOptions": {},

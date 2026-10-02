@@ -416,12 +416,13 @@ pub struct SourceCacheConfig {
 	pub max_bytes: usize,
 	pub entry_max_bytes: usize,
 	pub ttl: Duration,
+	pub stale_max: Duration,
 }
 
 pub struct SourceCache {
 	config: SourceCacheConfig,
 	entries: Mutex<SourceLruInner>,
-	inflight: Mutex<HashMap<String, broadcast::Sender<Option<SourceEntry>>>>,
+	inflight: Mutex<HashMap<String, broadcast::Sender<Option<SourceFlightResult>>>>,
 }
 
 struct SourceLruInner {
@@ -433,7 +434,13 @@ pub enum SourceCacheLookup {
 	Bypass,
 	Hit(SourceEntry),
 	Leader(SourceFlightGuard),
-	Follower(broadcast::Receiver<Option<SourceEntry>>),
+	Follower(broadcast::Receiver<Option<SourceFlightResult>>),
+}
+
+#[derive(Clone)]
+pub struct SourceFlightResult {
+	pub entry: SourceEntry,
+	pub stale: bool,
 }
 
 impl SourceCache {
@@ -452,15 +459,19 @@ impl SourceCache {
 		if !self.config.enabled {
 			return SourceCacheLookup::Bypass;
 		}
-		if let Ok(mut inner) = self.entries.lock() {
-			if let Some(entry) = inner.map.get(&key) {
-				if entry.created_at.elapsed() < self.config.ttl {
-					let entry = entry.clone();
-					let from = inner.map.get_index_of(&key).unwrap();
-					let to = inner.map.len() - 1;
-					inner.map.move_index(from, to);
-					return SourceCacheLookup::Hit(entry);
-				}
+		let Ok(mut inner) = self.entries.lock() else {
+			return SourceCacheLookup::Bypass;
+		};
+		if let Some(entry) = inner.map.get(&key) {
+			let age = entry.created_at.elapsed();
+			if age < self.config.ttl {
+				let entry = entry.clone();
+				let from = inner.map.get_index_of(&key).unwrap();
+				let to = inner.map.len() - 1;
+				inner.map.move_index(from, to);
+				return SourceCacheLookup::Hit(entry);
+			}
+			if self.config.stale_max.is_zero() || age >= self.config.ttl + self.config.stale_max {
 				if let Some(expired) = inner.map.shift_remove(&key) {
 					inner.total_bytes = inner.total_bytes.saturating_sub(expired.size);
 				}
@@ -480,6 +491,17 @@ impl SourceCache {
 			cache: Arc::clone(self),
 			completed: false,
 		})
+	}
+
+	pub fn get_stale(&self, key: &str) -> Option<SourceEntry> {
+		if !self.config.enabled || self.config.stale_max.is_zero() {
+			return None;
+		}
+		let inner = self.entries.lock().ok()?;
+		let entry = inner.map.get(key)?;
+		let age = entry.created_at.elapsed();
+		(age >= self.config.ttl && age < self.config.ttl + self.config.stale_max)
+			.then(|| entry.clone())
 	}
 
 	fn put(&self, key: String, entry: SourceEntry) -> bool {
@@ -510,10 +532,16 @@ impl SourceCache {
 		guard: &mut SourceFlightGuard,
 		entry: Option<SourceEntry>,
 	) {
+		let stale = entry.as_ref().is_some_and(|entry| {
+			let age = entry.created_at.elapsed();
+			age >= self.config.ttl && age < self.config.ttl + self.config.stale_max
+		});
 		if let Some(entry) = &entry {
 			self.put(guard.key.clone(), entry.clone());
 		}
-		let _ = guard.sender.send(entry);
+		let _ = guard
+			.sender
+			.send(entry.map(|entry| SourceFlightResult { entry, stale }));
 		guard.completed = true;
 		if let Ok(mut inflight) = self.inflight.lock() {
 			inflight.remove(&guard.key);
@@ -530,7 +558,7 @@ impl SourceCache {
 
 pub struct SourceFlightGuard {
 	key: String,
-	sender: broadcast::Sender<Option<SourceEntry>>,
+	sender: broadcast::Sender<Option<SourceFlightResult>>,
 	cache: Arc<SourceCache>,
 	completed: bool,
 }
@@ -549,7 +577,7 @@ impl Drop for SourceFlightGuard {
 impl SourceFlightGuard {
 	fn inflight_remove(
 		&self,
-		inflight: &mut HashMap<String, broadcast::Sender<Option<SourceEntry>>>,
+		inflight: &mut HashMap<String, broadcast::Sender<Option<SourceFlightResult>>>,
 	) {
 		inflight.remove(&self.key);
 	}
@@ -565,6 +593,7 @@ mod source_cache_tests {
 			max_bytes,
 			entry_max_bytes: max_bytes,
 			ttl: Duration::from_secs(60),
+			stale_max: Duration::from_secs(60),
 		}))
 	}
 
@@ -583,7 +612,9 @@ mod source_cache_tests {
 		};
 		let entry = SourceEntry::new(Some("image/png".into()), None, Bytes::from_static(b"png"));
 		cache.complete_flight(&mut leader, Some(entry));
-		assert_eq!(follower.recv().await.unwrap().unwrap().body, "png");
+		let result = follower.recv().await.unwrap().unwrap();
+		assert_eq!(result.entry.body, "png");
+		assert!(!result.stale);
 		assert!(matches!(
 			cache.lookup_or_start("https://example.com/image".into()),
 			SourceCacheLookup::Hit(_)
@@ -605,6 +636,40 @@ mod source_cache_tests {
 		assert_eq!(cache.stats().0, 1);
 		assert!(matches!(
 			cache.lookup_or_start("a".into()),
+			SourceCacheLookup::Leader(_)
+		));
+	}
+
+	#[tokio::test]
+	async fn keeps_expired_source_for_stale_fallback() {
+		let cache = Arc::new(SourceCache::new(SourceCacheConfig {
+			enabled: true,
+			max_bytes: 4096,
+			entry_max_bytes: 4096,
+			ttl: Duration::ZERO,
+			stale_max: Duration::from_secs(60),
+		}));
+		let key = "https://example.com/image";
+		let SourceCacheLookup::Leader(mut leader) = cache.lookup_or_start(key.into()) else {
+			panic!("first lookup must lead");
+		};
+		cache.complete_flight(
+			&mut leader,
+			Some(SourceEntry::new(None, None, Bytes::from_static(b"stale"))),
+		);
+
+		assert_eq!(cache.get_stale(key).unwrap().body, "stale");
+		let SourceCacheLookup::Leader(mut leader) = cache.lookup_or_start(key.into()) else {
+			panic!("expired source must start revalidation");
+		};
+		let SourceCacheLookup::Follower(mut follower) = cache.lookup_or_start(key.into()) else {
+			panic!("concurrent lookup must follow");
+		};
+		let stale = cache.get_stale(key).unwrap();
+		cache.complete_flight(&mut leader, Some(stale));
+		assert!(follower.recv().await.unwrap().unwrap().stale);
+		assert!(matches!(
+			cache.lookup_or_start(key.into()),
 			SourceCacheLookup::Leader(_)
 		));
 	}
