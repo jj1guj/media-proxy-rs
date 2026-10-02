@@ -152,6 +152,12 @@ struct HostThrottlePermit {
 	_deadline_slot: Option<OwnedSemaphorePermit>,
 }
 
+impl HostThrottlePermit {
+	fn is_deadline_fallback(&self) -> bool {
+		self._deadline_slot.is_some()
+	}
+}
+
 #[derive(Debug)]
 struct HostThrottleRejection {
 	waited: Duration,
@@ -1251,6 +1257,7 @@ struct OtlpMetrics {
 	upstream_429_rescue_outcomes: Counter<u64>,
 	host_throttle_deadline_fallback_attempts: Counter<u64>,
 	host_throttle_deadline_fallback_outcomes: Counter<u64>,
+	host_throttle_deadline_fallback_terminal_outcomes: Counter<u64>,
 	dns_cache_requests: Counter<u64>,
 	dns_cache_entries: Gauge<u64>,
 	dns_cache_capacity_entries: Gauge<u64>,
@@ -1353,6 +1360,9 @@ impl OtlpMetrics {
 				.build(),
 			host_throttle_deadline_fallback_outcomes: meter
 				.u64_counter("media_proxy_host_throttle_deadline_fallback_outcomes_total")
+				.build(),
+			host_throttle_deadline_fallback_terminal_outcomes: meter
+				.u64_counter("media_proxy_host_throttle_deadline_fallback_terminal_outcomes_total")
 				.build(),
 			dns_cache_requests: meter
 				.u64_counter("media_proxy_dns_cache_requests_total")
@@ -1702,6 +1712,12 @@ struct GlobalStats {
 	throttle_initial_wait_timeouts: AtomicU64,
 	throttle_429_retry_wait_timeouts: AtomicU64,
 	throttle_connect_retry_wait_timeouts: AtomicU64,
+	throttle_deadline_fallback_response_2xx: AtomicU64,
+	throttle_deadline_fallback_response_429: AtomicU64,
+	throttle_deadline_fallback_response_other: AtomicU64,
+	throttle_deadline_fallback_connect_timeout: AtomicU64,
+	throttle_deadline_fallback_body_error: AtomicU64,
+	throttle_deadline_fallback_request_deadline_exceeded: AtomicU64,
 	http1_responses: AtomicU64,
 	http2_responses: AtomicU64,
 	cache_stale_served: AtomicU64,
@@ -1776,6 +1792,12 @@ impl GlobalStats {
 			throttle_initial_wait_timeouts: AtomicU64::new(0),
 			throttle_429_retry_wait_timeouts: AtomicU64::new(0),
 			throttle_connect_retry_wait_timeouts: AtomicU64::new(0),
+			throttle_deadline_fallback_response_2xx: AtomicU64::new(0),
+			throttle_deadline_fallback_response_429: AtomicU64::new(0),
+			throttle_deadline_fallback_response_other: AtomicU64::new(0),
+			throttle_deadline_fallback_connect_timeout: AtomicU64::new(0),
+			throttle_deadline_fallback_body_error: AtomicU64::new(0),
+			throttle_deadline_fallback_request_deadline_exceeded: AtomicU64::new(0),
 			http1_responses: AtomicU64::new(0),
 			http2_responses: AtomicU64::new(0),
 			cache_stale_served: AtomicU64::new(0),
@@ -1959,6 +1981,24 @@ impl GlobalStats {
 			metrics
 				.host_throttle_deadline_fallback_outcomes
 				.add(1, &[KeyValue::new("result", outcome)]);
+		}
+	}
+	fn observe_deadline_fallback_terminal(&self, result: &'static str) {
+		let counter = match result {
+			"response_2xx" => &self.throttle_deadline_fallback_response_2xx,
+			"response_429" => &self.throttle_deadline_fallback_response_429,
+			"connect_timeout" => &self.throttle_deadline_fallback_connect_timeout,
+			"body_error" => &self.throttle_deadline_fallback_body_error,
+			"request_deadline_exceeded" => {
+				&self.throttle_deadline_fallback_request_deadline_exceeded
+			}
+			_ => &self.throttle_deadline_fallback_response_other,
+		};
+		counter.fetch_add(1, Ordering::Relaxed);
+		if let Some(metrics) = &self.otlp {
+			metrics
+				.host_throttle_deadline_fallback_terminal_outcomes
+				.add(1, &[KeyValue::new("result", result)]);
 		}
 	}
 	fn observe_request(&self, timings: &PhaseTimings, is_static_path: bool) {
@@ -2760,6 +2800,24 @@ fn main() {
 					let throttle_connect_retry_wait_timeouts = stats
 						.throttle_connect_retry_wait_timeouts
 						.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_response_2xx = stats
+						.throttle_deadline_fallback_response_2xx
+						.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_response_429 = stats
+						.throttle_deadline_fallback_response_429
+						.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_response_other = stats
+						.throttle_deadline_fallback_response_other
+						.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_connect_timeout = stats
+						.throttle_deadline_fallback_connect_timeout
+						.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_body_error = stats
+						.throttle_deadline_fallback_body_error
+						.swap(0, Ordering::Relaxed);
+					let throttle_deadline_fallback_request_deadline_exceeded = stats
+						.throttle_deadline_fallback_request_deadline_exceeded
+						.swap(0, Ordering::Relaxed);
 					let (http1, http2) = stats.swap_reset_http();
 					let stale_served = stats.cache_stale_served.swap(0, Ordering::Relaxed);
 					let throttle_passed = stats.throttle_passed.swap(0, Ordering::Relaxed);
@@ -2863,6 +2921,12 @@ fn main() {
 						throttle_initial_wait_timeouts,
 						throttle_429_retry_wait_timeouts,
 						throttle_connect_retry_wait_timeouts,
+						throttle_deadline_fallback_response_2xx,
+						throttle_deadline_fallback_response_429,
+						throttle_deadline_fallback_response_other,
+						throttle_deadline_fallback_connect_timeout,
+						throttle_deadline_fallback_body_error,
+						throttle_deadline_fallback_request_deadline_exceeded,
 						http1_responses = http1,
 						http2_responses = http2,
 						cache_stale_served = stale_served,
@@ -3863,6 +3927,18 @@ fn classify_reqwest_error(e: &reqwest::Error) -> String {
 	}
 }
 
+fn classify_deadline_fallback_send_error(e: &reqwest::Error) -> &'static str {
+	if e.is_connect() && e.is_timeout() {
+		"connect_timeout"
+	} else if e.is_timeout() {
+		"request_deadline_exceeded"
+	} else if e.is_body() {
+		"body_error"
+	} else {
+		"response_other"
+	}
+}
+
 /// 1リクエスト1行のサマリを出力する。正常かつ高速(slow_log_ms未満)なら DEBUG に落とす。
 fn emit_summary(
 	cfg: &ConfigFile,
@@ -4476,6 +4552,7 @@ async fn get_file_inner(
 	let mut upstream_429_retries = 0_u8;
 	let mut upstream_429_rescue = Upstream429RescueGuard::new(global_stats.clone());
 	let mut upstream_429_retry_succeeded = false;
+	let mut deadline_fallback_response_pending = false;
 	let resp = loop {
 		let mut throttle_permit = if let Some(throttle) = &host_throttle {
 			let result = throttle
@@ -4632,6 +4709,14 @@ async fn get_file_inner(
 				partial_image_response.take().unwrap()
 			}
 			Err(e) => {
+				if throttle_permit
+					.as_ref()
+					.is_some_and(HostThrottlePermit::is_deadline_fallback)
+				{
+					global_stats.observe_deadline_fallback_terminal(
+						classify_deadline_fallback_send_error(&e),
+					);
+				}
 				drop(throttle_permit.take());
 				let first_err = classify_reqwest_error(&e);
 				let is_connect_phase = e.is_connect() || e.is_timeout();
@@ -4784,6 +4869,14 @@ async fn get_file_inner(
 							resp
 						}
 						Err(e2) => {
+							if throttle_permit
+								.as_ref()
+								.is_some_and(HostThrottlePermit::is_deadline_fallback)
+							{
+								global_stats.observe_deadline_fallback_terminal(
+									classify_deadline_fallback_send_error(&e2),
+								);
+							}
 							let fetch_err = classify_reqwest_error(&e2);
 							let is_fallback = q.fallback.is_some();
 							if let Ok(mut t) = timings.lock() {
@@ -4897,6 +4990,17 @@ async fn get_file_inner(
 				)
 				.await;
 		}
+		let used_deadline_fallback = throttle_permit
+			.as_ref()
+			.is_some_and(HostThrottlePermit::is_deadline_fallback);
+		if used_deadline_fallback && !resp.status().is_success() {
+			let result = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+				"response_429"
+			} else {
+				"response_other"
+			};
+			global_stats.observe_deadline_fallback_terminal(result);
+		}
 		drop(throttle_permit.take());
 		if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
 			&& !forward_range
@@ -4946,11 +5050,16 @@ async fn get_file_inner(
 			&& resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
 			&& is_image_response
 		{
+			if used_deadline_fallback {
+				global_stats.observe_deadline_fallback_terminal("response_2xx");
+			}
 			forward_range = false;
 			partial_image_response = Some(resp);
 			continue;
 		}
 		if !resp.status().is_redirection() {
+			deadline_fallback_response_pending =
+				used_deadline_fallback && resp.status().is_success();
 			break resp;
 		}
 		if redirects >= MAX_REDIRECTS {
@@ -5151,6 +5260,7 @@ async fn get_file_inner(
 		cache_key: cache_key.clone(),
 		is_static_path: summary.is_static_path,
 		global_stats: global_stats.clone(),
+		deadline_fallback_response_pending,
 	}
 	.encode(resp, is_img)
 	.await;
@@ -5235,6 +5345,7 @@ struct RequestContext {
 	cache_key: CacheKey,
 	is_static_path: bool,
 	global_stats: Arc<GlobalStats>,
+	deadline_fallback_response_pending: bool,
 }
 impl RequestContext {
 	/// フェーズ計測ガードを生成する(Arcを複製して保持するため self を借用し続けない)。
@@ -5249,6 +5360,12 @@ impl RequestContext {
 	pub(crate) fn mark_body_done(&self, body_duration: Duration) {
 		if let Ok(mut t) = self.timings.lock() {
 			t.body = body_duration;
+		}
+	}
+	fn complete_deadline_fallback_terminal(&mut self, result: &'static str) {
+		if self.deadline_fallback_response_pending {
+			self.deadline_fallback_response_pending = false;
+			self.global_stats.observe_deadline_fallback_terminal(result);
 		}
 	}
 	/// encode_anim のフレーム数・入出力バイト数を記録する。
@@ -5351,6 +5468,7 @@ impl RequestContext {
 		}
 		let status = resp.status();
 		if !status.is_success() {
+			self.complete_deadline_fallback_terminal("response_other");
 			return Err(self.remote_error_response(status));
 		}
 		let resp = PreDataStream::new(resp).await;
@@ -5434,6 +5552,7 @@ impl RequestContext {
 			{
 				Ok(Ok(permit)) => permit,
 				_ => {
+					self.complete_deadline_fallback_terminal("response_2xx");
 					if let Ok(mut t) = self.timings.lock() {
 						let elapsed = wait_start.elapsed();
 						t.wait += elapsed;
@@ -5628,6 +5747,7 @@ impl RequestContext {
 				{
 					Ok(Ok(permit)) => permit,
 					_ => {
+						self.complete_deadline_fallback_terminal("response_2xx");
 						if let Ok(mut t) = self.timings.lock() {
 							let elapsed = wait_start.elapsed();
 							t.wait += elapsed;
@@ -5706,6 +5826,7 @@ impl RequestContext {
 			crate::browsersafe::FILE_TYPE_BROWSERSAFE.contains(&content_type.as_ref())
 		});
 		if !is_browsersafe {
+			self.complete_deadline_fallback_terminal("response_2xx");
 			self.headers.remove("Content-Type");
 			self.headers.remove("Content-Length");
 			self.headers.remove("Content-Range");
@@ -5722,6 +5843,7 @@ impl RequestContext {
 				.into_response());
 		}
 		let body = axum::body::Body::from_stream(resp);
+		self.complete_deadline_fallback_terminal("response_2xx");
 		// ストリーミングパス: ボディ計測は行わない(パススルー)
 		self.headers.remove("Cache-Control");
 		self.headers.append(
@@ -5778,6 +5900,7 @@ impl RequestContext {
 			.content_length
 			.unwrap_or(2048.min(self.config.max_size));
 		if len_hint > self.config.max_size {
+			self.complete_deadline_fallback_terminal("response_2xx");
 			self.headers
 				.append("X-Proxy-Error", "ResponseTooLarge".parse().unwrap());
 			return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response());
@@ -5792,6 +5915,7 @@ impl RequestContext {
 			match x {
 				Ok(b) => {
 					if response_bytes.len() + b.len() > self.config.max_size as usize {
+						self.complete_deadline_fallback_terminal("response_2xx");
 						self.headers
 							.append("X-Proxy-Error", "ResponseTooLarge".parse().unwrap());
 						return Err((axum::http::StatusCode::BAD_GATEWAY, self.headers.clone())
@@ -5800,6 +5924,7 @@ impl RequestContext {
 					response_bytes.extend_from_slice(&b);
 				}
 				Err(e) => {
+					self.complete_deadline_fallback_terminal("body_error");
 					let fetch_err = classify_reqwest_error(&e);
 					if let Ok(mut t) = self.timings.lock() {
 						t.fetch_err = Some(fetch_err.clone());
@@ -5813,6 +5938,7 @@ impl RequestContext {
 			}
 		}
 		self.src_bytes = response_bytes;
+		self.complete_deadline_fallback_terminal("response_2xx");
 		self.mark_body_done(body_start.elapsed());
 		Ok(())
 	}
@@ -6084,6 +6210,7 @@ mod metrics_tests {
 		rescue.complete("retry_success");
 		let deadline_fallback: Result<(), HostThrottleRejection> = Ok(());
 		stats.observe_deadline_fallback(&deadline_fallback, DeadlineFallbackContext::Initial);
+		stats.observe_deadline_fallback_terminal("response_2xx");
 		assert_eq!(stats.throttle_passed.load(Ordering::Relaxed), 1);
 		assert_eq!(stats.throttle_waited.load(Ordering::Relaxed), 1);
 		{
@@ -6149,6 +6276,7 @@ mod metrics_tests {
 			"media_proxy_upstream_429_rescue_outcomes_total",
 			"media_proxy_host_throttle_deadline_fallback_attempts_total",
 			"media_proxy_host_throttle_deadline_fallback_outcomes_total",
+			"media_proxy_host_throttle_deadline_fallback_terminal_outcomes_total",
 			"media_proxy_dns_cache_requests_total",
 			"media_proxy_dns_cache_entries",
 			"media_proxy_dns_cache_capacity_entries",
@@ -6250,6 +6378,58 @@ mod metrics_tests {
 		assert_eq!(
 			stats
 				.throttle_connect_retry_wait_timeouts
+				.load(Ordering::Relaxed),
+			1
+		);
+	}
+
+	#[test]
+	fn deadline_fallback_terminal_metrics_distinguish_upstream_results() {
+		let stats = GlobalStats::new();
+		for result in [
+			"response_2xx",
+			"response_429",
+			"response_other",
+			"connect_timeout",
+			"body_error",
+			"request_deadline_exceeded",
+		] {
+			stats.observe_deadline_fallback_terminal(result);
+		}
+
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_response_2xx
+				.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_response_429
+				.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_response_other
+				.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_connect_timeout
+				.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_body_error
+				.load(Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			stats
+				.throttle_deadline_fallback_request_deadline_exceeded
 				.load(Ordering::Relaxed),
 			1
 		);

@@ -1856,8 +1856,33 @@ mod tests {
 			},
 			is_static_path: false,
 			global_stats: std::sync::Arc::new(GlobalStats::new()),
+			deadline_fallback_response_pending: false,
 		}
 	}
+
+	#[test]
+	fn deadline_fallback_terminal_result_is_recorded_once() {
+		let mut context = test_request_context(1024);
+		context.deadline_fallback_response_pending = true;
+		context.complete_deadline_fallback_terminal("response_2xx");
+		context.complete_deadline_fallback_terminal("body_error");
+
+		assert_eq!(
+			context
+				.global_stats
+				.throttle_deadline_fallback_response_2xx
+				.load(std::sync::atomic::Ordering::Relaxed),
+			1
+		);
+		assert_eq!(
+			context
+				.global_stats
+				.throttle_deadline_fallback_body_error
+				.load(std::sync::atomic::Ordering::Relaxed),
+			0
+		);
+	}
+
 	fn make_frame() -> Result<image::Frame, image::ImageError> {
 		let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
 		Ok(image::Frame::from_parts(
