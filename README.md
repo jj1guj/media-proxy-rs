@@ -110,45 +110,53 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 ## 設定項目一覧
 
-| 項目                           | 型        | 既定値              | 説明                                                                         |
-| ------------------------------ | --------- | ------------------- | ---------------------------------------------------------------------------- |
-| `bind_addr`                    | string    | `"0.0.0.0:12766"`   | バインドアドレス                                                             |
-| `timeout`                      | u64       | `10000`             | 外部リクエストのタイムアウト(ms)                                             |
-| `user_agent`                   | string    |                     | User-Agent ヘッダ                                                            |
-| `max_size`                     | u64       | `33554432` (32MB)   | ダウンロードの最大バイト数。**既定値が256MBから32MBに変更されました**        |
-| `proxy`                        | string?   | `null`              | HTTPプロキシURL                                                              |
-| `filter_type`                  | string    | `"Triangle"`        | リサイズフィルタ                                                             |
-| `max_pixels`                   | u32       | `2048`              | 最大ピクセル寸法                                                             |
-| `webp_quality`                 | f32       | `75.0`              | WebPエンコード品質(0-100)                                                    |
-| `encode_avif`                  | bool      | `false`             | AVIFエンコードを有効にする                                                   |
-| `jpeg_quality`                 | i32       | `85`                | JPEG出力品質(0-100)。従来は`webp_quality`を流用していた                      |
-| `webp_method`                  | i32       | `4`                 | WebPエンコードのmethod(0-6)。小さいほど高速だが圧縮率が下がる                |
-| `slow_log_ms`                  | u64       | `50`                | この時間(ms)未満かつ正常完了のリクエストはログをDEBUGに降格                  |
-| `enable_cache`                 | bool      | `true`              | レスポンスキャッシュの有効/無効                                              |
-| `cache_max_bytes`              | u64       | `134217728` (128MB) | キャッシュ合計バイト数上限                                                   |
-| `cache_entry_max_bytes`        | u64       | `5242880` (5MB)     | 1エントリの最大バイト数                                                      |
-| `cache_ttl_secs`               | u64       | `3600`              | キャッシュTTL(秒)                                                            |
-| `negative_cache_404_ttl_secs`  | u64       | `3600`              | 上流404のネガティブキャッシュTTL(秒)。`0`で無効                              |
-| `negative_cache_410_ttl_secs`  | u64       | `86400`             | 上流410のネガティブキャッシュTTL(秒)。`0`で無効                              |
-| `negative_cache_max_entries`   | usize     | `16384`             | 404/410ネガティブキャッシュの最大URL数                                       |
-| `passthrough_max_bytes`        | u64       | `1048576` (1MB)     | パススルー対象の最大バイトサイズ                                             |
-| `dns_negative_ttl_secs`        | u64       | `10`                | DNS解決失敗のネガティブキャッシュTTL(秒)                                     |
-| `dns_timeout_ms`               | u64       | `4000`              | DNS解決のタイムアウト(ms)。タイムアウト時は1回リトライ                       |
-| `dns_ttl_secs`                 | u64       | `300`               | DNSキャッシュのTTL(秒)                                                       |
-| `dns_cache_max_entries`        | usize     | `1024`              | DNSキャッシュの最大エントリ数                                                |
-| `max_concurrent_downloads`     | usize     | `24`                | ダウンロードの最大同時接続数                                                 |
-| `inflight_buffer_budget_bytes` | u64       | `268435456` (256MB) | 同時ダウンロードの合計バイト予算                                             |
-| `connect_timeout_ms`           | u64       | `3000`              | TCP接続タイムアウト(ms)。`timeout`より小さく設定すること                     |
-| `fetch_retry_delay_ms`         | u64       | `500`               | 接続失敗時のリトライ前待機(ms)                                               |
-| `host_throttle`                | object?   | `null`              | ホストごとに独立したToken Bucketと429クールダウン設定                        |
-| `otlp_metrics_endpoint`        | string?   | `null`              | OTLP/HTTP metrics送信先。`/v1/metrics`を含む完全なURL。`null`で無効          |
-| `otlp_export_interval_ms`      | u64       | `5000`              | OTLP metrics送信間隔(ms)                                                     |
-| `otlp_service_name`            | string    | `"media-proxy-rs"`  | OpenTelemetryの`service.name`                                                |
-| `allowed_networks`             | string[]? | `null`              | 許可するCIDR。ヘルスチェック等でloopbackを使う場合は`["127.0.0.1/32"]`を追加 |
-| `blocked_networks`             | string[]? | `null`              | 遮断するCIDR                                                                 |
-| `blocked_hosts`                | string[]? | `null`              | 遮断するホスト名                                                             |
+| 項目                           | 型        | 既定値                          | 説明                                                                         |
+| ------------------------------ | --------- | ------------------------------- | ---------------------------------------------------------------------------- |
+| `bind_addr`                    | string    | `"0.0.0.0:12766"`               | バインドアドレス                                                             |
+| `timeout`                      | u64       | `10000`                         | 外部リクエストのタイムアウト(ms)                                             |
+| `user_agent`                   | string    |                                 | User-Agent ヘッダ                                                            |
+| `max_size`                     | u64       | `33554432` (32MB)               | ダウンロードの最大バイト数。**既定値が256MBから32MBに変更されました**        |
+| `proxy`                        | string?   | `null`                          | HTTPプロキシURL                                                              |
+| `filter_type`                  | string    | `"Triangle"`                    | リサイズフィルタ                                                             |
+| `max_pixels`                   | u32       | `2048`                          | 最大ピクセル寸法                                                             |
+| `webp_quality`                 | f32       | `75.0`                          | WebPエンコード品質(0-100)                                                    |
+| `encode_avif`                  | bool      | `false`                         | AVIFエンコードを有効にする                                                   |
+| `jpeg_quality`                 | i32       | `85`                            | JPEG出力品質(0-100)。従来は`webp_quality`を流用していた                      |
+| `webp_method`                  | i32       | `4`                             | WebPエンコードのmethod(0-6)。小さいほど高速だが圧縮率が下がる                |
+| `slow_log_ms`                  | u64       | `50`                            | この時間(ms)未満かつ正常完了のリクエストはログをDEBUGに降格                  |
+| `enable_cache`                 | bool      | `true`                          | レスポンスキャッシュの有効/無効                                              |
+| `cache_max_bytes`              | u64       | `134217728` (128MB)             | キャッシュ合計バイト数上限                                                   |
+| `cache_entry_max_bytes`        | u64       | `5242880` (5MB)                 | 1エントリの最大バイト数                                                      |
+| `cache_ttl_secs`               | u64       | `3600`                          | キャッシュTTL(秒)                                                            |
+| `negative_cache_404_ttl_secs`  | u64       | `3600`                          | 上流404のネガティブキャッシュTTL(秒)。`0`で無効                              |
+| `negative_cache_410_ttl_secs`  | u64       | `86400`                         | 上流410のネガティブキャッシュTTL(秒)。`0`で無効                              |
+| `negative_cache_max_entries`   | usize     | `16384`                         | 404/410ネガティブキャッシュの最大URL数                                       |
+| `passthrough_max_bytes`        | u64       | `1048576` (1MB)                 | パススルー対象の最大バイトサイズ                                             |
+| `dns_negative_ttl_secs`        | u64       | `10`                            | DNS解決失敗のネガティブキャッシュTTL(秒)                                     |
+| `dns_timeout_ms`               | u64       | `4000`                          | DNS解決のタイムアウト(ms)。タイムアウト時は1回リトライ                       |
+| `dns_ttl_secs`                 | u64       | `300`                           | DNSキャッシュのTTL(秒)                                                       |
+| `dns_cache_max_entries`        | usize     | `1024`                          | DNSキャッシュの最大エントリ数                                                |
+| `max_concurrent_downloads`     | usize     | `24`                            | ダウンロードの最大同時接続数                                                 |
+| `inflight_buffer_budget_bytes` | u64       | `268435456` (256MB)             | 同時ダウンロードの合計バイト予算                                             |
+| `connect_timeout_ms`           | u64       | `3000`                          | TCP接続タイムアウト(ms)。`timeout`より小さく設定すること                     |
+| `fetch_retry_delay_ms`         | u64       | `500`                           | 接続失敗時のリトライ前待機(ms)                                               |
+| `host_throttle`                | object?   | `null`                          | ホストごとに独立したToken Bucketと429クールダウン設定                        |
+| `enable_source_cache`          | bool      | `false`                         | 変換前レスポンスの永続ディスクキャッシュを有効化                             |
+| `source_cache_path`            | string    | `/var/cache/media-proxy/source` | source cacheの保存先ディレクトリ                                             |
+| `source_cache_capacity_bytes`  | u64       | `26843545600` (25GiB)           | source cacheのディスク容量上限                                               |
+| `source_cache_entry_max_bytes` | u64       | `33554432` (32MiB)              | source cacheへ保存する本文の最大サイズ                                       |
+| `source_cache_ttl_secs`        | u64       | `43200`                         | source cacheをfreshとして使う期間(秒)                                        |
+| `source_cache_stale_secs`      | u64       | `86400`                         | fresh期限後に障害救済へ使える期間(秒)                                        |
+| `otlp_metrics_endpoint`        | string?   | `null`                          | OTLP/HTTP metrics送信先。`/v1/metrics`を含む完全なURL。`null`で無効          |
+| `otlp_export_interval_ms`      | u64       | `5000`                          | OTLP metrics送信間隔(ms)                                                     |
+| `otlp_service_name`            | string    | `"media-proxy-rs"`              | OpenTelemetryの`service.name`                                                |
+| `allowed_networks`             | string[]? | `null`                          | 許可するCIDR。ヘルスチェック等でloopbackを使う場合は`["127.0.0.1/32"]`を追加 |
+| `blocked_networks`             | string[]? | `null`                          | 遮断するCIDR                                                                 |
+| `blocked_hosts`                | string[]? | `null`                          | 遮断するホスト名                                                             |
 
 すべての追加項目は `#[serde(default)]` 付きのため、既存の config.json をそのまま使えます。
+
+source cacheは要求元URLをキーに200レスポンスの本文を保存します。fresh hitもクライアントへ直接返さず、通常と同じ画像変換処理を通します。DNS・接続・本文読込みの失敗、429、5xxでは、変換後stale cacheを優先し、利用できない場合だけsource staleを再変換します。Rangeリクエストは対象外です。同じ`source_cache_path`を複数processまたは複数replicaから共有しないでください。
 
 `host_throttle`を設定した場合、通常時の送信は制限せず、429を返したホストだけサーキットブレーカーの対象にします。`requests_per_second`と`burst`は回復中の送信レートとバースト上限です。`max_wait_ms`はFIFOキューで待機できる通常の上限で、5秒・10秒のクールダウンをジッター込みで待てる`15000`を推奨します。`max_hosts`は保持するホスト状態数、`queue_capacity`はホストごとの最大待機数です。`queue_capacity`を省略した場合は64です。新しいクールダウンを開始する429ごとにレートを半減（下限0.25件/秒）しますが、同じクールダウン中に到着した並行429は重複カウントしません。有効な`Retry-After`があればその期間は送信を停止し、0秒または期限切れの場合は5〜60秒の指数バックオフとジッターを使用します。クールダウン開始ログには上流の`Retry-After`、`RateLimit`、`X-RateLimit`、CDN識別ヘッダーも記録します。クールダウン終了後は送信を直列化し、3件連続で成功すると通常状態へ復帰します。
 
@@ -274,7 +282,7 @@ DNSキャッシュ結果の属性 `result` は `hit`、`stale`、`miss` の3種�
 
 ### Alloy
 
-`compose.example.yml` は、media-proxyとAlloyを同じComposeプロジェクトで起動します。Prometheusは既存インスタンスを使用し、GrafanaはこのComposeでは起動しません。
+`compose.example.yml` は、media-proxyとAlloyを同じComposeプロジェクトで起動します。source cacheは`source-cache` named volumeへ永続化します。Prometheusは既存インスタンスを使用し、GrafanaはこのComposeでは起動しません。
 
 既存Prometheusはremote-write receiverを有効にして起動してください。
 
@@ -324,6 +332,9 @@ provisioning後は `Media Proxy` フォルダーに `Media Proxy Overview` ダ�
 
 - **`cache_max_bytes`: 1GB** — キャッシュ滞留時間を確保する
 - **`cache_ttl_secs`: 43200** — キャッシュTTLを12時間に延長する
+- **`source_cache_capacity_bytes`: 25GiB** — 変換前レスポンスを永続volumeへ保存する
+- **`source_cache_ttl_secs`: 43200** — 12時間は上流へ再取得せず再変換する
+- **`source_cache_stale_secs`: 86400** — その後24時間は上流障害時の救済に使う
 - **`dns_cache_max_entries`: 4096** — 多数の連合先ホストを保持し、DNSキャッシュの回転を抑える
 - **`max_concurrent_downloads`: 128** — バースト時のダウンロード同時実行枠を拡大する
 - **`inflight_buffer_budget_bytes`: 512MB** — 同時ダウンロードの合計バイト予算を拡大する

@@ -6,6 +6,7 @@ services:
       MEDIA_PROXY_CONFIG_PATH: /config/config.json
     volumes:
       - ./config/:/config:Z
+      - source-cache:/var/cache/media-proxy/source
     ports:
       - "80:12766"
     depends_on:
@@ -31,3 +32,4 @@ services:
 
 volumes:
   alloy-data:
+  source-cache:

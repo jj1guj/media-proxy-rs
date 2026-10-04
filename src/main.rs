@@ -26,6 +26,7 @@ mod cache;
 mod image_test;
 mod img;
 mod mng;
+mod source_cache;
 mod ssrf;
 mod svg;
 
@@ -2191,6 +2192,7 @@ type AppState = (
 	Arc<GlobalStats>,
 	Option<Arc<HostThrottle>>,
 	Arc<cache::NegativeCache>,
+	Option<Arc<source_cache::SourceCache>>,
 );
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2281,6 +2283,23 @@ pub struct ConfigFile {
 	/// TTL切れ後もこの期間はstaleとして保持し、フェッチ失敗時に返す。0で無効。
 	#[serde(default = "default_cache_stale_max_secs")]
 	cache_stale_max_secs: u64,
+	/// 上流の元レスポンスを永続ディスクキャッシュに保存する。
+	#[serde(default)]
+	enable_source_cache: bool,
+	#[serde(default = "default_source_cache_path")]
+	source_cache_path: String,
+	/// source cacheのディスク容量上限(既定25GiB)。
+	#[serde(default = "default_source_cache_capacity_bytes")]
+	source_cache_capacity_bytes: u64,
+	/// source cacheの1エントリ本文上限(既定32MiB)。
+	#[serde(default = "default_source_cache_entry_max_bytes")]
+	source_cache_entry_max_bytes: u64,
+	/// source cacheをfreshとして扱う時間(既定12時間)。
+	#[serde(default = "default_source_cache_ttl_secs")]
+	source_cache_ttl_secs: u64,
+	/// fresh期限後に障害救済へ利用できる時間(既定24時間)。
+	#[serde(default = "default_source_cache_stale_secs")]
+	source_cache_stale_secs: u64,
 	/// OTLP/HTTP metrics の送信先。未設定ならメトリクス送信を無効化する。
 	/// シグナルパスを含む完全なURLを指定する。
 	#[serde(default)]
@@ -2352,13 +2371,28 @@ fn default_fetch_retry_delay_ms() -> u64 {
 fn default_cache_stale_max_secs() -> u64 {
 	86400
 }
+fn default_source_cache_path() -> String {
+	"/var/cache/media-proxy/source".to_owned()
+}
+fn default_source_cache_capacity_bytes() -> u64 {
+	25 * 1024 * 1024 * 1024
+}
+fn default_source_cache_entry_max_bytes() -> u64 {
+	32 * 1024 * 1024
+}
+fn default_source_cache_ttl_secs() -> u64 {
+	12 * 60 * 60
+}
+fn default_source_cache_stale_secs() -> u64 {
+	24 * 60 * 60
+}
 fn default_otlp_export_interval_ms() -> u64 {
 	5000
 }
 fn default_otlp_service_name() -> String {
 	env!("CARGO_PKG_NAME").to_owned()
 }
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RequestParams {
 	url: String,
 	//#[serde(rename = "static")]
@@ -2519,6 +2553,12 @@ fn main() {
 			fetch_retry_delay_ms:default_fetch_retry_delay_ms(),
 			host_throttle:None,
 			cache_stale_max_secs:default_cache_stale_max_secs(),
+			enable_source_cache:false,
+			source_cache_path:default_source_cache_path(),
+			source_cache_capacity_bytes:default_source_cache_capacity_bytes(),
+			source_cache_entry_max_bytes:default_source_cache_entry_max_bytes(),
+			source_cache_ttl_secs:default_source_cache_ttl_secs(),
+			source_cache_stale_secs:default_source_cache_stale_secs(),
             otlp_metrics_endpoint:None,
             otlp_export_interval_ms:default_otlp_export_interval_ms(),
             otlp_service_name:default_otlp_service_name(),
@@ -2670,6 +2710,39 @@ fn main() {
 		not_found_ttl: Duration::from_secs(config.negative_cache_404_ttl_secs),
 		gone_ttl: Duration::from_secs(config.negative_cache_410_ttl_secs),
 	}));
+	let source_cache = if config.enable_source_cache {
+		let capacity_bytes =
+			usize::try_from(config.source_cache_capacity_bytes).unwrap_or_else(|_| {
+				tracing::error!(
+					capacity_bytes = config.source_cache_capacity_bytes,
+					"source cache容量をこのarchitectureで表現できません"
+				);
+				std::process::exit(1);
+			});
+		let max_entry_bytes =
+			usize::try_from(config.source_cache_entry_max_bytes).unwrap_or_else(|_| {
+				tracing::error!(
+					max_entry_bytes = config.source_cache_entry_max_bytes,
+					"source cacheのentry上限をこのarchitectureで表現できません"
+				);
+				std::process::exit(1);
+			});
+		match rt.block_on(source_cache::SourceCache::open(
+			&config.source_cache_path,
+			capacity_bytes,
+			max_entry_bytes,
+			Duration::from_secs(config.source_cache_ttl_secs),
+			Duration::from_secs(config.source_cache_stale_secs),
+		)) {
+			Ok(cache) => Some(Arc::new(cache)),
+			Err(error) => {
+				tracing::error!(path = %config.source_cache_path, %error, "source cacheの初期化に失敗");
+				std::process::exit(1);
+			}
+		}
+	} else {
+		None
+	};
 	let global_stats = Arc::new(GlobalStats::with_otlp(meter_provider.as_ref()));
 	let host_throttle = match config
 		.host_throttle
@@ -2697,7 +2770,9 @@ fn main() {
 		global_stats,
 		host_throttle,
 		negative_cache,
+		source_cache,
 	);
+	let source_cache_for_shutdown = arg_tup.13.clone();
 	rt.block_on(async {
 		if let Some(throttle) = arg_tup.11.clone() {
 			if let Some(interval_duration) = throttle.observation_interval() {
@@ -3044,6 +3119,11 @@ fn main() {
 			}
 		}
 	});
+	if let Some(source_cache) = &source_cache_for_shutdown {
+		if let Err(error) = rt.block_on(source_cache.close()) {
+			tracing::warn!(%error, "source cacheのcloseに失敗");
+		}
+	}
 	if let Some(provider) = meter_provider {
 		if let Err(error) = provider.shutdown_with_timeout(Duration::from_secs(3)) {
 			tracing::warn!(%error, "OTLP metrics exporter shutdown failed");
@@ -4230,6 +4310,7 @@ async fn get_file_inner(
 		global_stats,
 		host_throttle,
 		negative_cache,
+		source_cache,
 	): AppState,
 	axum::extract::Query(q): axum::extract::Query<RequestParams>,
 ) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
@@ -4428,6 +4509,47 @@ async fn get_file_inner(
 			"Range".parse().unwrap()
 		},
 	);
+	let source_transform_context = SourceTransformContext {
+		is_accept_avif,
+		headers: headers.clone(),
+		parms: q.clone(),
+		config: config.clone(),
+		dummy_img: dummy_img.clone(),
+		fontdb: fontdb.clone(),
+		encode_semaphore: encode_semaphore.clone(),
+		buffer_budget: buffer_budget.clone(),
+		timings: timings.clone(),
+		response_cache: response_cache.clone(),
+		cache_key: cache_key.clone(),
+		is_static_path: summary.is_static_path,
+		global_stats: global_stats.clone(),
+	};
+	let mut stale_source = None;
+	if !has_range {
+		if let Some(cache) = &source_cache {
+			match cache.get(&q.url).await {
+				Ok(Some(source_cache::SourceLookup::Fresh(entry))) => {
+					return transform_source_entry(
+						&source_transform_context,
+						entry,
+						&response_cache,
+						&cache_key,
+						&mut flight_guard,
+						&summary,
+						false,
+					)
+					.await;
+				}
+				Ok(Some(source_cache::SourceLookup::Stale(entry))) => {
+					stale_source = Some(entry);
+				}
+				Ok(None) => {}
+				Err(error) => {
+					tracing::warn!(url = %q.url, %error, "source cacheの読込みに失敗");
+				}
+			}
+		}
+	}
 	let check_start = Instant::now();
 	match check_url(&network_policy, &dns_cache, &q.url).await {
 		Ok((hit, v4_count, v6_count)) => {
@@ -4460,6 +4582,18 @@ async fn get_file_inner(
 						emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
 					}
 					return Err(resp);
+				}
+				if let Some(entry) = stale_source.take() {
+					return transform_source_entry(
+						&source_transform_context,
+						entry,
+						&response_cache,
+						&cache_key,
+						&mut flight_guard,
+						&summary,
+						true,
+					)
+					.await;
 				}
 			}
 			let is_fallback = q.fallback.is_some();
@@ -4595,6 +4729,19 @@ async fn get_file_inner(
 							}
 							return Err(resp);
 						}
+						if let Some(entry) = stale_source.take() {
+							upstream_429_rescue.complete("stale");
+							return transform_source_entry(
+								&source_transform_context,
+								entry,
+								&response_cache,
+								&cache_key,
+								&mut flight_guard,
+								&summary,
+								true,
+							)
+							.await;
+						}
 					}
 					let recovery = throttle
 						.acquire_for_recovery(
@@ -4627,6 +4774,18 @@ async fn get_file_inner(
 										);
 									}
 									return Err(resp);
+								}
+								if let Some(entry) = stale_source.take() {
+									return transform_source_entry(
+										&source_transform_context,
+										entry,
+										&response_cache,
+										&cache_key,
+										&mut flight_guard,
+										&summary,
+										true,
+									)
+									.await;
 								}
 							}
 							let fallback_context = if upstream_429_rescue.pending {
@@ -4777,6 +4936,19 @@ async fn get_file_inner(
 										);
 									}
 									return Err(resp);
+								}
+								if let Some(entry) = stale_source.take() {
+									upstream_429_rescue.complete("stale");
+									return transform_source_entry(
+										&source_transform_context,
+										entry,
+										&response_cache,
+										&cache_key,
+										&mut flight_guard,
+										&summary,
+										true,
+									)
+									.await;
 								}
 								let recovery = throttle
 									.acquire_for_recovery(
@@ -4967,6 +5139,18 @@ async fn get_file_inner(
 							}
 							return Err(resp);
 						}
+						if let Some(entry) = stale_source.take() {
+							return transform_source_entry(
+								&source_transform_context,
+								entry,
+								&response_cache,
+								&cache_key,
+								&mut flight_guard,
+								&summary,
+								true,
+							)
+							.await;
+						}
 					}
 					if let Ok(t) = timings.lock() {
 						emit_summary(
@@ -5034,6 +5218,19 @@ async fn get_file_inner(
 					emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
 				}
 				return Err(stale_response);
+			}
+			if let Some(entry) = stale_source.take() {
+				upstream_429_rescue.complete("stale");
+				return transform_source_entry(
+					&source_transform_context,
+					entry,
+					&response_cache,
+					&cache_key,
+					&mut flight_guard,
+					&summary,
+					true,
+				)
+				.await;
 			}
 			upstream_429_retries = 1;
 			global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
@@ -5164,6 +5361,27 @@ async fn get_file_inner(
 					"X-Proxy-Error",
 					reqwest::header::HeaderValue::from_static(error.as_header()),
 				);
+				if error.is_resolve_failed() && !has_range {
+					if let Some(stale) = response_cache.get_stale(&cache_key) {
+						let response = build_stale_response(&stale, &config, &timings);
+						if let Ok(t) = timings.lock() {
+							emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+						}
+						return Err(response);
+					}
+					if let Some(entry) = stale_source.take() {
+						return transform_source_entry(
+							&source_transform_context,
+							entry,
+							&response_cache,
+							&cache_key,
+							&mut flight_guard,
+							&summary,
+							true,
+						)
+						.await;
+					}
+				}
 				if let Ok(t) = timings.lock() {
 					emit_summary(
 						&config,
@@ -5281,6 +5499,8 @@ async fn get_file_inner(
 		is_static_path: summary.is_static_path,
 		global_stats: global_stats.clone(),
 		deadline_fallback_response_pending,
+		source_cache: source_cache.clone(),
+		stale_source,
 	}
 	.encode(resp, is_img)
 	.await;
@@ -5348,6 +5568,100 @@ async fn get_file_inner(
 	}
 	result
 }
+#[derive(Clone)]
+struct SourceTransformContext {
+	is_accept_avif: bool,
+	headers: HeaderMap,
+	parms: RequestParams,
+	config: Arc<ConfigFile>,
+	dummy_img: Arc<Vec<u8>>,
+	fontdb: Arc<resvg::usvg::fontdb::Database>,
+	encode_semaphore: Arc<Semaphore>,
+	buffer_budget: Arc<Semaphore>,
+	timings: Arc<Mutex<PhaseTimings>>,
+	response_cache: Arc<ResponseCache>,
+	cache_key: CacheKey,
+	is_static_path: bool,
+	global_stats: Arc<GlobalStats>,
+}
+impl SourceTransformContext {
+	async fn encode(
+		&self,
+		entry: source_cache::SourceEntry,
+	) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+		let mut headers = self.headers.clone();
+		headers.insert("Cache-Control", "no-store".parse().unwrap());
+		headers.insert("X-Content-Type-Options", "nosniff".parse().unwrap());
+		for line in &self.config.append_headers {
+			if let Some(idx) = line.find(':') {
+				if idx + 1 < line.len() {
+					if let Ok(key) = axum::http::HeaderName::from_str(&line[..idx]) {
+						if let Ok(value) = line[idx + 1..].parse() {
+							headers.append(key, value);
+						}
+					}
+				}
+			}
+		}
+		RequestContext {
+			is_accept_avif: self.is_accept_avif,
+			headers,
+			parms: self.parms.clone(),
+			src_bytes: Vec::new(),
+			config: self.config.clone(),
+			codec: Err(None),
+			dummy_img: self.dummy_img.clone(),
+			fontdb: self.fontdb.clone(),
+			encode_semaphore: self.encode_semaphore.clone(),
+			buffer_budget: self.buffer_budget.clone(),
+			dl_permit: None,
+			timings: self.timings.clone(),
+			response_cache: self.response_cache.clone(),
+			cache_key: self.cache_key.clone(),
+			is_static_path: self.is_static_path,
+			global_stats: self.global_stats.clone(),
+			deadline_fallback_response_pending: false,
+			source_cache: None,
+			stale_source: None,
+		}
+		.encode_source(entry)
+		.await
+	}
+}
+async fn transform_source_entry(
+	context: &SourceTransformContext,
+	entry: source_cache::SourceEntry,
+	response_cache: &Arc<ResponseCache>,
+	cache_key: &CacheKey,
+	flight_guard: &mut Option<cache::FlightGuard>,
+	summary: &ReqSummary,
+	rescued: bool,
+) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+	let result = context.encode(entry).await;
+	if let Some(guard) = flight_guard {
+		let entry = response_cache.get(cache_key);
+		response_cache.complete_flight(guard, entry);
+	}
+	let (status, has_error) = match &result {
+		Ok((status, headers, _)) => (status.as_u16(), headers.contains_key("X-Proxy-Error")),
+		Err(response) => (
+			response.status().as_u16(),
+			response.headers().contains_key("X-Proxy-Error"),
+		),
+	};
+	if let Ok(timings) = context.timings.lock() {
+		emit_summary(
+			&context.config,
+			summary,
+			&timings,
+			status,
+			rescued || has_error,
+			None,
+			&context.global_stats,
+		);
+	}
+	result
+}
 struct RequestContext {
 	is_accept_avif: bool,
 	headers: HeaderMap,
@@ -5366,6 +5680,8 @@ struct RequestContext {
 	is_static_path: bool,
 	global_stats: Arc<GlobalStats>,
 	deadline_fallback_response_pending: bool,
+	source_cache: Option<Arc<source_cache::SourceCache>>,
+	stale_source: Option<source_cache::SourceEntry>,
 }
 impl RequestContext {
 	/// フェーズ計測ガードを生成する(Arcを複製して保持するため self を借用し続けない)。
@@ -5416,6 +5732,33 @@ impl RequestContext {
 		let entry = cache::CacheEntry::new(status, ct, cd, cc, body.to_vec());
 		if self.response_cache.put(self.cache_key.clone(), entry) && self.is_static_path {
 			self.global_stats.record_static_insertion(body.len());
+		}
+	}
+	fn cache_source(&self) {
+		let Some(cache) = &self.source_cache else {
+			return;
+		};
+		if !cache.can_store(self.src_bytes.len()) {
+			return;
+		}
+		let content_type = self
+			.headers
+			.get("Content-Type")
+			.and_then(|value| value.to_str().ok())
+			.map(str::to_owned);
+		let content_disposition = self
+			.headers
+			.get("Content-Disposition")
+			.and_then(|value| value.to_str().ok())
+			.map(str::to_owned);
+		let entry = source_cache::SourceEntry::new(
+			200,
+			content_type,
+			content_disposition,
+			self.src_bytes.clone(),
+		);
+		if !cache.put(self.parms.url.clone(), entry) {
+			tracing::debug!(url = %self.parms.url, "source cacheへの書込みを見送り");
 		}
 	}
 }
@@ -5469,8 +5812,53 @@ impl RequestContext {
 }
 impl RequestContext {
 	async fn encode(
-		mut self,
+		self,
 		resp: reqwest::Response,
+		is_img: bool,
+	) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+		let status = resp.status();
+		let resp = PreDataStream::new(resp).await;
+		self.encode_stream(status, resp, is_img).await
+	}
+
+	async fn encode_source(
+		mut self,
+		entry: source_cache::SourceEntry,
+	) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+		self.source_cache = None;
+		self.stale_source = None;
+		drop(self.dl_permit.take());
+		self.headers.remove("Content-Type");
+		self.headers.remove("Content-Disposition");
+		self.headers.remove("Content-Length");
+		self.headers.remove("Content-Range");
+		self.headers.remove("Accept-Ranges");
+		self.headers.remove("X-Proxy-Error");
+		if let Some(content_type) = &entry.content_type {
+			if let Ok(value) = content_type.parse() {
+				self.headers.insert("Content-Type", value);
+			}
+		}
+		if let Some(content_disposition) = &entry.content_disposition {
+			if let Ok(value) = content_disposition.parse() {
+				self.headers.insert("Content-Disposition", value);
+			}
+		}
+		let is_img = entry
+			.content_type
+			.as_deref()
+			.and_then(|value| value.split(';').next())
+			.is_some_and(|media_type| media_type.trim().starts_with("image/"));
+		let status = axum::http::StatusCode::from_u16(entry.status)
+			.unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+		self.encode_stream(status, PreDataStream::from_bytes(entry.body), is_img)
+			.await
+	}
+
+	async fn encode_stream(
+		mut self,
+		status: axum::http::StatusCode,
+		resp: PreDataStream,
 		mut is_img: bool,
 	) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
 		let mut is_svg = false;
@@ -5486,12 +5874,18 @@ impl RequestContext {
 				content_type = Some(s);
 			}
 		}
-		let status = resp.status();
 		if !status.is_success() {
 			self.complete_deadline_fallback_terminal("response_other");
+			if status == axum::http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+				if let Some(stale) = self.response_cache.get_stale(&self.cache_key) {
+					return Err(build_stale_response(&stale, &self.config, &self.timings));
+				}
+				if let Some(entry) = self.stale_source.take() {
+					return Box::pin(self.encode_source(entry)).await;
+				}
+			}
 			return Err(self.remote_error_response(status));
 		}
-		let resp = PreDataStream::new(resp).await;
 		if let Some(Ok(head)) = resp.head.as_ref() {
 			//utf8にパースできて空白文字を削除した後の先頭部分が<svgの場合はsvg
 			if std::str::from_utf8(head)
@@ -5591,7 +5985,16 @@ impl RequestContext {
 				t.wait += elapsed;
 				t.buffer_wait += elapsed;
 			}
-			self.load_all(resp).await?;
+			if let Err(error) = self.load_all(resp).await {
+				if let Some(stale) = self.response_cache.get_stale(&self.cache_key) {
+					return Err(build_stale_response(&stale, &self.config, &self.timings));
+				}
+				if let Some(entry) = self.stale_source.take() {
+					return Box::pin(self.encode_source(entry)).await;
+				}
+				return Err(error);
+			}
+			self.cache_source();
 			drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
 								// CPU permit を取得してエンコード
 			let cpu_sem = self.encode_semaphore.clone();
@@ -5703,7 +6106,16 @@ impl RequestContext {
 				t.wait += elapsed;
 				t.buffer_wait += elapsed;
 			}
-			self.load_all(resp).await?;
+			if let Err(error) = self.load_all(resp).await {
+				if let Some(stale) = self.response_cache.get_stale(&self.cache_key) {
+					return Err(build_stale_response(&stale, &self.config, &self.timings));
+				}
+				if let Some(entry) = self.stale_source.take() {
+					return Box::pin(self.encode_source(entry)).await;
+				}
+				return Err(error);
+			}
+			self.cache_source();
 			drop(self.dl_permit.take()); // ダウンロード完了 → DL permit 解放
 								// --- パススルー判定 ---
 								// webp/png/jpeg/gif かつ badge/static 無 かつ寸法が目標以下かつサイズが閾値以下なら
@@ -5985,6 +6397,14 @@ impl PreDataStream {
 			last: Box::pin(stream),
 		}
 	}
+	fn from_bytes(value: Vec<u8>) -> Self {
+		let content_length = value.len() as u64;
+		Self {
+			content_length: Some(content_length),
+			head: Some(Ok(value.into())),
+			last: Box::pin(futures::stream::empty()),
+		}
+	}
 }
 impl futures::stream::Stream for PreDataStream {
 	type Item = Result<axum::body::Bytes, reqwest::Error>;
@@ -5998,6 +6418,20 @@ impl futures::stream::Stream for PreDataStream {
 			return std::task::Poll::Ready(Some(d));
 		}
 		r.last.as_mut().poll_next(cx)
+	}
+}
+
+#[cfg(test)]
+mod pre_data_stream_tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn from_bytes_yields_cached_body_once() {
+		let mut stream = PreDataStream::from_bytes(b"cached source".to_vec());
+
+		assert_eq!(stream.content_length, Some(13));
+		assert_eq!(stream.next().await.unwrap().unwrap(), "cached source");
+		assert!(stream.next().await.is_none());
 	}
 }
 
@@ -7474,6 +7908,12 @@ mod network_policy_tests {
 			fetch_retry_delay_ms: default_fetch_retry_delay_ms(),
 			host_throttle: None,
 			cache_stale_max_secs: default_cache_stale_max_secs(),
+			enable_source_cache: false,
+			source_cache_path: default_source_cache_path(),
+			source_cache_capacity_bytes: default_source_cache_capacity_bytes(),
+			source_cache_entry_max_bytes: default_source_cache_entry_max_bytes(),
+			source_cache_ttl_secs: default_source_cache_ttl_secs(),
+			source_cache_stale_secs: default_source_cache_stale_secs(),
 			otlp_metrics_endpoint: None,
 			otlp_export_interval_ms: default_otlp_export_interval_ms(),
 			otlp_service_name: default_otlp_service_name(),
@@ -7500,6 +7940,25 @@ mod network_policy_tests {
 		assert_eq!(config.otlp_metrics_endpoint, None);
 		assert_eq!(config.otlp_export_interval_ms, 5000);
 		assert_eq!(config.otlp_service_name, "media-proxy-rs");
+	}
+	#[test]
+	fn source_cache_defaults_for_existing_config() {
+		let mut value = serde_json::to_value(base_config()).unwrap();
+		let object = value.as_object_mut().unwrap();
+		object.remove("enable_source_cache");
+		object.remove("source_cache_path");
+		object.remove("source_cache_capacity_bytes");
+		object.remove("source_cache_entry_max_bytes");
+		object.remove("source_cache_ttl_secs");
+		object.remove("source_cache_stale_secs");
+
+		let config: ConfigFile = serde_json::from_value(value).unwrap();
+		assert!(!config.enable_source_cache);
+		assert_eq!(config.source_cache_path, "/var/cache/media-proxy/source");
+		assert_eq!(config.source_cache_capacity_bytes, 25 * 1024 * 1024 * 1024);
+		assert_eq!(config.source_cache_entry_max_bytes, 32 * 1024 * 1024);
+		assert_eq!(config.source_cache_ttl_secs, 12 * 60 * 60);
+		assert_eq!(config.source_cache_stale_secs, 24 * 60 * 60);
 	}
 	#[test]
 	fn unavailable_otlp_collector_does_not_block_initialization() {

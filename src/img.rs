@@ -1531,8 +1531,10 @@ mod tests {
 		default_max_concurrent_downloads, default_negative_cache_404_ttl_secs,
 		default_negative_cache_410_ttl_secs, default_negative_cache_max_entries,
 		default_otlp_export_interval_ms, default_otlp_service_name, default_passthrough_max_bytes,
-		default_slow_log_ms, default_webp_method, ConfigFile, FilterType, GlobalStats,
-		PhaseTimings, RequestParams,
+		default_slow_log_ms, default_source_cache_capacity_bytes,
+		default_source_cache_entry_max_bytes, default_source_cache_path,
+		default_source_cache_stale_secs, default_source_cache_ttl_secs, default_webp_method,
+		ConfigFile, FilterType, GlobalStats, PhaseTimings, RequestParams,
 	};
 
 	fn png_chunk(ctype: &[u8; 4], data: &[u8]) -> Vec<u8> {
@@ -1827,6 +1829,12 @@ mod tests {
 				fetch_retry_delay_ms: default_fetch_retry_delay_ms(),
 				host_throttle: None,
 				cache_stale_max_secs: default_cache_stale_max_secs(),
+				enable_source_cache: false,
+				source_cache_path: default_source_cache_path(),
+				source_cache_capacity_bytes: default_source_cache_capacity_bytes(),
+				source_cache_entry_max_bytes: default_source_cache_entry_max_bytes(),
+				source_cache_ttl_secs: default_source_cache_ttl_secs(),
+				source_cache_stale_secs: default_source_cache_stale_secs(),
 				otlp_metrics_endpoint: None,
 				otlp_export_interval_ms: default_otlp_export_interval_ms(),
 				otlp_service_name: default_otlp_service_name(),
@@ -1857,6 +1865,8 @@ mod tests {
 			is_static_path: false,
 			global_stats: std::sync::Arc::new(GlobalStats::new()),
 			deadline_fallback_response_pending: false,
+			source_cache: None,
+			stale_source: None,
 		}
 	}
 

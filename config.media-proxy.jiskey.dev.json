@@ -55,6 +55,12 @@
     }
   },
   "cache_stale_max_secs": 86400,
+  "enable_source_cache": true,
+  "source_cache_path": "/var/cache/media-proxy/source",
+  "source_cache_capacity_bytes": 26843545600,
+  "source_cache_entry_max_bytes": 33554432,
+  "source_cache_ttl_secs": 43200,
+  "source_cache_stale_secs": 86400,
   "otlp_metrics_endpoint": "http://alloy:4318/v1/metrics",
   "otlp_export_interval_ms": 5000,
   "otlp_service_name": "media-proxy-rs",
