@@ -29,10 +29,7 @@ mod mng;
 mod ssrf;
 mod svg;
 
-use cache::{
-	CacheKey, CacheResult, ResponseCache, SourceCache, SourceCacheLookup, SourceEntry,
-	SourceFlightGuard,
-};
+use cache::{CacheKey, CacheResult, ResponseCache};
 
 const HOST_THROTTLE_FALLBACK_COOLDOWN: Duration = Duration::from_secs(5);
 const HOST_THROTTLE_MAX_COOLDOWN: Duration = Duration::from_secs(60);
@@ -1258,10 +1255,6 @@ struct OtlpMetrics {
 	cache_capacity_evictions: Counter<u64>,
 	cache_expired_evictions: Counter<u64>,
 	singleflight_active: Gauge<u64>,
-	source_cache_requests: Counter<u64>,
-	source_cache_entries: Gauge<u64>,
-	source_cache_bytes: Gauge<u64>,
-	source_cache_capacity_bytes: Gauge<u64>,
 	static_requests: Counter<u64>,
 	downloads_active: Gauge<u64>,
 	downloads_limit: Gauge<u64>,
@@ -1345,14 +1338,6 @@ impl OtlpMetrics {
 				.u64_counter("media_proxy_cache_expired_evictions_total")
 				.build(),
 			singleflight_active: meter.u64_gauge("media_proxy_singleflight_active").build(),
-			source_cache_requests: meter
-				.u64_counter("media_proxy_source_cache_requests_total")
-				.build(),
-			source_cache_entries: meter.u64_gauge("media_proxy_source_cache_entries").build(),
-			source_cache_bytes: meter.u64_gauge("media_proxy_source_cache_bytes").build(),
-			source_cache_capacity_bytes: meter
-				.u64_gauge("media_proxy_source_cache_capacity_bytes")
-				.build(),
 			static_requests: meter
 				.u64_counter("media_proxy_static_requests_total")
 				.build(),
@@ -1555,12 +1540,6 @@ impl OtlpMetrics {
 		self.cache_expired_evictions.add(eviction_deltas.1, &[]);
 		self.singleflight_active
 			.record(snapshot.singleflight_active, &[]);
-		self.source_cache_entries
-			.record(snapshot.source_cache_entries, &[]);
-		self.source_cache_bytes
-			.record(snapshot.source_cache_bytes, &[]);
-		self.source_cache_capacity_bytes
-			.record(snapshot.source_cache_capacity_bytes, &[]);
 		self.downloads_active.record(snapshot.downloads_active, &[]);
 		self.downloads_limit.record(snapshot.downloads_limit, &[]);
 		self.cpu_active.record(snapshot.cpu_active, &[]);
@@ -1600,9 +1579,6 @@ struct ResourceSnapshot {
 	cache_bytes: u64,
 	cache_capacity_bytes: u64,
 	singleflight_active: u64,
-	source_cache_entries: u64,
-	source_cache_bytes: u64,
-	source_cache_capacity_bytes: u64,
 	downloads_active: u64,
 	downloads_limit: u64,
 	cpu_active: u64,
@@ -1617,7 +1593,6 @@ struct ResourceSnapshot {
 fn record_resource_metrics(
 	metrics: &OtlpMetrics,
 	response_cache: &ResponseCache,
-	source_cache: &SourceCache,
 	dns_cache: &DnsCache,
 	download_semaphore: &Semaphore,
 	download_limit: usize,
@@ -1626,13 +1601,11 @@ fn record_resource_metrics(
 	buffer_budget: &Semaphore,
 	buffer_limit: usize,
 	cache_capacity_bytes: u64,
-	source_cache_capacity_bytes: u64,
 	process_started: Instant,
 	previous_evictions: &mut (u64, u64),
 	previous_dns_retries: &mut (u64, u64),
 ) {
 	let (cache_entries, cache_bytes) = response_cache.stats();
-	let (source_cache_entries, source_cache_bytes) = source_cache.stats();
 	let cumulative_evictions = response_cache.cumulative_evictions();
 	let eviction_deltas = (
 		cumulative_evictions.0.saturating_sub(previous_evictions.0),
@@ -1655,9 +1628,6 @@ fn record_resource_metrics(
 			cache_bytes: cache_bytes as u64,
 			cache_capacity_bytes,
 			singleflight_active: response_cache.inflight_count() as u64,
-			source_cache_entries: source_cache_entries as u64,
-			source_cache_bytes: source_cache_bytes as u64,
-			source_cache_capacity_bytes,
 			downloads_active: download_limit.saturating_sub(download_semaphore.available_permits())
 				as u64,
 			downloads_limit: download_limit as u64,
@@ -1738,10 +1708,6 @@ struct GlobalStats {
 	errors: AtomicU64,
 	cache_hits: AtomicU64,
 	cache_misses: AtomicU64,
-	source_cache_hits: AtomicU64,
-	source_cache_misses: AtomicU64,
-	source_cache_joined: AtomicU64,
-	source_cache_stale_served: AtomicU64,
 	cache_evicted_reaccesses: AtomicU64,
 	ferr_connect: AtomicU64,
 	ferr_timeout: AtomicU64,
@@ -1822,10 +1788,6 @@ impl GlobalStats {
 			errors: AtomicU64::new(0),
 			cache_hits: AtomicU64::new(0),
 			cache_misses: AtomicU64::new(0),
-			source_cache_hits: AtomicU64::new(0),
-			source_cache_misses: AtomicU64::new(0),
-			source_cache_joined: AtomicU64::new(0),
-			source_cache_stale_served: AtomicU64::new(0),
 			cache_evicted_reaccesses: AtomicU64::new(0),
 			ferr_connect: AtomicU64::new(0),
 			ferr_timeout: AtomicU64::new(0),
@@ -1911,36 +1873,6 @@ impl GlobalStats {
 			self.errors.swap(0, Ordering::Relaxed),
 			self.cache_hits.swap(0, Ordering::Relaxed),
 			self.cache_misses.swap(0, Ordering::Relaxed),
-		)
-	}
-	fn observe_source_cache(&self, result: &'static str) {
-		match result {
-			"hit" => &self.source_cache_hits,
-			"miss" => &self.source_cache_misses,
-			"joined" => &self.source_cache_joined,
-			"stale" => &self.source_cache_stale_served,
-			_ => {
-				if let Some(metrics) = &self.otlp {
-					metrics
-						.source_cache_requests
-						.add(1, &[KeyValue::new("result", result)]);
-				}
-				return;
-			}
-		}
-		.fetch_add(1, Ordering::Relaxed);
-		if let Some(metrics) = &self.otlp {
-			metrics
-				.source_cache_requests
-				.add(1, &[KeyValue::new("result", result)]);
-		}
-	}
-	fn swap_reset_source_cache(&self) -> (u64, u64, u64, u64) {
-		(
-			self.source_cache_hits.swap(0, Ordering::Relaxed),
-			self.source_cache_misses.swap(0, Ordering::Relaxed),
-			self.source_cache_joined.swap(0, Ordering::Relaxed),
-			self.source_cache_stale_served.swap(0, Ordering::Relaxed),
 		)
 	}
 	/// fetch_err カウンタをリセットし値を返す。
@@ -2259,7 +2191,6 @@ type AppState = (
 	Arc<GlobalStats>,
 	Option<Arc<HostThrottle>>,
 	Arc<cache::NegativeCache>,
-	Arc<SourceCache>,
 );
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2296,18 +2227,6 @@ pub struct ConfigFile {
 	/// キャッシュTTL(秒、既定3600)。
 	#[serde(default = "default_cache_ttl_secs")]
 	cache_ttl_secs: u64,
-	/// 元画像キャッシュの合計バイト数上限(既定128MB)。
-	#[serde(default = "default_source_cache_max_bytes")]
-	source_cache_max_bytes: u64,
-	/// 元画像キャッシュの1エントリ上限(既定5MB)。
-	#[serde(default = "default_source_cache_entry_max_bytes")]
-	source_cache_entry_max_bytes: u64,
-	/// 元画像キャッシュTTL(秒、既定3600)。
-	#[serde(default = "default_source_cache_ttl_secs")]
-	source_cache_ttl_secs: u64,
-	/// 元画像stale-if-errorの保持上限(秒、既定86400=24時間)。0で無効。
-	#[serde(default = "default_source_cache_stale_max_secs")]
-	source_cache_stale_max_secs: u64,
 	/// 上流404のネガティブキャッシュTTL(秒、既定3600)。0で無効。
 	#[serde(default = "default_negative_cache_404_ttl_secs")]
 	negative_cache_404_ttl_secs: u64,
@@ -2387,18 +2306,6 @@ fn default_cache_entry_max_bytes() -> u64 {
 }
 fn default_cache_ttl_secs() -> u64 {
 	3600
-}
-fn default_source_cache_max_bytes() -> u64 {
-	128 * 1024 * 1024
-}
-fn default_source_cache_entry_max_bytes() -> u64 {
-	5 * 1024 * 1024
-}
-fn default_source_cache_ttl_secs() -> u64 {
-	3600
-}
-fn default_source_cache_stale_max_secs() -> u64 {
-	86400
 }
 fn default_negative_cache_404_ttl_secs() -> u64 {
 	3600
@@ -2596,10 +2503,6 @@ fn main() {
 			cache_max_bytes:default_cache_max_bytes(),
 			cache_entry_max_bytes:default_cache_entry_max_bytes(),
 			cache_ttl_secs:default_cache_ttl_secs(),
-			source_cache_max_bytes:default_source_cache_max_bytes(),
-			source_cache_entry_max_bytes:default_source_cache_entry_max_bytes(),
-			source_cache_ttl_secs:default_source_cache_ttl_secs(),
-			source_cache_stale_max_secs:default_source_cache_stale_max_secs(),
 			negative_cache_404_ttl_secs:default_negative_cache_404_ttl_secs(),
 			negative_cache_410_ttl_secs:default_negative_cache_410_ttl_secs(),
 			negative_cache_max_entries:default_negative_cache_max_entries(),
@@ -2761,13 +2664,6 @@ fn main() {
 		ttl: Duration::from_secs(config.cache_ttl_secs),
 		stale_max: Duration::from_secs(config.cache_stale_max_secs),
 	}));
-	let source_cache = Arc::new(SourceCache::new(cache::SourceCacheConfig {
-		enabled: config.enable_cache,
-		max_bytes: config.source_cache_max_bytes as usize,
-		entry_max_bytes: config.source_cache_entry_max_bytes as usize,
-		ttl: Duration::from_secs(config.source_cache_ttl_secs),
-		stale_max: Duration::from_secs(config.source_cache_stale_max_secs),
-	}));
 	let negative_cache = Arc::new(cache::NegativeCache::new(cache::NegativeCacheConfig {
 		enabled: config.enable_cache,
 		max_entries: config.negative_cache_max_entries,
@@ -2801,7 +2697,6 @@ fn main() {
 		global_stats,
 		host_throttle,
 		negative_cache,
-		source_cache,
 	);
 	rt.block_on(async {
 		if let Some(throttle) = arg_tup.11.clone() {
@@ -2846,7 +2741,6 @@ fn main() {
 		}
 		if let Some(metrics) = arg_tup.10.otlp.clone() {
 			let response_cache = arg_tup.7.clone();
-			let source_cache = arg_tup.13.clone();
 			let dns_cache = arg_tup.6.clone();
 			let download_semaphore = arg_tup.8.clone();
 			let cpu_semaphore = arg_tup.4.clone();
@@ -2855,7 +2749,6 @@ fn main() {
 			let cpu_limit = max_concurrent_encode;
 			let buffer_limit = arg_tup.1.inflight_buffer_budget_bytes as usize;
 			let cache_capacity_bytes = arg_tup.1.cache_max_bytes;
-			let source_cache_capacity_bytes = arg_tup.1.source_cache_max_bytes;
 			let interval_ms = arg_tup.1.otlp_export_interval_ms;
 			tokio::spawn(async move {
 				let mut previous_evictions = (0, 0);
@@ -2866,7 +2759,6 @@ fn main() {
 					record_resource_metrics(
 						&metrics,
 						&response_cache,
-						&source_cache,
 						&dns_cache,
 						&download_semaphore,
 						download_limit,
@@ -2875,7 +2767,6 @@ fn main() {
 						&buffer_budget,
 						buffer_limit,
 						cache_capacity_bytes,
-						source_cache_capacity_bytes,
 						process_started,
 						&mut previous_evictions,
 						&mut previous_dns_retries,
@@ -2891,7 +2782,6 @@ fn main() {
 			let buf_sem = arg_tup.9.clone();
 			let resp_cache = arg_tup.7.clone();
 			let negative_cache = arg_tup.12.clone();
-			let source_cache = arg_tup.13.clone();
 			let dns = arg_tup.6.clone();
 			let max_encode = max_concurrent_encode;
 			let max_dl = arg_tup.1.max_concurrent_downloads;
@@ -2902,12 +2792,6 @@ fn main() {
 				loop {
 					interval.tick().await;
 					let (reqs, errs, hits, misses) = stats.swap_reset();
-					let (
-						source_cache_hits,
-						source_cache_misses,
-						source_cache_joined,
-						source_cache_stale_served,
-					) = stats.swap_reset_source_cache();
 					let cache_evicted_reaccesses =
 						stats.cache_evicted_reaccesses.swap(0, Ordering::Relaxed);
 					let (fc, ft, fd, fr, fb, fth, fo) = stats.swap_reset_ferr();
@@ -3009,7 +2893,6 @@ fn main() {
 					let cpu_active = max_encode - encode_sem.available_permits();
 					let buf_used = max_buf - buf_sem.available_permits();
 					let (cache_entries, cache_bytes) = resp_cache.stats();
-					let (source_cache_entries, source_cache_bytes) = source_cache.stats();
 					let negative_cache_entries = negative_cache.len();
 					let (cache_capacity_evictions, cache_expired_evictions) =
 						resp_cache.swap_reset_evictions();
@@ -3020,10 +2903,6 @@ fn main() {
 						errors = errs,
 						cache_hits = hits,
 						cache_misses = misses,
-						source_cache_hits,
-						source_cache_misses,
-						source_cache_joined,
-						source_cache_stale_served,
 						cache_evicted_reaccesses,
 						dl_active = dl_active as u64,
 						dl_max = max_dl as u64,
@@ -3033,8 +2912,6 @@ fn main() {
 						buf_max_mb = (max_buf / (1024 * 1024)) as u64,
 						cache_entries = cache_entries as u64,
 						cache_bytes = cache_bytes as u64,
-						source_cache_entries = source_cache_entries as u64,
-						source_cache_bytes = source_cache_bytes as u64,
 						cache_capacity_evictions,
 						cache_expired_evictions,
 						negative_cache_entries = negative_cache_entries as u64,
@@ -4249,29 +4126,6 @@ fn build_stale_response(
 	(axum::http::StatusCode::OK, headers, cached.body.clone()).into_response()
 }
 
-fn source_entry_response(source: SourceEntry) -> reqwest::Response {
-	let mut response = axum::http::Response::builder().status(reqwest::StatusCode::OK);
-	if let Some(content_type) = source.content_type {
-		response = response.header(reqwest::header::CONTENT_TYPE, content_type);
-	}
-	if let Some(content_disposition) = source.content_disposition {
-		response = response.header(reqwest::header::CONTENT_DISPOSITION, content_disposition);
-	}
-	response.body(source.body).unwrap().into()
-}
-
-fn take_stale_source_response(
-	source_cache: &Arc<SourceCache>,
-	source_key: &str,
-	source_flight_guard: &mut Option<SourceFlightGuard>,
-) -> Option<reqwest::Response> {
-	let source = source_cache.get_stale(source_key)?;
-	if let Some(mut guard) = source_flight_guard.take() {
-		source_cache.complete_flight(&mut guard, Some(source.clone()));
-	}
-	Some(source_entry_response(source))
-}
-
 fn build_negative_response(
 	status: u16,
 	params: &RequestParams,
@@ -4376,7 +4230,6 @@ async fn get_file_inner(
 		global_stats,
 		host_throttle,
 		negative_cache,
-		source_cache,
 	): AppState,
 	axum::extract::Query(q): axum::extract::Query<RequestParams>,
 ) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
@@ -4575,12 +4428,8 @@ async fn get_file_inner(
 			"Range".parse().unwrap()
 		},
 	);
-	let negative_key = reqwest::Url::parse(&q.url)
-		.map(|url| url.to_string())
-		.unwrap_or_else(|_| q.url.clone());
-	let mut source_cache_stale = false;
 	let check_start = Instant::now();
-	let dns_stale_source = match check_url(&network_policy, &dns_cache, &q.url).await {
+	match check_url(&network_policy, &dns_cache, &q.url).await {
 		Ok((hit, v4_count, v6_count)) => {
 			if let Ok(mut t) = timings.lock() {
 				t.check = check_start.elapsed();
@@ -4588,7 +4437,6 @@ async fn get_file_inner(
 				t.dns_v4 = v4_count;
 				t.dns_v6 = v6_count;
 			}
-			None
 		}
 		Err(error) => {
 			if let Ok(mut t) = timings.lock() {
@@ -4604,7 +4452,8 @@ async fn get_file_inner(
 				"X-Proxy-Error",
 				reqwest::header::HeaderValue::from_static(error.as_header()),
 			);
-			let stale_source = if error.is_resolve_failed() && !has_range {
+			// stale-if-error: DNS失敗(ポリシー拒否以外)ならstaleを試みる
+			if error.is_resolve_failed() && !has_range {
 				if let Some(stale) = response_cache.get_stale(&cache_key) {
 					let resp = build_stale_response(&stale, &config, &timings);
 					if let Ok(t) = timings.lock() {
@@ -4612,41 +4461,34 @@ async fn get_file_inner(
 					}
 					return Err(resp);
 				}
-				source_cache.get_stale(&negative_key)
-			} else {
-				None
-			};
-			if let Some(stale) = stale_source {
-				headers.remove("X-Proxy-Error");
-				global_stats.observe_source_cache("stale");
-				source_cache_stale = true;
-				Some(stale)
-			} else {
-				let is_fallback = q.fallback.is_some();
-				if let Ok(t) = timings.lock() {
-					emit_summary(
-						&config,
-						&summary,
-						&t,
-						if is_fallback { 200 } else { 400 },
-						true,
-						Some(error.detail()),
-						&global_stats,
-					);
-				}
-				if is_fallback {
-					headers.append("Cache-Control", "no-store".parse().unwrap());
-					headers.append("Content-Type", "image/png".parse().unwrap());
-					return Err(
-						(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
-					);
-				}
-				headers.append("Cache-Control", "no-store".parse().unwrap());
-				return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 			}
+			let is_fallback = q.fallback.is_some();
+			if let Ok(t) = timings.lock() {
+				emit_summary(
+					&config,
+					&summary,
+					&t,
+					if is_fallback { 200 } else { 400 },
+					true,
+					Some(error.detail()),
+					&global_stats,
+				);
+			}
+			if is_fallback {
+				headers.append("Cache-Control", "no-store".parse().unwrap());
+				headers.append("Content-Type", "image/png".parse().unwrap());
+				return Err(
+					(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
+				);
+			}
+			headers.append("Cache-Control", "no-store".parse().unwrap());
+			return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 		}
 	};
-	if !has_range && dns_stale_source.is_none() {
+	let negative_key = reqwest::Url::parse(&q.url)
+		.map(|url| url.to_string())
+		.unwrap_or_else(|_| q.url.clone());
+	if !has_range {
 		if let Some(entry) = negative_cache.get(&negative_key) {
 			if let Ok(mut t) = timings.lock() {
 				t.cache_result = Some(CacheResult::Negative);
@@ -4670,89 +4512,46 @@ async fn get_file_inner(
 			return Err(response);
 		}
 	}
-	let mut source_flight_guard = None;
-	let cached_source = if let Some(stale) = dns_stale_source {
-		Some(stale)
-	} else if has_range {
-		global_stats.observe_source_cache("bypass");
-		None
-	} else {
-		loop {
-			match source_cache.lookup_or_start(negative_key.clone()) {
-				SourceCacheLookup::Bypass => {
-					global_stats.observe_source_cache("bypass");
-					break None;
-				}
-				SourceCacheLookup::Hit(entry) => {
-					global_stats.observe_source_cache("hit");
-					break Some(entry);
-				}
-				SourceCacheLookup::Leader(guard) => {
-					global_stats.observe_source_cache("miss");
-					source_flight_guard = Some(guard);
-					break None;
-				}
-				SourceCacheLookup::Follower(mut receiver) => {
-					global_stats.observe_source_cache("joined");
-					match receiver.recv().await {
-						Ok(Some(result)) => {
-							if result.stale {
-								global_stats.observe_source_cache("stale");
-								source_cache_stale = true;
-							}
-							break Some(result.entry);
-						}
-						_ => continue,
-					}
-				}
-			}
-		}
-	};
 
 	// --- ダウンロードpermit取得(取得順序: DL permit → バイト予算 → CPU permit) ---
-	let dl_permit = if cached_source.is_none() {
-		let wait_start = Instant::now();
-		let permit = match tokio::time::timeout(
-			RESOURCE_WAIT_TIMEOUT,
-			download_semaphore.clone().acquire_owned(),
-		)
-		.await
-		{
-			Ok(Ok(permit)) => permit,
-			_ => {
-				if let Ok(mut t) = timings.lock() {
-					let elapsed = wait_start.elapsed();
-					t.wait += elapsed;
-					t.dl_wait += elapsed;
-				}
-				let mut h = HeaderMap::new();
-				h.append("X-Proxy-Error", "DownloadSemaphoreError".parse().unwrap());
-				if let Ok(t) = timings.lock() {
-					emit_summary(
-						&config,
-						&summary,
-						&t,
-						503,
-						true,
-						Some("DownloadSemaphoreError"),
-						&global_stats,
-					);
-				}
-				return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
+	let wait_start = Instant::now();
+	let dl_permit = match tokio::time::timeout(
+		RESOURCE_WAIT_TIMEOUT,
+		download_semaphore.clone().acquire_owned(),
+	)
+	.await
+	{
+		Ok(Ok(permit)) => permit,
+		_ => {
+			if let Ok(mut t) = timings.lock() {
+				let elapsed = wait_start.elapsed();
+				t.wait += elapsed;
+				t.dl_wait += elapsed;
 			}
-		};
-		global_stats.observe_dl_active(
-			config.max_concurrent_downloads - download_semaphore.available_permits(),
-		);
-		if let Ok(mut t) = timings.lock() {
-			let elapsed = wait_start.elapsed();
-			t.wait += elapsed;
-			t.dl_wait += elapsed;
+			let mut h = HeaderMap::new();
+			h.append("X-Proxy-Error", "DownloadSemaphoreError".parse().unwrap());
+			if let Ok(t) = timings.lock() {
+				emit_summary(
+					&config,
+					&summary,
+					&t,
+					503,
+					true,
+					Some("DownloadSemaphoreError"),
+					&global_stats,
+				);
+			}
+			return Err((axum::http::StatusCode::SERVICE_UNAVAILABLE, h).into_response());
 		}
-		Some(permit)
-	} else {
-		None
 	};
+	global_stats.observe_dl_active(
+		config.max_concurrent_downloads - download_semaphore.available_permits(),
+	);
+	if let Ok(mut t) = timings.lock() {
+		let elapsed = wait_start.elapsed();
+		t.wait += elapsed;
+		t.dl_wait += elapsed;
+	}
 	let send_start = Instant::now();
 	// Direct fetches are revalidated by ValidatingResolver at connection time.
 	// With config.proxy, the proxy resolves the target, so only the URL pre-check
@@ -4774,326 +4573,283 @@ async fn get_file_inner(
 	let mut upstream_429_rescue = Upstream429RescueGuard::new(global_stats.clone());
 	let mut upstream_429_retry_succeeded = false;
 	let mut deadline_fallback_response_pending = false;
-	let mut source_cache_hit = cached_source.is_some();
-	let resp = if let Some(source) = cached_source {
-		source_entry_response(source)
-	} else {
-		'fetch: loop {
-			macro_rules! serve_source_stale {
-				() => {
-					if let Some(stale_response) = take_stale_source_response(
-						&source_cache,
-						&negative_key,
-						&mut source_flight_guard,
-					) {
-						global_stats.observe_source_cache("stale");
-						if upstream_429_rescue.pending {
-							upstream_429_rescue.complete("stale");
-						}
-						source_cache_hit = true;
-						source_cache_stale = true;
-						break 'fetch stale_response;
-					}
-				};
-			}
-			let mut throttle_permit = if let Some(throttle) = &host_throttle {
-				let result = throttle
-					.acquire(&current_url, throttle_wait_budget(&config, request_started))
-					.await;
-				global_stats.observe_host_throttle(&result);
-				match result {
-					Ok(permit) => Some(permit),
-					Err(rejection) => {
-						throttle_wait_total += rejection.waited;
-						if let Ok(mut t) = timings.lock() {
-							t.wait += rejection.waited;
-						}
-						if !has_range {
-							if let Some(stale) = response_cache.get_stale(&cache_key) {
-								upstream_429_rescue.complete("stale");
-								let resp = build_stale_response(&stale, &config, &timings);
-								if let Ok(t) = timings.lock() {
-									emit_summary(
-										&config,
-										&summary,
-										&t,
-										200,
-										true,
-										None,
-										&global_stats,
-									);
-								}
-								return Err(resp);
-							}
-						}
-						serve_source_stale!();
-						let recovery = throttle
-							.acquire_for_recovery(
-								&current_url,
-								throttle_wait_budget(&config, request_started),
-								rejection.shadow_decision,
-							)
-							.await;
-						global_stats.observe_host_throttle(&recovery);
-						match recovery {
-							Ok(permit) => Some(permit),
-							Err(final_rejection) => {
-								throttle_wait_total += final_rejection.waited;
-								if let Ok(mut t) = timings.lock() {
-									t.wait += final_rejection.waited;
-								}
-								if !has_range {
-									if let Some(stale) = response_cache.get_stale(&cache_key) {
-										upstream_429_rescue.complete("stale");
-										let resp = build_stale_response(&stale, &config, &timings);
-										if let Ok(t) = timings.lock() {
-											emit_summary(
-												&config,
-												&summary,
-												&t,
-												200,
-												true,
-												None,
-												&global_stats,
-											);
-										}
-										return Err(resp);
-									}
-								}
-								serve_source_stale!();
-								let fallback_context = if upstream_429_rescue.pending {
-									DeadlineFallbackContext::Upstream429Retry
-								} else {
-									DeadlineFallbackContext::Initial
-								};
-								let fallback = throttle
-									.acquire_for_deadline_fallback(
-										&current_url,
-										throttle_deadline_fallback_budget(&config, request_started),
-										final_rejection.shadow_decision,
-									)
-									.await;
-								global_stats.observe_deadline_fallback(&fallback, fallback_context);
-								global_stats.observe_host_throttle(&fallback);
-								match fallback {
-									Ok(permit) => Some(permit),
-									Err(fallback_rejection) => {
-										throttle_wait_total += fallback_rejection.waited;
-										let (fetch_error, summary_error) = match fallback_context {
-											DeadlineFallbackContext::Upstream429Retry => (
-												"throttle:429_retry_wait_timeout",
-												"HostThrottle429RetryWaitTimeout",
-											),
-											_ => (
-												"throttle:initial_wait_timeout",
-												"HostThrottleInitialWaitTimeout",
-											),
-										};
-										if let Ok(mut t) = timings.lock() {
-											t.wait += fallback_rejection.waited;
-											t.fetch_err = Some(fetch_error.to_owned());
-										}
-										serve_source_stale!();
-										headers.append(
-											"X-Proxy-Error",
-											"HostThrottleTimeout".parse().unwrap(),
-										);
-										headers.append(
-											"Retry-After",
-											response_retry_after(fallback_rejection.retry_after),
-										);
-										if let Ok(t) = timings.lock() {
-											emit_summary(
-												&config,
-												&summary,
-												&t,
-												503,
-												true,
-												Some(summary_error),
-												&global_stats,
-											);
-										}
-										return Err((
-											axum::http::StatusCode::SERVICE_UNAVAILABLE,
-											headers,
-										)
-											.into_response());
-									}
-								}
-							}
-						}
-					}
-				}
-			} else {
-				None
-			};
-			let throttle_wait = throttle_permit
-				.as_ref()
-				.map(|permit| permit.waited)
-				.unwrap_or_default();
-			throttle_wait_total += throttle_wait;
-			if let Ok(mut t) = timings.lock() {
-				t.wait += throttle_wait;
-			}
-			let build_req = || {
-				let req = client.get(current_url.as_str());
-				let req = req.header("User-Agent", config.user_agent.clone());
-				if forward_range {
-					let range = client_headers.get("Range").expect("range header");
-					req.header("Range", range.as_bytes())
-				} else {
-					req
-				}
-			};
-			if was_capacity_evicted {
-				if let Ok(mut t) = timings.lock() {
-					t.cache_result = Some(CacheResult::Evicted);
-				}
-			}
-			let resp = match build_req().send().await {
-				Ok(resp) => {
+	let resp = loop {
+		let mut throttle_permit = if let Some(throttle) = &host_throttle {
+			let result = throttle
+				.acquire(&current_url, throttle_wait_budget(&config, request_started))
+				.await;
+			global_stats.observe_host_throttle(&result);
+			match result {
+				Ok(permit) => Some(permit),
+				Err(rejection) => {
+					throttle_wait_total += rejection.waited;
 					if let Ok(mut t) = timings.lock() {
-						t.ttfb = send_start.elapsed().saturating_sub(throttle_wait_total);
+						t.wait += rejection.waited;
 					}
-					resp
-				}
-				Err(e) if !forward_range && partial_image_response.is_some() => {
-					tracing::warn!(url = %current_url, %e, "full image refetch failed; using original partial response");
-					partial_image_response.take().unwrap()
-				}
-				Err(e) => {
-					if throttle_permit
-						.as_ref()
-						.is_some_and(HostThrottlePermit::is_deadline_fallback)
-					{
-						global_stats.observe_deadline_fallback_terminal(
-							classify_deadline_fallback_send_error(&e),
-						);
-					}
-					drop(throttle_permit.take());
-					let first_err = classify_reqwest_error(&e);
-					let is_connect_phase = e.is_connect() || e.is_timeout();
-					// 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
-					let remaining_ms = config
-						.timeout
-						.saturating_sub(send_start.elapsed().as_millis() as u64);
-					if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms
-					{
-						global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
-						if let Some(metrics) = &global_stats.otlp {
-							metrics.fetch_retry_attempts.add(1, &[]);
+					if !has_range {
+						if let Some(stale) = response_cache.get_stale(&cache_key) {
+							upstream_429_rescue.complete("stale");
+							let resp = build_stale_response(&stale, &config, &timings);
+							if let Ok(t) = timings.lock() {
+								emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+							}
+							return Err(resp);
 						}
-						tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms))
-							.await;
-						if let Some(throttle) = &host_throttle {
-							let result = throttle
-								.acquire(
+					}
+					let recovery = throttle
+						.acquire_for_recovery(
+							&current_url,
+							throttle_wait_budget(&config, request_started),
+							rejection.shadow_decision,
+						)
+						.await;
+					global_stats.observe_host_throttle(&recovery);
+					match recovery {
+						Ok(permit) => Some(permit),
+						Err(final_rejection) => {
+							throttle_wait_total += final_rejection.waited;
+							if let Ok(mut t) = timings.lock() {
+								t.wait += final_rejection.waited;
+							}
+							if !has_range {
+								if let Some(stale) = response_cache.get_stale(&cache_key) {
+									upstream_429_rescue.complete("stale");
+									let resp = build_stale_response(&stale, &config, &timings);
+									if let Ok(t) = timings.lock() {
+										emit_summary(
+											&config,
+											&summary,
+											&t,
+											200,
+											true,
+											None,
+											&global_stats,
+										);
+									}
+									return Err(resp);
+								}
+							}
+							let fallback_context = if upstream_429_rescue.pending {
+								DeadlineFallbackContext::Upstream429Retry
+							} else {
+								DeadlineFallbackContext::Initial
+							};
+							let fallback = throttle
+								.acquire_for_deadline_fallback(
 									&current_url,
-									throttle_wait_budget(&config, request_started),
+									throttle_deadline_fallback_budget(&config, request_started),
+									final_rejection.shadow_decision,
 								)
 								.await;
-							global_stats.observe_host_throttle(&result);
-							throttle_permit = match result {
+							global_stats.observe_deadline_fallback(&fallback, fallback_context);
+							global_stats.observe_host_throttle(&fallback);
+							match fallback {
 								Ok(permit) => Some(permit),
-								Err(rejection) => {
-									throttle_wait_total += rejection.waited;
+								Err(fallback_rejection) => {
+									throttle_wait_total += fallback_rejection.waited;
+									let (fetch_error, summary_error) = match fallback_context {
+										DeadlineFallbackContext::Upstream429Retry => (
+											"throttle:429_retry_wait_timeout",
+											"HostThrottle429RetryWaitTimeout",
+										),
+										_ => (
+											"throttle:initial_wait_timeout",
+											"HostThrottleInitialWaitTimeout",
+										),
+									};
 									if let Ok(mut t) = timings.lock() {
-										t.wait += rejection.waited;
+										t.wait += fallback_rejection.waited;
+										t.fetch_err = Some(fetch_error.to_owned());
 									}
-									if let Some(stale) = response_cache.get_stale(&cache_key) {
-										upstream_429_rescue.complete("stale");
-										let resp = build_stale_response(&stale, &config, &timings);
-										if let Ok(t) = timings.lock() {
-											emit_summary(
-												&config,
-												&summary,
-												&t,
-												200,
-												true,
-												None,
-												&global_stats,
-											);
+									headers.append(
+										"X-Proxy-Error",
+										"HostThrottleTimeout".parse().unwrap(),
+									);
+									headers.append(
+										"Retry-After",
+										response_retry_after(fallback_rejection.retry_after),
+									);
+									if let Ok(t) = timings.lock() {
+										emit_summary(
+											&config,
+											&summary,
+											&t,
+											503,
+											true,
+											Some(summary_error),
+											&global_stats,
+										);
+									}
+									return Err((
+										axum::http::StatusCode::SERVICE_UNAVAILABLE,
+										headers,
+									)
+										.into_response());
+								}
+							}
+						}
+					}
+				}
+			}
+		} else {
+			None
+		};
+		let throttle_wait = throttle_permit
+			.as_ref()
+			.map(|permit| permit.waited)
+			.unwrap_or_default();
+		throttle_wait_total += throttle_wait;
+		if let Ok(mut t) = timings.lock() {
+			t.wait += throttle_wait;
+		}
+		let build_req = || {
+			let req = client.get(current_url.as_str());
+			let req = req.header("User-Agent", config.user_agent.clone());
+			if forward_range {
+				let range = client_headers.get("Range").expect("range header");
+				req.header("Range", range.as_bytes())
+			} else {
+				req
+			}
+		};
+		if was_capacity_evicted {
+			if let Ok(mut t) = timings.lock() {
+				t.cache_result = Some(CacheResult::Evicted);
+			}
+		}
+		let resp = match build_req().send().await {
+			Ok(resp) => {
+				if let Ok(mut t) = timings.lock() {
+					t.ttfb = send_start.elapsed().saturating_sub(throttle_wait_total);
+				}
+				resp
+			}
+			Err(e) if !forward_range && partial_image_response.is_some() => {
+				tracing::warn!(url = %current_url, %e, "full image refetch failed; using original partial response");
+				partial_image_response.take().unwrap()
+			}
+			Err(e) => {
+				if throttle_permit
+					.as_ref()
+					.is_some_and(HostThrottlePermit::is_deadline_fallback)
+				{
+					global_stats.observe_deadline_fallback_terminal(
+						classify_deadline_fallback_send_error(&e),
+					);
+				}
+				drop(throttle_permit.take());
+				let first_err = classify_reqwest_error(&e);
+				let is_connect_phase = e.is_connect() || e.is_timeout();
+				// 接続段階の失敗かつRangeリクエスト以外かつ残り時間がある場合のみ1回リトライ
+				let remaining_ms = config
+					.timeout
+					.saturating_sub(send_start.elapsed().as_millis() as u64);
+				if is_connect_phase && !has_range && remaining_ms > config.fetch_retry_delay_ms {
+					global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+					if let Some(metrics) = &global_stats.otlp {
+						metrics.fetch_retry_attempts.add(1, &[]);
+					}
+					tokio::time::sleep(Duration::from_millis(config.fetch_retry_delay_ms)).await;
+					if let Some(throttle) = &host_throttle {
+						let result = throttle
+							.acquire(&current_url, throttle_wait_budget(&config, request_started))
+							.await;
+						global_stats.observe_host_throttle(&result);
+						throttle_permit = match result {
+							Ok(permit) => Some(permit),
+							Err(rejection) => {
+								throttle_wait_total += rejection.waited;
+								if let Ok(mut t) = timings.lock() {
+									t.wait += rejection.waited;
+								}
+								if let Some(stale) = response_cache.get_stale(&cache_key) {
+									upstream_429_rescue.complete("stale");
+									let resp = build_stale_response(&stale, &config, &timings);
+									if let Ok(t) = timings.lock() {
+										emit_summary(
+											&config,
+											&summary,
+											&t,
+											200,
+											true,
+											None,
+											&global_stats,
+										);
+									}
+									return Err(resp);
+								}
+								let recovery = throttle
+									.acquire_for_recovery(
+										&current_url,
+										throttle_wait_budget(&config, request_started),
+										rejection.shadow_decision,
+									)
+									.await;
+								global_stats.observe_host_throttle(&recovery);
+								match recovery {
+									Ok(permit) => Some(permit),
+									Err(final_rejection) => {
+										throttle_wait_total += final_rejection.waited;
+										if let Ok(mut t) = timings.lock() {
+											t.wait += final_rejection.waited;
+											t.retried = true;
 										}
-										return Err(resp);
-									}
-									serve_source_stale!();
-									let recovery = throttle
-										.acquire_for_recovery(
-											&current_url,
-											throttle_wait_budget(&config, request_started),
-											rejection.shadow_decision,
-										)
-										.await;
-									global_stats.observe_host_throttle(&recovery);
-									match recovery {
-										Ok(permit) => Some(permit),
-										Err(final_rejection) => {
-											throttle_wait_total += final_rejection.waited;
-											if let Ok(mut t) = timings.lock() {
-												t.wait += final_rejection.waited;
-												t.retried = true;
+										if let Some(stale) = response_cache.get_stale(&cache_key) {
+											upstream_429_rescue.complete("stale");
+											let resp =
+												build_stale_response(&stale, &config, &timings);
+											if let Ok(t) = timings.lock() {
+												emit_summary(
+													&config,
+													&summary,
+													&t,
+													200,
+													true,
+													None,
+													&global_stats,
+												);
 											}
-											if let Some(stale) =
-												response_cache.get_stale(&cache_key)
-											{
-												upstream_429_rescue.complete("stale");
-												let resp =
-													build_stale_response(&stale, &config, &timings);
+											return Err(resp);
+										}
+										let fallback = throttle
+											.acquire_for_deadline_fallback(
+												&current_url,
+												throttle_deadline_fallback_budget(
+													&config,
+													request_started,
+												),
+												final_rejection.shadow_decision,
+											)
+											.await;
+										global_stats.observe_deadline_fallback(
+											&fallback,
+											DeadlineFallbackContext::ConnectRetry,
+										);
+										global_stats.observe_host_throttle(&fallback);
+										match fallback {
+											Ok(permit) => Some(permit),
+											Err(fallback_rejection) => {
+												throttle_wait_total += fallback_rejection.waited;
+												if let Ok(mut t) = timings.lock() {
+													t.wait += fallback_rejection.waited;
+													t.fetch_err = Some(
+														"throttle:connect_retry_wait_timeout"
+															.to_owned(),
+													);
+													t.retried = true;
+												}
+												headers.append(
+													"X-Proxy-Error",
+													"HostThrottleTimeout".parse().unwrap(),
+												);
+												headers.append(
+													"Retry-After",
+													response_retry_after(
+														fallback_rejection.retry_after,
+													),
+												);
 												if let Ok(t) = timings.lock() {
 													emit_summary(
-														&config,
-														&summary,
-														&t,
-														200,
-														true,
-														None,
-														&global_stats,
-													);
-												}
-												return Err(resp);
-											}
-											serve_source_stale!();
-											let fallback = throttle
-												.acquire_for_deadline_fallback(
-													&current_url,
-													throttle_deadline_fallback_budget(
-														&config,
-														request_started,
-													),
-													final_rejection.shadow_decision,
-												)
-												.await;
-											global_stats.observe_deadline_fallback(
-												&fallback,
-												DeadlineFallbackContext::ConnectRetry,
-											);
-											global_stats.observe_host_throttle(&fallback);
-											match fallback {
-												Ok(permit) => Some(permit),
-												Err(fallback_rejection) => {
-													throttle_wait_total +=
-														fallback_rejection.waited;
-													if let Ok(mut t) = timings.lock() {
-														t.wait += fallback_rejection.waited;
-														t.fetch_err = Some(
-															"throttle:connect_retry_wait_timeout"
-																.to_owned(),
-														);
-														t.retried = true;
-													}
-													serve_source_stale!();
-													headers.append(
-														"X-Proxy-Error",
-														"HostThrottleTimeout".parse().unwrap(),
-													);
-													headers.append(
-														"Retry-After",
-														response_retry_after(
-															fallback_rejection.retry_after,
-														),
-													);
-													if let Ok(t) = timings.lock() {
-														emit_summary(
 														&config,
 														&summary,
 														&t,
@@ -5102,372 +4858,337 @@ async fn get_file_inner(
 														Some("HostThrottleConnectRetryWaitTimeout"),
 														&global_stats,
 													);
-													}
-													return Err((
-														axum::http::StatusCode::SERVICE_UNAVAILABLE,
-														headers,
-													)
-														.into_response());
 												}
+												return Err((
+													axum::http::StatusCode::SERVICE_UNAVAILABLE,
+													headers,
+												)
+													.into_response());
 											}
 										}
 									}
 								}
-							};
-						}
-						let retry_throttle_wait = throttle_permit
-							.as_ref()
-							.map(|permit| permit.waited)
-							.unwrap_or_default();
-						throttle_wait_total += retry_throttle_wait;
-						if let Ok(mut t) = timings.lock() {
-							t.wait += retry_throttle_wait;
-						}
-						match build_req().send().await {
-							Ok(resp) => {
-								if let Ok(mut t) = timings.lock() {
-									t.ttfb =
-										send_start.elapsed().saturating_sub(throttle_wait_total);
-									t.retried = true;
-									t.fetch_retry_succeeded = true;
-								}
-								resp
 							}
-							Err(e2) => {
-								if throttle_permit
-									.as_ref()
-									.is_some_and(HostThrottlePermit::is_deadline_fallback)
-								{
-									global_stats.observe_deadline_fallback_terminal(
-										classify_deadline_fallback_send_error(&e2),
-									);
-								}
-								let fetch_err = classify_reqwest_error(&e2);
-								let is_fallback = q.fallback.is_some();
-								if let Ok(mut t) = timings.lock() {
-									t.ttfb = send_start.elapsed();
-									t.fetch_err = Some(fetch_err.clone());
-									t.retried = true;
-								}
-								headers.append("X-Proxy-Error", "FetchFailed".parse().unwrap());
-								// stale-if-error
-								if !has_range {
-									if let Some(stale) = response_cache.get_stale(&cache_key) {
-										let resp = build_stale_response(&stale, &config, &timings);
-										if let Ok(t) = timings.lock() {
-											emit_summary(
-												&config,
-												&summary,
-												&t,
-												200,
-												true,
-												None,
-												&global_stats,
-											);
-										}
-										return Err(resp);
-									}
-								}
-								serve_source_stale!();
-								if let Ok(t) = timings.lock() {
-									emit_summary(
-										&config,
-										&summary,
-										&t,
-										if is_fallback { 200 } else { 400 },
-										true,
-										Some(&fetch_err),
-										&global_stats,
-									);
-								}
-								if is_fallback {
-									headers.append("Cache-Control", "no-store".parse().unwrap());
-									headers.append("Content-Type", "image/png".parse().unwrap());
-									return Err((
-										axum::http::StatusCode::OK,
-										headers,
-										(*dummy_img).clone(),
-									)
-										.into_response());
-								}
-								headers.append("Cache-Control", "no-store".parse().unwrap());
-								return Err(
-									(axum::http::StatusCode::BAD_REQUEST, headers).into_response()
+						};
+					}
+					let retry_throttle_wait = throttle_permit
+						.as_ref()
+						.map(|permit| permit.waited)
+						.unwrap_or_default();
+					throttle_wait_total += retry_throttle_wait;
+					if let Ok(mut t) = timings.lock() {
+						t.wait += retry_throttle_wait;
+					}
+					match build_req().send().await {
+						Ok(resp) => {
+							if let Ok(mut t) = timings.lock() {
+								t.ttfb = send_start.elapsed().saturating_sub(throttle_wait_total);
+								t.retried = true;
+								t.fetch_retry_succeeded = true;
+							}
+							resp
+						}
+						Err(e2) => {
+							if throttle_permit
+								.as_ref()
+								.is_some_and(HostThrottlePermit::is_deadline_fallback)
+							{
+								global_stats.observe_deadline_fallback_terminal(
+									classify_deadline_fallback_send_error(&e2),
 								);
 							}
-						}
-					} else {
-						// リトライ不可(接続段階以外 or 残り時間不足 or Rangeリクエスト)
-						let is_fallback = q.fallback.is_some();
-						if let Ok(mut t) = timings.lock() {
-							t.ttfb = send_start.elapsed();
-							t.fetch_err = Some(first_err.clone());
-						}
-						headers.append("X-Proxy-Error", "FetchFailed".parse().unwrap());
-						// stale-if-error
-						if !has_range {
-							if let Some(stale) = response_cache.get_stale(&cache_key) {
-								let resp = build_stale_response(&stale, &config, &timings);
-								if let Ok(t) = timings.lock() {
-									emit_summary(
-										&config,
-										&summary,
-										&t,
-										200,
-										true,
-										None,
-										&global_stats,
-									);
-								}
-								return Err(resp);
+							let fetch_err = classify_reqwest_error(&e2);
+							let is_fallback = q.fallback.is_some();
+							if let Ok(mut t) = timings.lock() {
+								t.ttfb = send_start.elapsed();
+								t.fetch_err = Some(fetch_err.clone());
+								t.retried = true;
 							}
-						}
-						serve_source_stale!();
-						if let Ok(t) = timings.lock() {
-							emit_summary(
-								&config,
-								&summary,
-								&t,
-								if is_fallback { 200 } else { 400 },
-								true,
-								Some(&first_err),
-								&global_stats,
+							headers.append("X-Proxy-Error", "FetchFailed".parse().unwrap());
+							// stale-if-error
+							if !has_range {
+								if let Some(stale) = response_cache.get_stale(&cache_key) {
+									let resp = build_stale_response(&stale, &config, &timings);
+									if let Ok(t) = timings.lock() {
+										emit_summary(
+											&config,
+											&summary,
+											&t,
+											200,
+											true,
+											None,
+											&global_stats,
+										);
+									}
+									return Err(resp);
+								}
+							}
+							if let Ok(t) = timings.lock() {
+								emit_summary(
+									&config,
+									&summary,
+									&t,
+									if is_fallback { 200 } else { 400 },
+									true,
+									Some(&fetch_err),
+									&global_stats,
+								);
+							}
+							if is_fallback {
+								headers.append("Cache-Control", "no-store".parse().unwrap());
+								headers.append("Content-Type", "image/png".parse().unwrap());
+								return Err((
+									axum::http::StatusCode::OK,
+									headers,
+									(*dummy_img).clone(),
+								)
+									.into_response());
+							}
+							headers.append("Cache-Control", "no-store".parse().unwrap());
+							return Err(
+								(axum::http::StatusCode::BAD_REQUEST, headers).into_response()
 							);
 						}
-						if is_fallback {
-							headers.append("Cache-Control", "no-store".parse().unwrap());
-							headers.append("Content-Type", "image/png".parse().unwrap());
-							return Err((
-								axum::http::StatusCode::OK,
-								headers,
-								(*dummy_img).clone(),
-							)
-								.into_response());
-						}
-						headers.append("Cache-Control", "no-store".parse().unwrap());
-						return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 					}
-				}
-			};
-			if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && host_throttle.is_none() {
-				log_upstream_429(&current_url, resp.headers());
-			}
-			if let Some(throttle) = &host_throttle {
-				let was_throttled = throttle_permit
-					.as_ref()
-					.is_some_and(|permit| permit.throttled);
-				let shadow_decision = throttle_permit
-					.as_ref()
-					.and_then(|permit| permit.shadow_decision);
-				throttle
-					.observe_response_with_shadow(
-						&current_url,
-						resp.status(),
-						resp.headers(),
-						was_throttled,
-						shadow_decision,
-					)
-					.await;
-			}
-			let used_deadline_fallback = throttle_permit
-				.as_ref()
-				.is_some_and(HostThrottlePermit::is_deadline_fallback);
-			if used_deadline_fallback && !resp.status().is_success() {
-				let result = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-					"response_429"
 				} else {
-					"response_other"
-				};
-				global_stats.observe_deadline_fallback_terminal(result);
-			}
-			drop(throttle_permit.take());
-			if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
-				&& !forward_range
-				&& upstream_429_retries == 0
-			{
-				upstream_429_rescue.start();
-				if let Some(stale) = response_cache.get_stale(&cache_key) {
-					upstream_429_rescue.complete("stale");
-					let stale_response = build_stale_response(&stale, &config, &timings);
+					// リトライ不可(接続段階以外 or 残り時間不足 or Rangeリクエスト)
+					let is_fallback = q.fallback.is_some();
+					if let Ok(mut t) = timings.lock() {
+						t.ttfb = send_start.elapsed();
+						t.fetch_err = Some(first_err.clone());
+					}
+					headers.append("X-Proxy-Error", "FetchFailed".parse().unwrap());
+					// stale-if-error
+					if !has_range {
+						if let Some(stale) = response_cache.get_stale(&cache_key) {
+							let resp = build_stale_response(&stale, &config, &timings);
+							if let Ok(t) = timings.lock() {
+								emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+							}
+							return Err(resp);
+						}
+					}
 					if let Ok(t) = timings.lock() {
-						emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+						emit_summary(
+							&config,
+							&summary,
+							&t,
+							if is_fallback { 200 } else { 400 },
+							true,
+							Some(&first_err),
+							&global_stats,
+						);
 					}
-					return Err(stale_response);
-				}
-				serve_source_stale!();
-				upstream_429_retries = 1;
-				global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
-				if let Some(metrics) = &global_stats.otlp {
-					metrics.fetch_retry_attempts.add(1, &[]);
-				}
-				if let Ok(mut t) = timings.lock() {
-					t.retried = true;
-				}
-				if host_throttle.is_none() {
-					let retry_after = parse_retry_after(resp.headers())
-						.unwrap_or(HOST_THROTTLE_FALLBACK_COOLDOWN);
-					if retry_after > throttle_wait_budget(&config, request_started) {
-						break resp;
+					if is_fallback {
+						headers.append("Cache-Control", "no-store".parse().unwrap());
+						headers.append("Content-Type", "image/png".parse().unwrap());
+						return Err((axum::http::StatusCode::OK, headers, (*dummy_img).clone())
+							.into_response());
 					}
-					tokio::time::sleep(retry_after).await;
-				}
-				drop(resp);
-				continue;
-			}
-			if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-				serve_source_stale!();
-			}
-			if resp.status().is_server_error()
-				|| resp.status() == reqwest::StatusCode::REQUEST_TIMEOUT
-			{
-				if let Some(stale) = response_cache.get_stale(&cache_key) {
-					let stale_response = build_stale_response(&stale, &config, &timings);
-					if let Ok(t) = timings.lock() {
-						emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
-					}
-					return Err(stale_response);
-				}
-				serve_source_stale!();
-			}
-			if upstream_429_retries > 0 && resp.status().is_success() {
-				upstream_429_retry_succeeded = true;
-				if let Ok(mut t) = timings.lock() {
-					t.fetch_retry_succeeded = true;
+					headers.append("Cache-Control", "no-store".parse().unwrap());
+					return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
 				}
 			}
-			let is_image_response = resp
-				.headers()
-				.get(reqwest::header::CONTENT_TYPE)
-				.and_then(|value| value.to_str().ok())
-				.and_then(|value| value.split(';').next())
-				.is_some_and(|media_type| {
-					media_type.trim().to_ascii_lowercase().starts_with("image/")
-				});
-			if forward_range
-				&& resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-				&& is_image_response
-			{
-				if used_deadline_fallback {
-					global_stats.observe_deadline_fallback_terminal("response_2xx");
+		};
+		if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS && host_throttle.is_none() {
+			log_upstream_429(&current_url, resp.headers());
+		}
+		if let Some(throttle) = &host_throttle {
+			let was_throttled = throttle_permit
+				.as_ref()
+				.is_some_and(|permit| permit.throttled);
+			let shadow_decision = throttle_permit
+				.as_ref()
+				.and_then(|permit| permit.shadow_decision);
+			throttle
+				.observe_response_with_shadow(
+					&current_url,
+					resp.status(),
+					resp.headers(),
+					was_throttled,
+					shadow_decision,
+				)
+				.await;
+		}
+		let used_deadline_fallback = throttle_permit
+			.as_ref()
+			.is_some_and(HostThrottlePermit::is_deadline_fallback);
+		if used_deadline_fallback && !resp.status().is_success() {
+			let result = if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+				"response_429"
+			} else {
+				"response_other"
+			};
+			global_stats.observe_deadline_fallback_terminal(result);
+		}
+		drop(throttle_permit.take());
+		if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+			&& !forward_range
+			&& upstream_429_retries == 0
+		{
+			upstream_429_rescue.start();
+			if let Some(stale) = response_cache.get_stale(&cache_key) {
+				upstream_429_rescue.complete("stale");
+				let stale_response = build_stale_response(&stale, &config, &timings);
+				if let Ok(t) = timings.lock() {
+					emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
 				}
-				forward_range = false;
-				partial_image_response = Some(resp);
-				continue;
+				return Err(stale_response);
 			}
-			if !resp.status().is_redirection() {
-				deadline_fallback_response_pending =
-					used_deadline_fallback && resp.status().is_success();
-				break resp;
+			upstream_429_retries = 1;
+			global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
+			if let Some(metrics) = &global_stats.otlp {
+				metrics.fetch_retry_attempts.add(1, &[]);
 			}
-			if redirects >= MAX_REDIRECTS {
-				headers.append("X-Proxy-Error", "TooManyRedirects".parse().unwrap());
+			if let Ok(mut t) = timings.lock() {
+				t.retried = true;
+			}
+			if host_throttle.is_none() {
+				let retry_after =
+					parse_retry_after(resp.headers()).unwrap_or(HOST_THROTTLE_FALLBACK_COOLDOWN);
+				if retry_after > throttle_wait_budget(&config, request_started) {
+					break resp;
+				}
+				tokio::time::sleep(retry_after).await;
+			}
+			drop(resp);
+			continue;
+		}
+		if upstream_429_retries > 0 && resp.status().is_success() {
+			upstream_429_retry_succeeded = true;
+			if let Ok(mut t) = timings.lock() {
+				t.fetch_retry_succeeded = true;
+			}
+		}
+		let is_image_response = resp
+			.headers()
+			.get(reqwest::header::CONTENT_TYPE)
+			.and_then(|value| value.to_str().ok())
+			.and_then(|value| value.split(';').next())
+			.is_some_and(|media_type| media_type.trim().to_ascii_lowercase().starts_with("image/"));
+		if forward_range
+			&& resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
+			&& is_image_response
+		{
+			if used_deadline_fallback {
+				global_stats.observe_deadline_fallback_terminal("response_2xx");
+			}
+			forward_range = false;
+			partial_image_response = Some(resp);
+			continue;
+		}
+		if !resp.status().is_redirection() {
+			deadline_fallback_response_pending =
+				used_deadline_fallback && resp.status().is_success();
+			break resp;
+		}
+		if redirects >= MAX_REDIRECTS {
+			headers.append("X-Proxy-Error", "TooManyRedirects".parse().unwrap());
+			if let Ok(t) = timings.lock() {
+				emit_summary(
+					&config,
+					&summary,
+					&t,
+					502,
+					true,
+					Some("TooManyRedirects"),
+					&global_stats,
+				);
+			}
+			return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
+		}
+		let Some(location) = resp
+			.headers()
+			.get(axum::http::header::LOCATION)
+			.and_then(|value| value.to_str().ok())
+		else {
+			break resp;
+		};
+		let next_url = match current_url.join(location) {
+			Ok(url) => url,
+			Err(error) => {
+				tracing::warn!(location, %error, "invalid redirect URL");
 				if let Ok(t) = timings.lock() {
 					emit_summary(
 						&config,
 						&summary,
 						&t,
-						502,
+						if q.fallback.is_some() { 200 } else { 400 },
 						true,
-						Some("TooManyRedirects"),
+						Some("InvalidRedirect"),
 						&global_stats,
 					);
 				}
-				return Err((axum::http::StatusCode::BAD_GATEWAY, headers).into_response());
-			}
-			let Some(location) = resp
-				.headers()
-				.get(axum::http::header::LOCATION)
-				.and_then(|value| value.to_str().ok())
-			else {
-				break resp;
-			};
-			let next_url = match current_url.join(location) {
-				Ok(url) => url,
-				Err(error) => {
-					tracing::warn!(location, %error, "invalid redirect URL");
-					if let Ok(t) = timings.lock() {
-						emit_summary(
-							&config,
-							&summary,
-							&t,
-							if q.fallback.is_some() { 200 } else { 400 },
-							true,
-							Some("InvalidRedirect"),
-							&global_stats,
-						);
-					}
-					headers.append("X-Proxy-Error", "InvalidRedirect".parse().unwrap());
-					headers.append("Cache-Control", "no-store".parse().unwrap());
-					if q.fallback.is_some() {
-						headers.append("Content-Type", "image/png".parse().unwrap());
-						return Err((axum::http::StatusCode::OK, headers, (*dummy_img).clone())
-							.into_response());
-					}
-					return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
-				}
-			};
-			summary.final_target_domain = domain_from_url(next_url.as_str(), "invalid");
-			const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
-			let mut stream = resp.bytes_stream();
-			let mut drained = 0;
-			while let Some(Ok(chunk)) = stream.next().await {
-				drained += chunk.len();
-				if drained >= MAX_REDIRECT_DRAIN {
-					break;
-				}
-			}
-			drop(stream);
-			let check_start = Instant::now();
-			match check_url(&network_policy, &dns_cache, next_url.as_str()).await {
-				Ok((_hit, v4_count, v6_count)) => {
-					if let Ok(mut t) = timings.lock() {
-						t.check += check_start.elapsed();
-						t.dns_v4 = t.dns_v4.saturating_add(v4_count);
-						t.dns_v6 = t.dns_v6.saturating_add(v6_count);
-					}
-				}
-				Err(error) => {
-					if let Ok(mut t) = timings.lock() {
-						t.check += check_start.elapsed();
-						if error.is_resolve_failed() {
-							t.fetch_err = Some(format!(
-								"dns:{}",
-								error.detail().chars().take(60).collect::<String>()
-							));
-						}
-					}
-					headers.append(
-						"X-Proxy-Error",
-						reqwest::header::HeaderValue::from_static(error.as_header()),
+				headers.append("X-Proxy-Error", "InvalidRedirect".parse().unwrap());
+				headers.append("Cache-Control", "no-store".parse().unwrap());
+				if q.fallback.is_some() {
+					headers.append("Content-Type", "image/png".parse().unwrap());
+					return Err(
+						(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
 					);
-					if let Ok(t) = timings.lock() {
-						emit_summary(
-							&config,
-							&summary,
-							&t,
-							if q.fallback.is_some() { 200 } else { 400 },
-							true,
-							Some(error.detail()),
-							&global_stats,
-						);
-					}
-					headers.append("Cache-Control", "no-store".parse().unwrap());
-					if q.fallback.is_some() {
-						headers.append("Content-Type", "image/png".parse().unwrap());
-						return Err((axum::http::StatusCode::OK, headers, (*dummy_img).clone())
-							.into_response());
-					}
-					return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+				}
+				return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+			}
+		};
+		summary.final_target_domain = domain_from_url(next_url.as_str(), "invalid");
+		const MAX_REDIRECT_DRAIN: usize = 64 * 1024;
+		let mut stream = resp.bytes_stream();
+		let mut drained = 0;
+		while let Some(Ok(chunk)) = stream.next().await {
+			drained += chunk.len();
+			if drained >= MAX_REDIRECT_DRAIN {
+				break;
+			}
+		}
+		drop(stream);
+		let check_start = Instant::now();
+		match check_url(&network_policy, &dns_cache, next_url.as_str()).await {
+			Ok((_hit, v4_count, v6_count)) => {
+				if let Ok(mut t) = timings.lock() {
+					t.check += check_start.elapsed();
+					t.dns_v4 = t.dns_v4.saturating_add(v4_count);
+					t.dns_v6 = t.dns_v6.saturating_add(v6_count);
 				}
 			}
-			current_url = next_url;
-			redirects += 1;
+			Err(error) => {
+				if let Ok(mut t) = timings.lock() {
+					t.check += check_start.elapsed();
+					if error.is_resolve_failed() {
+						t.fetch_err = Some(format!(
+							"dns:{}",
+							error.detail().chars().take(60).collect::<String>()
+						));
+					}
+				}
+				headers.append(
+					"X-Proxy-Error",
+					reqwest::header::HeaderValue::from_static(error.as_header()),
+				);
+				if let Ok(t) = timings.lock() {
+					emit_summary(
+						&config,
+						&summary,
+						&t,
+						if q.fallback.is_some() { 200 } else { 400 },
+						true,
+						Some(error.detail()),
+						&global_stats,
+					);
+				}
+				headers.append("Cache-Control", "no-store".parse().unwrap());
+				if q.fallback.is_some() {
+					headers.append("Content-Type", "image/png".parse().unwrap());
+					return Err(
+						(axum::http::StatusCode::OK, headers, (*dummy_img).clone()).into_response()
+					);
+				}
+				return Err((axum::http::StatusCode::BAD_REQUEST, headers).into_response());
+			}
 		}
+		current_url = next_url;
+		redirects += 1;
 	};
 	drop(partial_image_response);
-	if source_cache_stale {
-		headers.append("X-Proxy-Source-Stale", "1".parse().unwrap());
-	}
 	fn add_remote_header(
 		key: &'static str,
 		headers: &mut HeaderMap,
@@ -5488,7 +5209,7 @@ async fn get_file_inner(
 		}
 	}
 	// HTTPバージョンを記録
-	if !source_cache_hit {
+	{
 		let ver = match resp.version() {
 			reqwest::Version::HTTP_2 => {
 				global_stats.http2_responses.fetch_add(1, Ordering::Relaxed);
@@ -5510,12 +5231,10 @@ async fn get_file_inner(
 	}
 	let remote_headers = resp.headers();
 	if let Ok(mut t) = timings.lock() {
-		if !source_cache_hit {
-			t.upstream_status = Some(resp.status().as_u16());
-		}
+		t.upstream_status = Some(resp.status().as_u16());
 	}
-	if !has_range && !source_cache_hit {
-		negative_cache.put(negative_key.clone(), resp.status().as_u16());
+	if !has_range {
+		negative_cache.put(negative_key, resp.status().as_u16());
 	}
 	add_remote_header("Content-Disposition", &mut headers, remote_headers);
 	add_remote_header("Content-Type", &mut headers, remote_headers);
@@ -5555,16 +5274,13 @@ async fn get_file_inner(
 		fontdb,
 		encode_semaphore,
 		buffer_budget,
-		dl_permit,
+		dl_permit: Some(dl_permit),
 		timings: timings.clone(),
 		response_cache: response_cache.clone(),
 		cache_key: cache_key.clone(),
 		is_static_path: summary.is_static_path,
 		global_stats: global_stats.clone(),
 		deadline_fallback_response_pending,
-		source_cache,
-		source_key: negative_key,
-		source_flight_guard,
 	}
 	.encode(resp, is_img)
 	.await;
@@ -5650,9 +5366,6 @@ struct RequestContext {
 	is_static_path: bool,
 	global_stats: Arc<GlobalStats>,
 	deadline_fallback_response_pending: bool,
-	source_cache: Arc<SourceCache>,
-	source_key: String,
-	source_flight_guard: Option<SourceFlightGuard>,
 }
 impl RequestContext {
 	/// フェーズ計測ガードを生成する(Arcを複製して保持するため self を借用し続けない)。
@@ -5704,32 +5417,6 @@ impl RequestContext {
 		if self.response_cache.put(self.cache_key.clone(), entry) && self.is_static_path {
 			self.global_stats.record_static_insertion(body.len());
 		}
-	}
-	fn load_stale_source(&mut self) -> bool {
-		let Some(source) = self.source_cache.get_stale(&self.source_key) else {
-			return false;
-		};
-		self.headers.remove("Content-Type");
-		self.headers.remove("Content-Disposition");
-		if let Some(content_type) = &source.content_type {
-			if let Ok(value) = content_type.parse() {
-				self.headers.append("Content-Type", value);
-			}
-		}
-		if let Some(content_disposition) = &source.content_disposition {
-			if let Ok(value) = content_disposition.parse() {
-				self.headers.append("Content-Disposition", value);
-			}
-		}
-		self.headers
-			.append("X-Proxy-Source-Stale", "1".parse().unwrap());
-		self.src_bytes = source.body.to_vec();
-		self.codec = image::guess_format(&self.src_bytes).map_err(Some);
-		if let Some(mut guard) = self.source_flight_guard.take() {
-			self.source_cache.complete_flight(&mut guard, Some(source));
-		}
-		self.global_stats.observe_source_cache("stale");
-		true
 	}
 }
 impl RequestContext {
@@ -6264,11 +5951,6 @@ impl RequestContext {
 					}
 					self.headers
 						.append("X-Proxy-Error", "BodyReadFailed".parse().unwrap());
-					if self.load_stale_source() {
-						self.headers.remove("X-Proxy-Error");
-						self.mark_body_done(body_start.elapsed());
-						return Ok(());
-					}
 					return Err(
 						(axum::http::StatusCode::BAD_GATEWAY, self.headers.clone()).into_response()
 					);
@@ -6276,24 +5958,6 @@ impl RequestContext {
 			}
 		}
 		self.src_bytes = response_bytes;
-		if let Some(mut guard) = self.source_flight_guard.take() {
-			let content_type = self
-				.headers
-				.get("Content-Type")
-				.and_then(|value| value.to_str().ok())
-				.map(str::to_owned);
-			let content_disposition = self
-				.headers
-				.get("Content-Disposition")
-				.and_then(|value| value.to_str().ok())
-				.map(str::to_owned);
-			let entry = SourceEntry::new(
-				content_type,
-				content_disposition,
-				axum::body::Bytes::copy_from_slice(&self.src_bytes),
-			);
-			self.source_cache.complete_flight(&mut guard, Some(entry));
-		}
 		self.complete_deadline_fallback_terminal("response_2xx");
 		self.mark_body_done(body_start.elapsed());
 		Ok(())
@@ -6529,9 +6193,6 @@ mod metrics_tests {
 				cache_bytes: 1024,
 				cache_capacity_bytes: 4096,
 				singleflight_active: 1,
-				source_cache_entries: 2,
-				source_cache_bytes: 512,
-				source_cache_capacity_bytes: 2048,
 				downloads_active: 2,
 				downloads_limit: 4,
 				cpu_active: 1,
@@ -7797,10 +7458,6 @@ mod network_policy_tests {
 			cache_max_bytes: default_cache_max_bytes(),
 			cache_entry_max_bytes: default_cache_entry_max_bytes(),
 			cache_ttl_secs: default_cache_ttl_secs(),
-			source_cache_max_bytes: default_source_cache_max_bytes(),
-			source_cache_entry_max_bytes: default_source_cache_entry_max_bytes(),
-			source_cache_ttl_secs: default_source_cache_ttl_secs(),
-			source_cache_stale_max_secs: default_source_cache_stale_max_secs(),
 			negative_cache_404_ttl_secs: default_negative_cache_404_ttl_secs(),
 			negative_cache_410_ttl_secs: default_negative_cache_410_ttl_secs(),
 			negative_cache_max_entries: default_negative_cache_max_entries(),

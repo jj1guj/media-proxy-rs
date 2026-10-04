@@ -571,27 +571,6 @@
                   },
                   "refId": "D"
                 }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "sum(rate(media_proxy_source_cache_requests_total{result=\"stale\"}[1m]))",
-                      "legendFormat": "Source stale rescues",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "E"
-                }
               }
             ],
             "queryOptions": {},
@@ -1705,27 +1684,6 @@
                   },
                   "refId": "A"
                 }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "100 * sum(rate(media_proxy_source_cache_requests_total{result=~\"hit|joined\"}[1m])) / clamp_min(sum(rate(media_proxy_source_cache_requests_total{result=~\"hit|joined|miss\"}[1m])), 0.001)",
-                      "legendFormat": "Source hit rate",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "B"
-                }
               }
             ],
             "queryOptions": {},
@@ -2326,48 +2284,6 @@
                     "version": "v0"
                   },
                   "refId": "B"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "max(media_proxy_source_cache_bytes)",
-                      "legendFormat": "Source used",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "C"
-                }
-              },
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "max(media_proxy_source_cache_capacity_bytes)",
-                      "legendFormat": "Source capacity",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "D"
                 }
               }
             ],

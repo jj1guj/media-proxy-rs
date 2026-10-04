@@ -128,10 +128,6 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `cache_max_bytes`              | u64       | `134217728` (128MB) | キャッシュ合計バイト数上限                                                   |
 | `cache_entry_max_bytes`        | u64       | `5242880` (5MB)     | 1エントリの最大バイト数                                                      |
 | `cache_ttl_secs`               | u64       | `3600`              | キャッシュTTL(秒)                                                            |
-| `source_cache_max_bytes`       | u64       | `134217728` (128MB) | 元画像キャッシュの合計バイト数上限                                           |
-| `source_cache_entry_max_bytes` | u64       | `5242880` (5MB)     | 元画像キャッシュの1エントリ最大バイト数                                      |
-| `source_cache_ttl_secs`        | u64       | `3600`              | 元画像キャッシュTTL(秒)                                                      |
-| `source_cache_stale_max_secs`  | u64       | `86400`             | TTL切れ元画像を障害時用に保持する追加秒数。`0`で無効                         |
 | `negative_cache_404_ttl_secs`  | u64       | `3600`              | 上流404のネガティブキャッシュTTL(秒)。`0`で無効                              |
 | `negative_cache_410_ttl_secs`  | u64       | `86400`             | 上流410のネガティブキャッシュTTL(秒)。`0`で無効                              |
 | `negative_cache_max_entries`   | usize     | `16384`             | 404/410ネガティブキャッシュの最大URL数                                       |
@@ -156,9 +152,9 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 
 `host_throttle`を設定した場合、通常時の送信は制限せず、429を返したホストだけサーキットブレーカーの対象にします。`requests_per_second`と`burst`は回復中の送信レートとバースト上限です。`max_wait_ms`はFIFOキューで待機できる通常の上限で、5秒・10秒のクールダウンをジッター込みで待てる`15000`を推奨します。`max_hosts`は保持するホスト状態数、`queue_capacity`はホストごとの最大待機数です。`queue_capacity`を省略した場合は64です。新しいクールダウンを開始する429ごとにレートを半減（下限0.25件/秒）しますが、同じクールダウン中に到着した並行429は重複カウントしません。有効な`Retry-After`があればその期間は送信を停止し、0秒または期限切れの場合は5〜60秒の指数バックオフとジッターを使用します。クールダウン開始ログには上流の`Retry-After`、`RateLimit`、`X-RateLimit`、CDN識別ヘッダーも記録します。クールダウン終了後は送信を直列化し、3件連続で成功すると通常状態へ復帰します。
 
-上流が429を返した場合、Rangeリクエストを除いて、最初に期限切れレスポンスキャッシュを確認し、次に期限切れ元画像キャッシュを確認します。元画像staleを使う場合は要求された形式へ再変換し、レスポンスへ`X-Proxy-Source-Stale: 1`を付与します。どちらも利用できなければクールダウンを待って1回だけ再試行します。`host_throttle`が無効な場合も`Retry-After`または既定のクールダウンを待機します。通常のキュー待機上限、接続失敗、本文読取失敗でも同じ順序でstaleを優先します。利用できなければリクエスト全体の残り期限まで待機を継続し、その待機にも入れない場合は、上流接続用の時間を残した範囲で、通常キューとは独立したホスト別1並列の最終送信枠を試します。最終送信枠も上流クールダウンを迂回しません。開始レートは設定上限とリアクティブレートの低い方に制限し、Shadowに有効サンプルが1,000件以上あり429エピソードを1回以上観測済みの場合は、さらにShadow安全レート以下へ制限します。
+上流が429を返した場合、Rangeリクエストを除いて、最初に期限切れレスポンスキャッシュを確認し、利用できなければクールダウンを待って1回だけ再試行します。`host_throttle`が無効な場合も`Retry-After`または既定のクールダウンを待機します。通常のキュー待機上限に達した場合もstaleを優先し、利用できなければリクエスト全体の残り期限まで待機を継続します。その待機にも入れない場合は、上流接続用の時間を残した範囲で、通常キューとは独立したホスト別1並列の最終送信枠を試します。最終送信枠も上流クールダウンを迂回しません。開始レートは設定上限とリアクティブレートの低い方に制限し、Shadowに有効サンプルが1,000件以上あり429エピソードを1回以上観測済みの場合は、さらにShadow安全レート以下へ制限します。
 
-60秒ごとの`periodic_stats`ログでは`upstream_429_rescue_attempts`、`upstream_429_retry_saved`、`upstream_429_stale_saved`、`upstream_429_unrescued`で429救済結果を確認できます。元画像staleの提供件数は`source_cache_stale_served`で確認できます。最終送信枠は`throttle_deadline_fallback_attempts`、`throttle_deadline_fallback_acquired`、`throttle_initial_wait_timeouts`、`throttle_429_retry_wait_timeouts`、`throttle_connect_retry_wait_timeouts`で、取得成功と待機段階別の失敗を確認できます。取得後の上流結果は`throttle_deadline_fallback_response_2xx`、`throttle_deadline_fallback_response_429`、`throttle_deadline_fallback_response_other`、`throttle_deadline_fallback_connect_timeout`、`throttle_deadline_fallback_body_error`、`throttle_deadline_fallback_request_deadline_exceeded`で確認できます。
+60秒ごとの`periodic_stats`ログでは`upstream_429_rescue_attempts`、`upstream_429_retry_saved`、`upstream_429_stale_saved`、`upstream_429_unrescued`で429救済結果を確認できます。最終送信枠は`throttle_deadline_fallback_attempts`、`throttle_deadline_fallback_acquired`、`throttle_initial_wait_timeouts`、`throttle_429_retry_wait_timeouts`、`throttle_connect_retry_wait_timeouts`で、取得成功と待機段階別の失敗を確認できます。取得後の上流結果は`throttle_deadline_fallback_response_2xx`、`throttle_deadline_fallback_response_429`、`throttle_deadline_fallback_response_other`、`throttle_deadline_fallback_connect_timeout`、`throttle_deadline_fallback_body_error`、`throttle_deadline_fallback_request_deadline_exceeded`で確認できます。
 
 `observation_hosts`にホスト名を指定すると、`observation_interval_ms`（既定10000ms）ごとに`host_throttle_window`ログを出力します。ログにはホスト別の上流送信数、2xx・429・その他応答数、制御下通過数、拒否数、合計待機時間、現在・最大キュー深度、現在レート、トークン数、クールダウン残時間、回復状態が含まれます。通信・応答・待機・拒否がなくキューも空の観測窓は出力しません。空配列の場合は出力しません。
 
@@ -207,7 +203,7 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_decode_duration`              | Histogram     | decode時間                                     |
 | `media_proxy_encode_duration`              | Histogram     | encode時間                                     |
 
-キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative`、`evicted` の7種類です。`evicted`は過去24時間以内に容量不足で追い出されたキーが再び要求され、上流取得へ進んだことを示します。60秒ごとのINFO統計ログでは`cache_capacity_evictions`が追い出し件数、`cache_evicted_reaccesses`が追い出し後の上流再取得件数です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss + evicted)` で算出します。元画像キャッシュは正規化URL単位で本文を保持し、`/image.webp`、`/static.webp`、`/avatar.webp`などの変換間で上流取得とsingleflightを共有します。元画像キャッシュ結果の`result`は`hit`、`miss`、`joined`、`bypass`、`stale`の5種類です。`stale`はfresh miss後の上流障害を元画像staleで救済した件数で、同じ要求には`miss`または`joined`も記録されます。GaugeはOTLP送信間隔ごとに更新されます。
+キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative`、`evicted` の7種類です。`evicted`は過去24時間以内に容量不足で追い出されたキーが再び要求され、上流取得へ進んだことを示します。60秒ごとのINFO統計ログでは`cache_capacity_evictions`が追い出し件数、`cache_evicted_reaccesses`が追い出し後の上流再取得件数です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss + evicted)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
 
 | メトリクス                                   | 種別      | 内容                                   |
 | -------------------------------------------- | --------- | -------------------------------------- |
@@ -218,10 +214,6 @@ amd64ではデフォルトでx86-64-v3向けにビルドしますが、x86-64-v3
 | `media_proxy_cache_capacity_evictions_total` | Counter   | 容量超過によるeviction累積数           |
 | `media_proxy_cache_expired_evictions_total`  | Counter   | 有効期間超過によるeviction累積数       |
 | `media_proxy_singleflight_active`            | Gauge     | singleflight処理中件数                 |
-| `media_proxy_source_cache_requests_total`    | Counter   | 元画像キャッシュ結果別リクエスト累積数 |
-| `media_proxy_source_cache_entries`           | Gauge     | 元画像キャッシュエントリ数             |
-| `media_proxy_source_cache_bytes`             | Gauge     | 元画像キャッシュ使用バイト数           |
-| `media_proxy_source_cache_capacity_bytes`    | Gauge     | 元画像キャッシュ容量上限               |
 | `media_proxy_static_requests_total`          | Counter   | `/static.webp`のキャッシュ結果別累積数 |
 | `media_proxy_downloads_active`               | Gauge     | ダウンロード同時処理数                 |
 | `media_proxy_downloads_limit`                | Gauge     | ダウンロード同時処理上限               |
