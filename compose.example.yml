@@ -10,7 +10,16 @@ services:
     ports:
       - "80:12766"
     depends_on:
-      - alloy
+      alloy:
+        condition: service_started
+      source-cache-init:
+        condition: service_completed_successfully
+
+  source-cache-init:
+    image: public.ecr.aws/docker/library/alpine:latest
+    command: chown 852:852 /var/cache/media-proxy/source
+    volumes:
+      - source-cache:/var/cache/media-proxy/source
 
   alloy:
     image: grafana/alloy:v1.12.2
