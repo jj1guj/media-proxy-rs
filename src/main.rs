@@ -4201,6 +4201,22 @@ fn emit_summary(
 		);
 	}
 }
+enum StaleRescue {
+	Transformed(cache::CacheEntry),
+	Source(source_cache::SourceEntry),
+}
+
+fn select_stale_rescue(
+	response_cache: &ResponseCache,
+	cache_key: &CacheKey,
+	stale_source: &mut Option<source_cache::SourceEntry>,
+) -> Option<StaleRescue> {
+	response_cache
+		.get_stale(cache_key)
+		.map(StaleRescue::Transformed)
+		.or_else(|| stale_source.take().map(StaleRescue::Source))
+}
+
 /// staleキャッシュエントリからレスポンスを構築する。
 fn build_stale_response(
 	cached: &cache::CacheEntry,
@@ -5255,26 +5271,29 @@ async fn get_file_inner(
 			&& upstream_429_retries == 0
 		{
 			upstream_429_rescue.start();
-			if let Some(stale) = response_cache.get_stale(&cache_key) {
-				upstream_429_rescue.complete("stale");
-				let stale_response = build_stale_response(&stale, &config, &timings);
-				if let Ok(t) = timings.lock() {
-					emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+			match select_stale_rescue(&response_cache, &cache_key, &mut stale_source) {
+				Some(StaleRescue::Transformed(stale)) => {
+					upstream_429_rescue.complete("stale");
+					let stale_response = build_stale_response(&stale, &config, &timings);
+					if let Ok(t) = timings.lock() {
+						emit_summary(&config, &summary, &t, 200, true, None, &global_stats);
+					}
+					return Err(stale_response);
 				}
-				return Err(stale_response);
-			}
-			if let Some(entry) = stale_source.take() {
-				upstream_429_rescue.complete("stale");
-				return transform_source_entry(
-					&source_transform_context,
-					entry,
-					&response_cache,
-					&cache_key,
-					&mut flight_guard,
-					&summary,
-					Some("429"),
-				)
-				.await;
+				Some(StaleRescue::Source(entry)) => {
+					upstream_429_rescue.complete("stale");
+					return transform_source_entry(
+						&source_transform_context,
+						entry,
+						&response_cache,
+						&cache_key,
+						&mut flight_guard,
+						&summary,
+						Some("429"),
+					)
+					.await;
+				}
+				None => {}
 			}
 			upstream_429_retries = 1;
 			global_stats.retry_attempts.fetch_add(1, Ordering::Relaxed);
@@ -8200,6 +8219,7 @@ mod network_policy_tests {
 #[cfg(test)]
 mod cache_tests {
 	use super::cache::*;
+	use super::{select_stale_rescue, source_cache, StaleRescue};
 	use std::sync::Arc;
 	use std::time::Duration;
 
@@ -8239,6 +8259,32 @@ mod cache_tests {
 		let hit = cache.get(&key);
 		assert!(hit.is_some());
 		assert_eq!(hit.unwrap().body, vec![1, 2, 3]);
+	}
+	#[test]
+	fn transformed_stale_takes_priority_without_consuming_source_stale() {
+		let cache = ResponseCache::new(CacheConfig {
+			enabled: true,
+			max_bytes: 1024 * 1024,
+			entry_max_bytes: 512 * 1024,
+			ttl: Duration::ZERO,
+			stale_max: Duration::from_secs(60),
+		});
+		let key = test_key();
+		cache.put(
+			key.clone(),
+			CacheEntry::new(200, Some("image/webp".to_owned()), None, None, vec![1]),
+		);
+		let mut source_stale = Some(source_cache::SourceEntry::new(
+			200,
+			Some("image/png".to_owned()),
+			None,
+			vec![2],
+		));
+
+		let rescue = select_stale_rescue(&cache, &key, &mut source_stale);
+
+		assert!(matches!(rescue, Some(StaleRescue::Transformed(entry)) if entry.body == vec![1]));
+		assert!(source_stale.is_some());
 	}
 	#[test]
 	fn cache_miss_when_disabled() {
