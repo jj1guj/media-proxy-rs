@@ -1,6 +1,7 @@
 services:
   server:
     build: .
+    image: media-proxy-rs-server
     restart: always
     environment:
       MEDIA_PROXY_CONFIG_PATH: /config/config.json
@@ -16,8 +17,10 @@ services:
         condition: service_completed_successfully
 
   source-cache-init:
-    image: public.ecr.aws/docker/library/alpine:latest
-    command: chown 852:852 /var/cache/media-proxy/source
+    image: media-proxy-rs-server
+    pull_policy: never
+    user: "0:0"
+    entrypoint: ["chown", "852:852", "/var/cache/media-proxy/source"]
     volumes:
       - source-cache:/var/cache/media-proxy/source
 
