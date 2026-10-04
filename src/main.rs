@@ -1255,6 +1255,9 @@ struct OtlpMetrics {
 	cache_capacity_bytes: Gauge<u64>,
 	cache_capacity_evictions: Counter<u64>,
 	cache_expired_evictions: Counter<u64>,
+	source_cache_requests: Counter<u64>,
+	source_cache_writes: Counter<u64>,
+	source_cache_rescues: Counter<u64>,
 	singleflight_active: Gauge<u64>,
 	static_requests: Counter<u64>,
 	downloads_active: Gauge<u64>,
@@ -1337,6 +1340,15 @@ impl OtlpMetrics {
 				.build(),
 			cache_expired_evictions: meter
 				.u64_counter("media_proxy_cache_expired_evictions_total")
+				.build(),
+			source_cache_requests: meter
+				.u64_counter("media_proxy_source_cache_requests_total")
+				.build(),
+			source_cache_writes: meter
+				.u64_counter("media_proxy_source_cache_writes_total")
+				.build(),
+			source_cache_rescues: meter
+				.u64_counter("media_proxy_source_cache_rescues_total")
 				.build(),
 			singleflight_active: meter.u64_gauge("media_proxy_singleflight_active").build(),
 			static_requests: meter
@@ -1974,6 +1986,35 @@ impl GlobalStats {
 			metrics
 				.upstream_429_rescue_outcomes
 				.add(1, &[KeyValue::new("result", result)]);
+		}
+	}
+	fn record_source_cache_request(&self, result: &'static str) {
+		if let Some(metrics) = &self.otlp {
+			metrics
+				.source_cache_requests
+				.add(1, &[KeyValue::new("result", result)]);
+		}
+	}
+	fn record_source_cache_write(&self, accepted: bool) {
+		if let Some(metrics) = &self.otlp {
+			metrics.source_cache_writes.add(
+				1,
+				&[KeyValue::new(
+					"result",
+					if accepted { "accepted" } else { "rejected" },
+				)],
+			);
+		}
+	}
+	fn record_source_cache_rescue(&self, reason: &'static str, served: bool) {
+		if let Some(metrics) = &self.otlp {
+			metrics.source_cache_rescues.add(
+				1,
+				&[
+					KeyValue::new("reason", reason),
+					KeyValue::new("result", if served { "served" } else { "failed" }),
+				],
+			);
 		}
 	}
 
@@ -4529,6 +4570,7 @@ async fn get_file_inner(
 		if let Some(cache) = &source_cache {
 			match cache.get(&q.url).await {
 				Ok(Some(source_cache::SourceLookup::Fresh(entry))) => {
+					global_stats.record_source_cache_request("fresh");
 					return transform_source_entry(
 						&source_transform_context,
 						entry,
@@ -4536,15 +4578,17 @@ async fn get_file_inner(
 						&cache_key,
 						&mut flight_guard,
 						&summary,
-						false,
+						None,
 					)
 					.await;
 				}
 				Ok(Some(source_cache::SourceLookup::Stale(entry))) => {
+					global_stats.record_source_cache_request("stale");
 					stale_source = Some(entry);
 				}
-				Ok(None) => {}
+				Ok(None) => global_stats.record_source_cache_request("miss"),
 				Err(error) => {
+					global_stats.record_source_cache_request("error");
 					tracing::warn!(url = %q.url, %error, "source cacheの読込みに失敗");
 				}
 			}
@@ -4591,7 +4635,7 @@ async fn get_file_inner(
 						&cache_key,
 						&mut flight_guard,
 						&summary,
-						true,
+						Some("dns"),
 					)
 					.await;
 				}
@@ -4738,7 +4782,7 @@ async fn get_file_inner(
 								&cache_key,
 								&mut flight_guard,
 								&summary,
-								true,
+								Some("throttle"),
 							)
 							.await;
 						}
@@ -4783,7 +4827,7 @@ async fn get_file_inner(
 										&cache_key,
 										&mut flight_guard,
 										&summary,
-										true,
+										Some("throttle"),
 									)
 									.await;
 								}
@@ -4946,7 +4990,7 @@ async fn get_file_inner(
 										&cache_key,
 										&mut flight_guard,
 										&summary,
-										true,
+										Some("throttle"),
 									)
 									.await;
 								}
@@ -5147,7 +5191,7 @@ async fn get_file_inner(
 								&cache_key,
 								&mut flight_guard,
 								&summary,
-								true,
+								Some("network"),
 							)
 							.await;
 						}
@@ -5228,7 +5272,7 @@ async fn get_file_inner(
 					&cache_key,
 					&mut flight_guard,
 					&summary,
-					true,
+					Some("429"),
 				)
 				.await;
 			}
@@ -5377,7 +5421,7 @@ async fn get_file_inner(
 							&cache_key,
 							&mut flight_guard,
 							&summary,
-							true,
+							Some("dns"),
 						)
 						.await;
 					}
@@ -5635,7 +5679,7 @@ async fn transform_source_entry(
 	cache_key: &CacheKey,
 	flight_guard: &mut Option<cache::FlightGuard>,
 	summary: &ReqSummary,
-	rescued: bool,
+	rescue_reason: Option<&'static str>,
 ) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
 	let result = context.encode(entry).await;
 	if let Some(guard) = flight_guard {
@@ -5649,13 +5693,18 @@ async fn transform_source_entry(
 			response.headers().contains_key("X-Proxy-Error"),
 		),
 	};
+	if let Some(reason) = rescue_reason {
+		context
+			.global_stats
+			.record_source_cache_rescue(reason, status < 400 && !has_error);
+	}
 	if let Ok(timings) = context.timings.lock() {
 		emit_summary(
 			&context.config,
 			summary,
 			&timings,
 			status,
-			rescued || has_error,
+			rescue_reason.is_some() || has_error,
 			None,
 			&context.global_stats,
 		);
@@ -5739,6 +5788,7 @@ impl RequestContext {
 			return;
 		};
 		if !cache.can_store(self.src_bytes.len()) {
+			self.global_stats.record_source_cache_write(false);
 			return;
 		}
 		let content_type = self
@@ -5757,7 +5807,9 @@ impl RequestContext {
 			content_disposition,
 			self.src_bytes.clone(),
 		);
-		if !cache.put(self.parms.url.clone(), entry) {
+		let accepted = cache.put(self.parms.url.clone(), entry);
+		self.global_stats.record_source_cache_write(accepted);
+		if !accepted {
 			tracing::debug!(url = %self.parms.url, "source cacheへの書込みを見送り");
 		}
 	}
@@ -5855,6 +5907,26 @@ impl RequestContext {
 			.await
 	}
 
+	async fn encode_source_rescue(
+		self,
+		entry: source_cache::SourceEntry,
+		reason: &'static str,
+	) -> Result<(axum::http::StatusCode, HeaderMap, axum::body::Body), axum::response::Response> {
+		let global_stats = self.global_stats.clone();
+		let result = Box::pin(self.encode_source(entry)).await;
+		let served = match &result {
+			Ok((status, headers, _)) => {
+				status.as_u16() < 400 && !headers.contains_key("X-Proxy-Error")
+			}
+			Err(response) => {
+				response.status().as_u16() < 400
+					&& !response.headers().contains_key("X-Proxy-Error")
+			}
+		};
+		global_stats.record_source_cache_rescue(reason, served);
+		result
+	}
+
 	async fn encode_stream(
 		mut self,
 		status: axum::http::StatusCode,
@@ -5881,7 +5953,12 @@ impl RequestContext {
 					return Err(build_stale_response(&stale, &self.config, &self.timings));
 				}
 				if let Some(entry) = self.stale_source.take() {
-					return Box::pin(self.encode_source(entry)).await;
+					let reason = if status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+						"429"
+					} else {
+						"5xx"
+					};
+					return Box::pin(self.encode_source_rescue(entry, reason)).await;
 				}
 			}
 			return Err(self.remote_error_response(status));
@@ -5990,7 +6067,7 @@ impl RequestContext {
 					return Err(build_stale_response(&stale, &self.config, &self.timings));
 				}
 				if let Some(entry) = self.stale_source.take() {
-					return Box::pin(self.encode_source(entry)).await;
+					return Box::pin(self.encode_source_rescue(entry, "body")).await;
 				}
 				return Err(error);
 			}
@@ -6111,7 +6188,7 @@ impl RequestContext {
 					return Err(build_stale_response(&stale, &self.config, &self.timings));
 				}
 				if let Some(entry) = self.stale_source.take() {
-					return Box::pin(self.encode_source(entry)).await;
+					return Box::pin(self.encode_source_rescue(entry, "body")).await;
 				}
 				return Err(error);
 			}
@@ -6662,6 +6739,12 @@ mod metrics_tests {
 		let mut rescue = Upstream429RescueGuard::new(stats.clone());
 		rescue.start();
 		rescue.complete("retry_success");
+		stats.record_source_cache_request("fresh");
+		stats.record_source_cache_request("miss");
+		stats.record_source_cache_write(true);
+		stats.record_source_cache_write(false);
+		stats.record_source_cache_rescue("dns", true);
+		stats.record_source_cache_rescue("network", false);
 		let deadline_fallback: Result<(), HostThrottleRejection> = Ok(());
 		stats.observe_deadline_fallback(&deadline_fallback, DeadlineFallbackContext::Initial);
 		stats.observe_deadline_fallback_terminal("response_2xx");
@@ -6707,6 +6790,9 @@ mod metrics_tests {
 			"media_proxy_cache_capacity_bytes",
 			"media_proxy_cache_capacity_evictions_total",
 			"media_proxy_cache_expired_evictions_total",
+			"media_proxy_source_cache_requests_total",
+			"media_proxy_source_cache_writes_total",
+			"media_proxy_source_cache_rescues_total",
 			"media_proxy_singleflight_active",
 			"media_proxy_static_requests_total",
 			"media_proxy_downloads_active",

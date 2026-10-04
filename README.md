@@ -221,6 +221,9 @@ source cacheは要求元URLをキーに200レスポンスの本文を保存し�
 | `media_proxy_cache_capacity_bytes`           | Gauge     | キャッシュ容量上限                     |
 | `media_proxy_cache_capacity_evictions_total` | Counter   | 容量超過によるeviction累積数           |
 | `media_proxy_cache_expired_evictions_total`  | Counter   | 有効期間超過によるeviction累積数       |
+| `media_proxy_source_cache_requests_total`    | Counter   | source cache参照結果別累積数           |
+| `media_proxy_source_cache_writes_total`      | Counter   | source cache書込み結果別累積数         |
+| `media_proxy_source_cache_rescues_total`     | Counter   | source stale救済結果・理由別累積数     |
 | `media_proxy_singleflight_active`            | Gauge     | singleflight処理中件数                 |
 | `media_proxy_static_requests_total`          | Counter   | `/static.webp`のキャッシュ結果別累積数 |
 | `media_proxy_downloads_active`               | Gauge     | ダウンロード同時処理数                 |
@@ -230,6 +233,8 @@ source cacheは要求元URLをキーに200レスポンスの本文を保存し�
 | `media_proxy_buffer_used_bytes`              | Gauge     | 処理中バッファ使用量                   |
 | `media_proxy_buffer_limit_bytes`             | Gauge     | 処理中バッファ上限                     |
 | `media_proxy_buffer_wait_duration`           | Histogram | バッファ予算セマフォ待機時間           |
+
+source cache参照結果の`result`は`fresh`、`stale`、`miss`、`error`、書込み結果は`accepted`、`rejected`です。source stale救済は`result=served|failed`と`reason=dns|network|throttle|429|5xx|body`で記録します。URLやホスト名は属性に含めません。
 
 出力形式の属性 `format` は `jpeg`、`png`、`webp`、`avif`、`other` の5種類です。圧縮率は `media_proxy_output_bytes_total / media_proxy_input_bytes_total`、パススルー率は `media_proxy_passthrough_total / media_proxy_requests_total` で算出します。処理エラーの `category` は `decode`、`encode`、`policy`、`size`、`internal`、fetchエラーは `dns`、`connect`、`timeout`、`reset`、`body`、`throttle`、`other` の固定分類です。流量制御結果の`result`は`passed`、`waited`、`rejected`の3種類で、ホスト名は属性に含めません。
 
