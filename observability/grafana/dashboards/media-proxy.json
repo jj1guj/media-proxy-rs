@@ -1693,7 +1693,7 @@
         "description": "",
         "id": 4,
         "links": [],
-        "title": "Cache hit rate",
+        "title": "Transformed cache hit rate",
         "vizConfig": {
           "group": "stat",
           "kind": "VizConfig",
@@ -2294,7 +2294,7 @@
         "description": "",
         "id": 8,
         "links": [],
-        "title": "Cache capacity",
+        "title": "Transformed cache capacity",
         "vizConfig": {
           "group": "timeseries",
           "kind": "VizConfig",
@@ -2501,7 +2501,7 @@
         "description": "",
         "id": 9,
         "links": [],
-        "title": "Cache evictions",
+        "title": "Transformed cache evictions",
         "vizConfig": {
           "group": "timeseries",
           "kind": "VizConfig",
@@ -2581,6 +2581,210 @@
           "version": "12.2.0"
         }
       }
+    },
+    "panel-28": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "100 * sum(rate(media_proxy_source_cache_requests_total{result=\"fresh\"}[1m])) / clamp_min(sum(rate(media_proxy_source_cache_requests_total{result=~\"fresh|stale|miss|error\"}[1m])), 0.001)",
+                      "legendFormat": "Fresh hit rate",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Share of source lookups served immediately from a fresh disk cache entry.",
+        "id": 28,
+        "links": [],
+        "title": "Source cache fresh hit rate",
+        "vizConfig": {
+          "group": "stat",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "thresholds"
+                },
+                "decimals": 1,
+                "max": 100,
+                "min": 0,
+                "noValue": "No source cache requests",
+                "thresholds": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": 0
+                    },
+                    {
+                      "color": "orange",
+                      "value": 50
+                    },
+                    {
+                      "color": "green",
+                      "value": 80
+                    }
+                  ]
+                },
+                "unit": "percent"
+              },
+              "overrides": []
+            },
+            "options": {
+              "colorMode": "value",
+              "graphMode": "area",
+              "justifyMode": "auto",
+              "orientation": "auto",
+              "percentChangeColorMode": "standard",
+              "reduceOptions": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "fields": "",
+                "values": false
+              },
+              "showPercentChange": false,
+              "textMode": "auto",
+              "wideLayout": true
+            }
+          },
+          "version": "12.2.0"
+        }
+      }
+    },
+    "panel-29": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "sum by (result) (rate(media_proxy_source_cache_requests_total[1m]))",
+                      "legendFormat": "lookup {{result}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "sum by (result) (rate(media_proxy_source_cache_writes_total[1m]))",
+                      "legendFormat": "write {{result}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "B"
+                }
+              },
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "sum by (reason, result) (rate(media_proxy_source_cache_rescues_total[1m]))",
+                      "legendFormat": "rescue {{reason}} {{result}}",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "C"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Source disk cache lookup, write, and stale rescue outcomes.",
+        "id": 29,
+        "links": [],
+        "title": "Source cache outcomes",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "unit": "ops"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            }
+          },
+          "version": ""
+        }
+      }
     }
   },
   "layout": {
@@ -2604,7 +2808,7 @@
                         "name": "panel-3"
                       },
                       "height": 4,
-                      "width": 6,
+                      "width": 8,
                       "x": 0,
                       "y": 0
                     }
@@ -2617,8 +2821,21 @@
                         "name": "panel-4"
                       },
                       "height": 4,
-                      "width": 6,
-                      "x": 6,
+                      "width": 8,
+                      "x": 8,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-28"
+                      },
+                      "height": 4,
+                      "width": 8,
+                      "x": 16,
                       "y": 0
                     }
                   },
@@ -2630,9 +2847,9 @@
                         "name": "panel-5"
                       },
                       "height": 4,
-                      "width": 6,
-                      "x": 12,
-                      "y": 0
+                      "width": 12,
+                      "x": 0,
+                      "y": 4
                     }
                   },
                   {
@@ -2643,9 +2860,9 @@
                         "name": "panel-19"
                       },
                       "height": 4,
-                      "width": 6,
-                      "x": 18,
-                      "y": 0
+                      "width": 12,
+                      "x": 12,
+                      "y": 4
                     }
                   }
                 ]
@@ -2765,6 +2982,33 @@
                       "width": 12,
                       "x": 12,
                       "y": 10
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "collapse": false,
+            "title": "Source disk cache",
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-29"
+                      },
+                      "height": 10,
+                      "width": 24,
+                      "x": 0,
+                      "y": 0
                     }
                   }
                 ]
