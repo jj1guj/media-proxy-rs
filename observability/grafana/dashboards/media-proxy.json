@@ -2786,75 +2786,6 @@
         }
       }
     },
-    "panel-30": {
-      "kind": "Panel",
-      "spec": {
-        "data": {
-          "kind": "QueryGroup",
-          "spec": {
-            "queries": [
-              {
-                "kind": "PanelQuery",
-                "spec": {
-                  "hidden": false,
-                  "query": {
-                    "datasource": {
-                      "name": "$prometheus"
-                    },
-                    "group": "prometheus",
-                    "kind": "DataQuery",
-                    "spec": {
-                      "editorMode": "code",
-                      "expr": "max(media_proxy_source_cache_capacity_bytes)",
-                      "legendFormat": "Configured capacity",
-                      "range": true
-                    },
-                    "version": "v0"
-                  },
-                  "refId": "A"
-                }
-              }
-            ],
-            "queryOptions": {},
-            "transformations": []
-          }
-        },
-        "description": "Configured source disk cache capacity. This is not live disk usage.",
-        "id": 30,
-        "links": [],
-        "title": "Source cache capacity",
-        "vizConfig": {
-          "group": "timeseries",
-          "kind": "VizConfig",
-          "spec": {
-            "fieldConfig": {
-              "defaults": {
-                "color": {
-                  "mode": "palette-classic"
-                },
-                "unit": "bytes"
-              },
-              "overrides": []
-            },
-            "options": {
-              "legend": {
-                "calcs": [
-                  "lastNotNull"
-                ],
-                "displayMode": "table",
-                "placement": "bottom",
-                "showLegend": true
-              },
-              "tooltip": {
-                "mode": "multi",
-                "sort": "desc"
-              }
-            }
-          },
-          "version": "12.2.0"
-        }
-      }
-    },
     "panel-31": {
       "kind": "Panel",
       "spec": {
@@ -3191,24 +3122,11 @@
                     "spec": {
                       "element": {
                         "kind": "ElementReference",
-                        "name": "panel-30"
-                      },
-                      "height": 10,
-                      "width": 8,
-                      "x": 0,
-                      "y": 10
-                    }
-                  },
-                  {
-                    "kind": "GridLayoutItem",
-                    "spec": {
-                      "element": {
-                        "kind": "ElementReference",
                         "name": "panel-31"
                       },
                       "height": 10,
-                      "width": 8,
-                      "x": 8,
+                      "width": 12,
+                      "x": 0,
                       "y": 10
                     }
                   },
@@ -3220,8 +3138,8 @@
                         "name": "panel-32"
                       },
                       "height": 10,
-                      "width": 8,
-                      "x": 16,
+                      "width": 12,
+                      "x": 12,
                       "y": 10
                     }
                   },
