@@ -37,7 +37,7 @@ impl GaugeOps for GaugeHandle {
 	fn decrease(&self, value: u64) {
 		let previous = self
 			.value
-			.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+			.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
 				Some(current.saturating_sub(value))
 			})
 			.unwrap_or_default();
