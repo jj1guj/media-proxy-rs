@@ -842,7 +842,7 @@
             },
             "options": {
               "colorMode": "value",
-              "graphMode": "area",
+              "graphMode": "none",
               "justifyMode": "auto",
               "orientation": "auto",
               "percentChangeColorMode": "standard",
@@ -1637,7 +1637,7 @@
             },
             "options": {
               "colorMode": "value",
-              "graphMode": "area",
+              "graphMode": "none",
               "justifyMode": "auto",
               "orientation": "auto",
               "percentChangeColorMode": "standard",
@@ -1730,7 +1730,7 @@
             },
             "options": {
               "colorMode": "value",
-              "graphMode": "area",
+              "graphMode": "none",
               "justifyMode": "auto",
               "orientation": "auto",
               "percentChangeColorMode": "standard",
@@ -1815,7 +1815,7 @@
             },
             "options": {
               "colorMode": "value",
-              "graphMode": "area",
+              "graphMode": "none",
               "justifyMode": "auto",
               "orientation": "auto",
               "percentChangeColorMode": "standard",
@@ -2655,7 +2655,7 @@
             },
             "options": {
               "colorMode": "value",
-              "graphMode": "area",
+              "graphMode": "none",
               "justifyMode": "auto",
               "orientation": "auto",
               "percentChangeColorMode": "standard",
@@ -3021,6 +3021,365 @@
           "version": "12.2.0"
         }
       }
+    },
+    "panel-33": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "100 * sum(rate(media_proxy_cache_requests_total{result=~\"hit|joined\"}[1m])) / clamp_min(sum(rate(media_proxy_cache_requests_total{result=~\"hit|joined|miss|evicted\"}[1m])), 0.001)",
+                      "legendFormat": "Transformed",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Transformed cache hit rate over time.",
+        "id": 33,
+        "links": [],
+        "title": "Transformed cache hit rate trend",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "fixedColor": "blue",
+                  "mode": "fixed"
+                },
+                "max": 100,
+                "min": 0,
+                "unit": "percent"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            }
+          },
+          "version": "12.2.0"
+        }
+      }
+    },
+    "panel-34": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "100 * sum(rate(media_proxy_errors_total[1m])) / clamp_min(sum(rate(media_proxy_requests_total[1m])), 0.001)",
+                      "legendFormat": "Errors",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Error percentage over time.",
+        "id": 34,
+        "links": [],
+        "title": "Error rate trend",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "fixedColor": "red",
+                  "mode": "fixed"
+                },
+                "max": 100,
+                "min": 0,
+                "unit": "percent"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            }
+          },
+          "version": "12.2.0"
+        }
+      }
+    },
+    "panel-35": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "sum(rate(media_proxy_output_bytes_total[1m])) / clamp_min(sum(rate(media_proxy_input_bytes_total[1m])), 1)",
+                      "legendFormat": "Output / input",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Encoded output bytes divided by input bytes over time.",
+        "id": 35,
+        "links": [],
+        "title": "Compression ratio trend",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "fixedColor": "purple",
+                  "mode": "fixed"
+                },
+                "min": 0,
+                "unit": "none"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            }
+          },
+          "version": "12.2.0"
+        }
+      }
+    },
+    "panel-36": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "100 * sum(rate(media_proxy_passthrough_total[1m])) / clamp_min(sum(rate(media_proxy_requests_total[1m])), 0.001)",
+                      "legendFormat": "Passthrough",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Passthrough percentage over time.",
+        "id": 36,
+        "links": [],
+        "title": "Passthrough rate trend",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                },
+                "max": 100,
+                "min": 0,
+                "unit": "percent"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            }
+          },
+          "version": "12.2.0"
+        }
+      }
+    },
+    "panel-37": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "100 * sum(rate(media_proxy_source_cache_requests_total{result=\"fresh\"}[1m])) / clamp_min(sum(rate(media_proxy_source_cache_requests_total{result=~\"fresh|stale|miss|error\"}[1m])), 0.001)",
+                      "legendFormat": "Source fresh",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Fresh source cache hit rate over time.",
+        "id": 37,
+        "links": [],
+        "title": "Source cache fresh hit rate trend",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "fixedColor": "green",
+                  "mode": "fixed"
+                },
+                "max": 100,
+                "min": 0,
+                "unit": "percent"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            }
+          },
+          "version": "12.2.0"
+        }
+      }
     }
   },
   "layout": {
@@ -3043,8 +3402,8 @@
                         "kind": "ElementReference",
                         "name": "panel-3"
                       },
-                      "height": 4,
-                      "width": 8,
+                      "height": 3,
+                      "width": 5,
                       "x": 0,
                       "y": 0
                     }
@@ -3056,9 +3415,9 @@
                         "kind": "ElementReference",
                         "name": "panel-4"
                       },
-                      "height": 4,
-                      "width": 8,
-                      "x": 8,
+                      "height": 3,
+                      "width": 5,
+                      "x": 5,
                       "y": 0
                     }
                   },
@@ -3069,9 +3428,9 @@
                         "kind": "ElementReference",
                         "name": "panel-28"
                       },
-                      "height": 4,
-                      "width": 8,
-                      "x": 16,
+                      "height": 3,
+                      "width": 5,
+                      "x": 10,
                       "y": 0
                     }
                   },
@@ -3082,10 +3441,10 @@
                         "kind": "ElementReference",
                         "name": "panel-5"
                       },
-                      "height": 4,
-                      "width": 12,
-                      "x": 0,
-                      "y": 4
+                      "height": 3,
+                      "width": 5,
+                      "x": 15,
+                      "y": 0
                     }
                   },
                   {
@@ -3095,10 +3454,89 @@
                         "kind": "ElementReference",
                         "name": "panel-19"
                       },
-                      "height": 4,
+                      "height": 3,
+                      "width": 4,
+                      "x": 20,
+                      "y": 0
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "RowsLayoutRow",
+          "spec": {
+            "collapse": false,
+            "title": "Rates & efficiency",
+            "layout": {
+              "kind": "GridLayout",
+              "spec": {
+                "items": [
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-33"
+                      },
+                      "height": 10,
+                      "width": 12,
+                      "x": 0,
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-37"
+                      },
+                      "height": 10,
                       "width": 12,
                       "x": 12,
-                      "y": 4
+                      "y": 0
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-34"
+                      },
+                      "height": 10,
+                      "width": 8,
+                      "x": 0,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-36"
+                      },
+                      "height": 10,
+                      "width": 8,
+                      "x": 8,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
+                        "name": "panel-35"
+                      },
+                      "height": 10,
+                      "width": 8,
+                      "x": 16,
+                      "y": 10
                     }
                   }
                 ]
@@ -3526,7 +3964,7 @@
       "1d"
     ],
     "fiscalYearStartMonth": 0,
-    "from": "now-30m",
+    "from": "now-1h",
     "hideTimepicker": false,
     "timezone": "browser",
     "to": "now"
