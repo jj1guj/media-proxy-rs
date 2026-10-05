@@ -1,6 +1,8 @@
 use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, RecoverMode};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BLOCK_SIZE: usize = 40 * 1024 * 1024;
@@ -38,12 +40,22 @@ pub enum SourceLookup {
 	Stale(SourceEntry),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SourceCacheStats {
+	pub capacity_bytes: u64,
+	pub disk_read_bytes: u64,
+	pub disk_write_bytes: u64,
+	pub expired_removals: u64,
+}
+
 #[derive(Clone)]
 pub struct SourceCache {
 	cache: HybridCache<String, SourceEntry>,
 	fresh_for: Duration,
 	stale_for: Duration,
 	max_entry_bytes: usize,
+	capacity_bytes: usize,
+	expired_removals: Arc<AtomicU64>,
 }
 
 impl SourceCache {
@@ -75,6 +87,8 @@ impl SourceCache {
 			fresh_for,
 			stale_for,
 			max_entry_bytes,
+			capacity_bytes,
+			expired_removals: Arc::new(AtomicU64::new(0)),
 		})
 	}
 
@@ -93,6 +107,7 @@ impl SourceCache {
 			Age::Stale => Ok(Some(SourceLookup::Stale(entry))),
 			Age::Expired => {
 				self.cache.remove(url);
+				self.expired_removals.fetch_add(1, Ordering::Relaxed);
 				Ok(None)
 			}
 		}
@@ -111,6 +126,16 @@ impl SourceCache {
 
 	pub fn can_store(&self, body_len: usize) -> bool {
 		body_len <= self.max_entry_bytes
+	}
+
+	pub fn stats(&self) -> SourceCacheStats {
+		let statistics = self.cache.storage().statistics();
+		SourceCacheStats {
+			capacity_bytes: self.capacity_bytes as u64,
+			disk_read_bytes: statistics.disk_read_bytes() as u64,
+			disk_write_bytes: statistics.disk_write_bytes() as u64,
+			expired_removals: self.expired_removals.load(Ordering::Relaxed),
+		}
 	}
 
 	pub async fn close(&self) -> foyer::Result<()> {
@@ -196,6 +221,17 @@ mod tests {
 			Some(SourceLookup::Fresh(entry)) => assert_eq!(entry.body, vec![1, 2, 3]),
 			other => panic!("unexpected source cache lookup: {other:?}"),
 		}
+		assert_eq!(cache.stats().capacity_bytes, (BLOCK_SIZE * 2) as u64);
+
+		let mut expired = SourceEntry::new(200, Some("image/png".to_owned()), None, vec![4]);
+		expired.fetched_at_ms = 0;
+		assert!(cache.put("https://example.com/expired.png".to_owned(), expired));
+		assert!(cache
+			.get("https://example.com/expired.png")
+			.await
+			.unwrap()
+			.is_none());
+		assert_eq!(cache.stats().expired_removals, 1);
 
 		cache.close().await.unwrap();
 		drop(cache);

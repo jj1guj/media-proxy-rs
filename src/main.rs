@@ -1258,6 +1258,10 @@ struct OtlpMetrics {
 	source_cache_requests: Counter<u64>,
 	source_cache_writes: Counter<u64>,
 	source_cache_rescues: Counter<u64>,
+	source_cache_capacity_bytes: Gauge<u64>,
+	source_cache_disk_read_bytes: Counter<u64>,
+	source_cache_disk_write_bytes: Counter<u64>,
+	source_cache_expired_removals: Counter<u64>,
 	singleflight_active: Gauge<u64>,
 	static_requests: Counter<u64>,
 	downloads_active: Gauge<u64>,
@@ -1349,6 +1353,18 @@ impl OtlpMetrics {
 				.build(),
 			source_cache_rescues: meter
 				.u64_counter("media_proxy_source_cache_rescues_total")
+				.build(),
+			source_cache_capacity_bytes: meter
+				.u64_gauge("media_proxy_source_cache_capacity_bytes")
+				.build(),
+			source_cache_disk_read_bytes: meter
+				.u64_counter("media_proxy_source_cache_disk_read_bytes_total")
+				.build(),
+			source_cache_disk_write_bytes: meter
+				.u64_counter("media_proxy_source_cache_disk_write_bytes_total")
+				.build(),
+			source_cache_expired_removals: meter
+				.u64_counter("media_proxy_source_cache_expired_removals_total")
 				.build(),
 			singleflight_active: meter.u64_gauge("media_proxy_singleflight_active").build(),
 			static_requests: meter
@@ -1544,6 +1560,7 @@ impl OtlpMetrics {
 		snapshot: ResourceSnapshot,
 		eviction_deltas: (u64, u64),
 		dns_retry_deltas: (u64, u64),
+		source_cache_deltas: (u64, u64, u64),
 	) {
 		self.cache_entries.record(snapshot.cache_entries, &[]);
 		self.cache_bytes.record(snapshot.cache_bytes, &[]);
@@ -1551,6 +1568,14 @@ impl OtlpMetrics {
 			.record(snapshot.cache_capacity_bytes, &[]);
 		self.cache_capacity_evictions.add(eviction_deltas.0, &[]);
 		self.cache_expired_evictions.add(eviction_deltas.1, &[]);
+		self.source_cache_capacity_bytes
+			.record(snapshot.source_cache_capacity_bytes, &[]);
+		self.source_cache_disk_read_bytes
+			.add(source_cache_deltas.0, &[]);
+		self.source_cache_disk_write_bytes
+			.add(source_cache_deltas.1, &[]);
+		self.source_cache_expired_removals
+			.add(source_cache_deltas.2, &[]);
 		self.singleflight_active
 			.record(snapshot.singleflight_active, &[]);
 		self.downloads_active.record(snapshot.downloads_active, &[]);
@@ -1591,6 +1616,7 @@ struct ResourceSnapshot {
 	cache_entries: u64,
 	cache_bytes: u64,
 	cache_capacity_bytes: u64,
+	source_cache_capacity_bytes: u64,
 	singleflight_active: u64,
 	downloads_active: u64,
 	downloads_limit: u64,
@@ -1614,9 +1640,11 @@ fn record_resource_metrics(
 	buffer_budget: &Semaphore,
 	buffer_limit: usize,
 	cache_capacity_bytes: u64,
+	source_cache: Option<&source_cache::SourceCache>,
 	process_started: Instant,
 	previous_evictions: &mut (u64, u64),
 	previous_dns_retries: &mut (u64, u64),
+	previous_source_cache_stats: &mut source_cache::SourceCacheStats,
 ) {
 	let (cache_entries, cache_bytes) = response_cache.stats();
 	let cumulative_evictions = response_cache.cumulative_evictions();
@@ -1635,11 +1663,25 @@ fn record_resource_metrics(
 			.saturating_sub(previous_dns_retries.1),
 	);
 	*previous_dns_retries = cumulative_dns_retries;
+	let source_cache_stats = source_cache.map(|cache| cache.stats()).unwrap_or_default();
+	let source_cache_deltas = (
+		source_cache_stats
+			.disk_read_bytes
+			.saturating_sub(previous_source_cache_stats.disk_read_bytes),
+		source_cache_stats
+			.disk_write_bytes
+			.saturating_sub(previous_source_cache_stats.disk_write_bytes),
+		source_cache_stats
+			.expired_removals
+			.saturating_sub(previous_source_cache_stats.expired_removals),
+	);
+	*previous_source_cache_stats = source_cache_stats;
 	metrics.record_resource_snapshot(
 		ResourceSnapshot {
 			cache_entries: cache_entries as u64,
 			cache_bytes: cache_bytes as u64,
 			cache_capacity_bytes,
+			source_cache_capacity_bytes: source_cache_stats.capacity_bytes,
 			singleflight_active: response_cache.inflight_count() as u64,
 			downloads_active: download_limit.saturating_sub(download_semaphore.available_permits())
 				as u64,
@@ -1655,6 +1697,7 @@ fn record_resource_metrics(
 		},
 		eviction_deltas,
 		dns_retry_deltas,
+		source_cache_deltas,
 	);
 }
 
@@ -2865,10 +2908,12 @@ fn main() {
 			let cpu_limit = max_concurrent_encode;
 			let buffer_limit = arg_tup.1.inflight_buffer_budget_bytes as usize;
 			let cache_capacity_bytes = arg_tup.1.cache_max_bytes;
+			let source_cache = arg_tup.13.clone();
 			let interval_ms = arg_tup.1.otlp_export_interval_ms;
 			tokio::spawn(async move {
 				let mut previous_evictions = (0, 0);
 				let mut previous_dns_retries = (0, 0);
+				let mut previous_source_cache_stats = source_cache::SourceCacheStats::default();
 				let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
 				loop {
 					interval.tick().await;
@@ -2883,9 +2928,11 @@ fn main() {
 						&buffer_budget,
 						buffer_limit,
 						cache_capacity_bytes,
+						source_cache.as_deref(),
 						process_started,
 						&mut previous_evictions,
 						&mut previous_dns_retries,
+						&mut previous_source_cache_stats,
 					);
 				}
 			});
@@ -6722,6 +6769,7 @@ mod metrics_tests {
 				cache_entries: 2,
 				cache_bytes: 1024,
 				cache_capacity_bytes: 4096,
+				source_cache_capacity_bytes: 8192,
 				singleflight_active: 1,
 				downloads_active: 2,
 				downloads_limit: 4,
@@ -6735,6 +6783,7 @@ mod metrics_tests {
 			},
 			(1, 1),
 			(1, 1),
+			(10, 20, 1),
 		);
 		stats
 			.otlp
@@ -6812,6 +6861,10 @@ mod metrics_tests {
 			"media_proxy_source_cache_requests_total",
 			"media_proxy_source_cache_writes_total",
 			"media_proxy_source_cache_rescues_total",
+			"media_proxy_source_cache_capacity_bytes",
+			"media_proxy_source_cache_disk_read_bytes_total",
+			"media_proxy_source_cache_disk_write_bytes_total",
+			"media_proxy_source_cache_expired_removals_total",
 			"media_proxy_singleflight_active",
 			"media_proxy_static_requests_total",
 			"media_proxy_downloads_active",

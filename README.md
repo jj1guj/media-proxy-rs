@@ -213,26 +213,30 @@ source cacheは要求元URLをキーに200レスポンスの本文を保存し�
 
 キャッシュ結果の属性 `result` は `hit`、`miss`、`joined`、`bypass`、`stale`、`negative`、`evicted` の7種類です。`evicted`は過去24時間以内に容量不足で追い出されたキーが再び要求され、上流取得へ進んだことを示します。60秒ごとのINFO統計ログでは`cache_capacity_evictions`が追い出し件数、`cache_evicted_reaccesses`が追い出し後の上流再取得件数です。変換後キャッシュのヒット率は `media_proxy_cache_requests_total` から `(hit + joined) / (hit + joined + miss + evicted)` で算出します。GaugeはOTLP送信間隔ごとに更新されます。
 
-| メトリクス                                   | 種別      | 内容                                   |
-| -------------------------------------------- | --------- | -------------------------------------- |
-| `media_proxy_cache_requests_total`           | Counter   | キャッシュ結果別リクエスト累積数       |
-| `media_proxy_cache_entries`                  | Gauge     | キャッシュエントリ数                   |
-| `media_proxy_cache_bytes`                    | Gauge     | キャッシュ使用バイト数                 |
-| `media_proxy_cache_capacity_bytes`           | Gauge     | キャッシュ容量上限                     |
-| `media_proxy_cache_capacity_evictions_total` | Counter   | 容量超過によるeviction累積数           |
-| `media_proxy_cache_expired_evictions_total`  | Counter   | 有効期間超過によるeviction累積数       |
-| `media_proxy_source_cache_requests_total`    | Counter   | source cache参照結果別累積数           |
-| `media_proxy_source_cache_writes_total`      | Counter   | source cache書込み結果別累積数         |
-| `media_proxy_source_cache_rescues_total`     | Counter   | source stale救済結果・理由別累積数     |
-| `media_proxy_singleflight_active`            | Gauge     | singleflight処理中件数                 |
-| `media_proxy_static_requests_total`          | Counter   | `/static.webp`のキャッシュ結果別累積数 |
-| `media_proxy_downloads_active`               | Gauge     | ダウンロード同時処理数                 |
-| `media_proxy_downloads_limit`                | Gauge     | ダウンロード同時処理上限               |
-| `media_proxy_cpu_active`                     | Gauge     | CPU同時処理数                          |
-| `media_proxy_cpu_limit`                      | Gauge     | CPU同時処理上限                        |
-| `media_proxy_buffer_used_bytes`              | Gauge     | 処理中バッファ使用量                   |
-| `media_proxy_buffer_limit_bytes`             | Gauge     | 処理中バッファ上限                     |
-| `media_proxy_buffer_wait_duration`           | Histogram | バッファ予算セマフォ待機時間           |
+| メトリクス                                        | 種別      | 内容                                   |
+| ------------------------------------------------- | --------- | -------------------------------------- |
+| `media_proxy_cache_requests_total`                | Counter   | キャッシュ結果別リクエスト累積数       |
+| `media_proxy_cache_entries`                       | Gauge     | キャッシュエントリ数                   |
+| `media_proxy_cache_bytes`                         | Gauge     | キャッシュ使用バイト数                 |
+| `media_proxy_cache_capacity_bytes`                | Gauge     | キャッシュ容量上限                     |
+| `media_proxy_cache_capacity_evictions_total`      | Counter   | 容量超過によるeviction累積数           |
+| `media_proxy_cache_expired_evictions_total`       | Counter   | 有効期間超過によるeviction累積数       |
+| `media_proxy_source_cache_requests_total`         | Counter   | source cache参照結果別累積数           |
+| `media_proxy_source_cache_writes_total`           | Counter   | source cache書込み結果別累積数         |
+| `media_proxy_source_cache_rescues_total`          | Counter   | source stale救済結果・理由別累積数     |
+| `media_proxy_source_cache_capacity_bytes`         | Gauge     | source cacheの設定容量                 |
+| `media_proxy_source_cache_disk_read_bytes_total`  | Counter   | source cacheのdisk読込み累積バイト数   |
+| `media_proxy_source_cache_disk_write_bytes_total` | Counter   | source cacheのdisk書込み累積バイト数   |
+| `media_proxy_source_cache_expired_removals_total` | Counter   | 期限切れsource entryの削除累積数       |
+| `media_proxy_singleflight_active`                 | Gauge     | singleflight処理中件数                 |
+| `media_proxy_static_requests_total`               | Counter   | `/static.webp`のキャッシュ結果別累積数 |
+| `media_proxy_downloads_active`                    | Gauge     | ダウンロード同時処理数                 |
+| `media_proxy_downloads_limit`                     | Gauge     | ダウンロード同時処理上限               |
+| `media_proxy_cpu_active`                          | Gauge     | CPU同時処理数                          |
+| `media_proxy_cpu_limit`                           | Gauge     | CPU同時処理上限                        |
+| `media_proxy_buffer_used_bytes`                   | Gauge     | 処理中バッファ使用量                   |
+| `media_proxy_buffer_limit_bytes`                  | Gauge     | 処理中バッファ上限                     |
+| `media_proxy_buffer_wait_duration`                | Histogram | バッファ予算セマフォ待機時間           |
 
 source cache参照結果の`result`は`fresh`、`stale`、`miss`、`error`、書込み結果は`accepted`、`rejected`です。source stale救済は`result=served|failed`と`reason=dns|network|throttle|429|5xx|body`で記録します。URLやホスト名は属性に含めません。
 
