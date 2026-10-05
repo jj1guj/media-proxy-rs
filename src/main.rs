@@ -1702,8 +1702,19 @@ fn record_resource_metrics(
 	);
 }
 
+const DURATION_HISTOGRAM_BOUNDARIES: &[f64] = &[
+	0.0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01, 0.02, 0.03,
+	0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7,
+	0.8, 0.9, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+	12.5, 15.0, 20.0, 25.0, 35.0, 50.0, 75.0, 100.0, 150.0, 250.0,
+];
+
 fn duration_histogram(meter: &opentelemetry::metrics::Meter, name: &'static str) -> Histogram<f64> {
-	meter.f64_histogram(name).with_unit("s").build()
+	meter
+		.f64_histogram(name)
+		.with_unit("s")
+		.with_boundaries(DURATION_HISTOGRAM_BOUNDARIES.to_vec())
+		.build()
 }
 
 fn status_class(status: u16) -> &'static str {
@@ -6907,6 +6918,24 @@ mod metrics_tests {
 		] {
 			assert!(names.contains(name), "missing metric: {name}");
 		}
+		let request_duration = metrics
+			.iter()
+			.find(|metric| metric.name() == "media_proxy_request_duration")
+			.expect("request duration histogram");
+		let AggregatedMetrics::F64(MetricData::Histogram(request_duration)) =
+			request_duration.data()
+		else {
+			panic!("request duration should export as an f64 histogram");
+		};
+		assert_eq!(
+			request_duration
+				.data_points()
+				.next()
+				.expect("request duration data point")
+				.bounds()
+				.collect::<Vec<_>>(),
+			DURATION_HISTOGRAM_BOUNDARIES
+		);
 		let requests = metrics
 			.iter()
 			.find(|metric| metric.name() == "media_proxy_requests_total")
