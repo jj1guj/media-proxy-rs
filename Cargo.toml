@@ -23,6 +23,7 @@ futures-util = { version = "0.3", default-features = false, features = [
     "std",
 ] }
 foyer = { version = "=0.22.6", features = ["serde"] }
+mixtrics = "=0.2.5"
 headers = "^0.4.1"
 serde = { version = "^1.0.229", features = ["derive"] }
 serde_json = "1"

@@ -2786,6 +2786,75 @@
         }
       }
     },
+    "panel-30": {
+      "kind": "Panel",
+      "spec": {
+        "data": {
+          "kind": "QueryGroup",
+          "spec": {
+            "queries": [
+              {
+                "kind": "PanelQuery",
+                "spec": {
+                  "hidden": false,
+                  "query": {
+                    "datasource": {
+                      "name": "$prometheus"
+                    },
+                    "group": "prometheus",
+                    "kind": "DataQuery",
+                    "spec": {
+                      "editorMode": "code",
+                      "expr": "sum by (name, instance) (foyer_storage_block_engine_block{name=\"source\", type!=\"clean\"}) * on (name, instance) max by (name, instance) (foyer_storage_block_engine_block_size_bytes{name=\"source\"})",
+                      "legendFormat": "{{instance}} used",
+                      "range": true
+                    },
+                    "version": "v0"
+                  },
+                  "refId": "A"
+                }
+              }
+            ],
+            "queryOptions": {},
+            "transformations": []
+          }
+        },
+        "description": "Occupied source cache blocks. Includes writing, evictable, and reclaiming blocks, so invalid bytes awaiting reclaim are included.",
+        "id": 30,
+        "links": [],
+        "title": "Source cache usage",
+        "vizConfig": {
+          "group": "timeseries",
+          "kind": "VizConfig",
+          "spec": {
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "palette-classic"
+                },
+                "unit": "bytes"
+              },
+              "overrides": []
+            },
+            "options": {
+              "legend": {
+                "calcs": [
+                  "lastNotNull"
+                ],
+                "displayMode": "table",
+                "placement": "bottom",
+                "showLegend": true
+              },
+              "tooltip": {
+                "mode": "multi",
+                "sort": "desc"
+              }
+            }
+          },
+          "version": "12.2.0"
+        }
+      }
+    },
     "panel-31": {
       "kind": "Panel",
       "spec": {
@@ -3122,11 +3191,24 @@
                     "spec": {
                       "element": {
                         "kind": "ElementReference",
+                        "name": "panel-30"
+                      },
+                      "height": 10,
+                      "width": 8,
+                      "x": 0,
+                      "y": 10
+                    }
+                  },
+                  {
+                    "kind": "GridLayoutItem",
+                    "spec": {
+                      "element": {
+                        "kind": "ElementReference",
                         "name": "panel-31"
                       },
                       "height": 10,
-                      "width": 12,
-                      "x": 0,
+                      "width": 8,
+                      "x": 8,
                       "y": 10
                     }
                   },
@@ -3138,8 +3220,8 @@
                         "name": "panel-32"
                       },
                       "height": 10,
-                      "width": 12,
-                      "x": 12,
+                      "width": 8,
+                      "x": 16,
                       "y": 10
                     }
                   },

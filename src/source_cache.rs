@@ -1,4 +1,5 @@
 use foyer::{BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, RecoverMode};
+use mixtrics::metrics::BoxedRegistry;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +66,7 @@ impl SourceCache {
 		max_entry_bytes: usize,
 		fresh_for: Duration,
 		stale_for: Duration,
+		metrics_registry: Option<BoxedRegistry>,
 	) -> foyer::Result<Self> {
 		let device = FsDeviceBuilder::new(path)
 			.with_capacity(capacity_bytes)
@@ -74,8 +76,11 @@ impl SourceCache {
 			.with_buffer_pool_size(BUFFER_POOL_SIZE)
 			.with_submit_queue_size_threshold(BUFFER_POOL_SIZE * 2)
 			.with_tombstone_log(true);
-		let cache = HybridCache::builder()
-			.with_name("source")
+		let mut builder = HybridCache::builder().with_name("source");
+		if let Some(metrics_registry) = metrics_registry {
+			builder = builder.with_metrics_registry(metrics_registry);
+		}
+		let cache = builder
 			.memory(1)
 			.storage()
 			.with_engine_config(engine)
@@ -173,6 +178,9 @@ fn classify_age(fetched_at_ms: u64, now_ms: u64, fresh_for: Duration, stale_for:
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use opentelemetry::metrics::MeterProvider as _;
+	use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
+	use std::collections::HashSet;
 	use std::sync::atomic::{AtomicU64, Ordering};
 
 	static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
@@ -199,6 +207,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn stores_and_reads_disk_only_entry() {
+		let exporter = InMemoryMetricExporter::default();
+		let provider = SdkMeterProvider::builder()
+			.with_periodic_exporter(exporter.clone())
+			.build();
 		let path = std::env::temp_dir().join(format!(
 			"media-proxy-source-cache-{}-{}",
 			std::process::id(),
@@ -210,9 +222,23 @@ mod tests {
 			1024,
 			Duration::from_secs(60),
 			Duration::from_secs(60),
+			Some(crate::mixtrics_otel::registry(provider.meter("foyer-test"))),
 		)
 		.await
 		.unwrap();
+		provider.force_flush().expect("foyer metrics should flush");
+		let exports = exporter
+			.get_finished_metrics()
+			.expect("foyer metrics should be exported");
+		let names = exports
+			.last()
+			.expect("one foyer metrics export")
+			.scope_metrics()
+			.flat_map(|scope| scope.metrics())
+			.map(|metric| metric.name())
+			.collect::<HashSet<_>>();
+		assert!(names.contains("foyer_storage_block_engine_block"));
+		assert!(names.contains("foyer_storage_block_engine_block_size_bytes"));
 		let entry = SourceEntry::new(200, Some("image/png".to_owned()), None, vec![1, 2, 3]);
 
 		assert!(cache.put("https://example.com/image.png".to_owned(), entry));

@@ -25,6 +25,7 @@ mod browsersafe;
 mod cache;
 mod image_test;
 mod img;
+mod mixtrics_otel;
 mod mng;
 mod source_cache;
 mod ssrf;
@@ -2817,6 +2818,9 @@ fn main() {
 			max_entry_bytes,
 			Duration::from_secs(config.source_cache_ttl_secs),
 			Duration::from_secs(config.source_cache_stale_secs),
+			meter_provider
+				.as_ref()
+				.map(|provider| mixtrics_otel::registry(provider.meter("media-proxy-rs.foyer"))),
 		)) {
 			Ok(cache) => Some(Arc::new(cache)),
 			Err(error) => {
