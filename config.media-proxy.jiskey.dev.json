@@ -15,7 +15,7 @@
   "encode_avif": false,
   "slow_log_ms": 50,
   "enable_cache": true,
-  "cache_max_bytes": 1073741824,
+  "cache_max_bytes": 2147483648,
   "cache_entry_max_bytes": 5242880,
   "cache_ttl_secs": 43200,
   "negative_cache_404_ttl_secs": 3600,
