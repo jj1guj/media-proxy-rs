@@ -240,7 +240,7 @@ source cacheは要求元URLをキーに200レスポンスの本文を保存し�
 
 source cache参照結果の`result`は`fresh`、`stale`、`miss`、`error`、書込み結果は`accepted`、`rejected`です。source stale救済は`result=served|failed`と`reason=dns|network|throttle|429|5xx|body`で記録します。URLやホスト名は属性に含めません。
 
-OTLPが有効な場合、source cacheはfoyerの内部メトリクスも`name="source"`付きで送信します。ディスク使用量は、空きではないブロック数とブロックサイズから`sum(foyer_storage_block_engine_block{name="source",type!="clean"}) * max(foyer_storage_block_engine_block_size_bytes{name="source"})`で算出できます。この値はブロック単位の占有量であり、reclaim待ちの無効データも含みます。
+OTLPが有効な場合、source cacheはfoyerの内部メトリクスも`name="source"`付きで送信します。`foyer_storage_block_engine_block`の`type`は、空きblockの`clean`、書込み中の`writing`、書込み済みの`evictable`、回収中の`reclaiming`です。状態別block数は書込みやreclaimの動作確認に使いますが、有効な画像データ量を表すものではありません。
 
 出力形式の属性 `format` は `jpeg`、`png`、`webp`、`avif`、`other` の5種類です。圧縮率は `media_proxy_output_bytes_total / media_proxy_input_bytes_total`、パススルー率は `media_proxy_passthrough_total / media_proxy_requests_total` で算出します。処理エラーの `category` は `decode`、`encode`、`policy`、`size`、`internal`、fetchエラーは `dns`、`connect`、`timeout`、`reset`、`body`、`throttle`、`other` の固定分類です。流量制御結果の`result`は`passed`、`waited`、`rejected`の3種類で、ホスト名は属性に含めません。
 

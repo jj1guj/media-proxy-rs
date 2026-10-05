@@ -2805,8 +2805,8 @@
                     "kind": "DataQuery",
                     "spec": {
                       "editorMode": "code",
-                      "expr": "sum by (name, instance) (foyer_storage_block_engine_block{name=\"source\", type!=\"clean\"}) * on (name, instance) max by (name, instance) (foyer_storage_block_engine_block_size_bytes{name=\"source\"})",
-                      "legendFormat": "{{instance}} used",
+                      "expr": "sum by (instance, type) (foyer_storage_block_engine_block{name=\"source\"})",
+                      "legendFormat": "{{instance}} {{type}}",
                       "range": true
                     },
                     "version": "v0"
@@ -2819,10 +2819,10 @@
             "transformations": []
           }
         },
-        "description": "Occupied source cache blocks. Includes writing, evictable, and reclaiming blocks, so invalid bytes awaiting reclaim are included.",
+        "description": "Source cache blocks by lifecycle state. The stacked total is fixed capacity in blocks, not live image bytes.",
         "id": 30,
         "links": [],
-        "title": "Source cache usage",
+        "title": "Source cache block states",
         "vizConfig": {
           "group": "timeseries",
           "kind": "VizConfig",
@@ -2832,7 +2832,15 @@
                 "color": {
                   "mode": "palette-classic"
                 },
-                "unit": "bytes"
+                "custom": {
+                  "fillOpacity": 35,
+                  "lineWidth": 1,
+                  "stacking": {
+                    "group": "A",
+                    "mode": "normal"
+                  }
+                },
+                "unit": "short"
               },
               "overrides": []
             },
