@@ -51,6 +51,30 @@ const PROACTIVE_SHADOW_UNSAFE_RATE_MARGIN: f64 = 0.9;
 const PROACTIVE_SHADOW_REQUIRED_QUALIFIED_WINDOWS: u32 = 3;
 const PROACTIVE_SHADOW_FALLBACK_MIN_QUALIFIED_SAMPLES: u64 = 1_000;
 
+fn default_proactive_target_reject_ratio() -> f64 {
+	0.01
+}
+
+fn default_proactive_burst_recovery_quiet_period_secs() -> u64 {
+	21_600
+}
+
+fn default_proactive_rate_recovery_quiet_period_secs() -> u64 {
+	86_400
+}
+
+fn default_proactive_recovery_min_samples() -> u64 {
+	1_000
+}
+
+fn default_proactive_burst_increase_step() -> u32 {
+	1
+}
+
+fn default_proactive_estimated_limit_increase_step() -> f64 {
+	0.05
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProactiveThrottleMode {
@@ -60,6 +84,8 @@ enum ProactiveThrottleMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProactiveHostConfig {
 	initial_requests_per_second: f64,
+	#[serde(default)]
+	initial_estimated_limit: Option<f64>,
 	min_requests_per_second: f64,
 	max_requests_per_second: f64,
 	burst: u32,
@@ -67,6 +93,18 @@ struct ProactiveHostConfig {
 	increase_step: f64,
 	increase_interval_secs: u64,
 	quiet_period_secs: u64,
+	#[serde(default = "default_proactive_target_reject_ratio")]
+	target_reject_ratio: f64,
+	#[serde(default = "default_proactive_burst_recovery_quiet_period_secs")]
+	burst_recovery_quiet_period_secs: u64,
+	#[serde(default = "default_proactive_rate_recovery_quiet_period_secs")]
+	rate_recovery_quiet_period_secs: u64,
+	#[serde(default = "default_proactive_recovery_min_samples")]
+	recovery_min_samples: u64,
+	#[serde(default = "default_proactive_burst_increase_step")]
+	burst_increase_step: u32,
+	#[serde(default = "default_proactive_estimated_limit_increase_step")]
+	estimated_limit_increase_step: f64,
 	mode: ProactiveThrottleMode,
 }
 
@@ -99,7 +137,9 @@ struct HostThrottleWindow {
 	shadow_passed: u64,
 	shadow_passed_2xx: u64,
 	shadow_waited: u64,
+	shadow_waited_2xx: u64,
 	shadow_rejected: u64,
+	shadow_rejected_2xx: u64,
 	shadow_wait_ms: u64,
 	shadow_queue_peak: usize,
 }
@@ -111,6 +151,7 @@ struct ProactiveShadowState {
 	tokens: f64,
 	last_refill: Instant,
 	stable_since: Instant,
+	last_any_429: Instant,
 	cooldown_until: Instant,
 	last_increase: Instant,
 	last_burst_adjustment: Instant,
@@ -121,6 +162,9 @@ struct ProactiveShadowState {
 	burst_bucket_started: Instant,
 	burst_bucket_count: u32,
 	burst_samples: VecDeque<u32>,
+	recovery_sample_count: u64,
+	recovery_rejected: u64,
+	recovery_constrained_2xx: u64,
 }
 
 struct HostThrottleState {
@@ -217,7 +261,9 @@ struct HostThrottleObservation {
 	shadow_passed: u64,
 	shadow_passed_2xx: u64,
 	shadow_waited: u64,
+	shadow_waited_2xx: u64,
 	shadow_rejected: u64,
+	shadow_rejected_2xx: u64,
 	shadow_wait_ms: u64,
 	shadow_queue_peak: usize,
 	shadow_rate_per_second: f64,
@@ -257,15 +303,21 @@ impl HostThrottle {
 					"host_throttle.proactive_hosts contains duplicate normalized host: {host}"
 				));
 			}
+			let initial_estimated_limit = proactive
+				.initial_estimated_limit
+				.unwrap_or(proactive.max_requests_per_second);
 			if !proactive.initial_requests_per_second.is_finite()
+				|| !initial_estimated_limit.is_finite()
 				|| !proactive.min_requests_per_second.is_finite()
 				|| !proactive.max_requests_per_second.is_finite()
 				|| proactive.min_requests_per_second <= 0.0
 				|| proactive.initial_requests_per_second < proactive.min_requests_per_second
 				|| proactive.initial_requests_per_second > proactive.max_requests_per_second
+				|| initial_estimated_limit < proactive.initial_requests_per_second
+				|| initial_estimated_limit > proactive.max_requests_per_second
 			{
 				return Err(format!(
-					"host_throttle.proactive_hosts.{host} rates must satisfy 0 < min <= initial <= max"
+					"host_throttle.proactive_hosts.{host} rates must satisfy 0 < min <= initial <= initial estimated limit <= max"
 				));
 			}
 			if proactive.burst == 0 {
@@ -289,6 +341,25 @@ impl HostThrottle {
 			if proactive.increase_interval_secs == 0 || proactive.quiet_period_secs == 0 {
 				return Err(format!(
 					"host_throttle.proactive_hosts.{host} intervals must be greater than 0"
+				));
+			}
+			if !proactive.target_reject_ratio.is_finite()
+				|| proactive.target_reject_ratio < 0.0
+				|| proactive.target_reject_ratio >= 1.0
+			{
+				return Err(format!(
+					"host_throttle.proactive_hosts.{host}.target_reject_ratio must be between 0 (inclusive) and 1 (exclusive)"
+				));
+			}
+			if proactive.burst_recovery_quiet_period_secs == 0
+				|| proactive.rate_recovery_quiet_period_secs == 0
+				|| proactive.recovery_min_samples == 0
+				|| proactive.burst_increase_step == 0
+				|| !proactive.estimated_limit_increase_step.is_finite()
+				|| proactive.estimated_limit_increase_step <= 0.0
+			{
+				return Err(format!(
+					"host_throttle.proactive_hosts.{host} recovery settings must be greater than 0"
 				));
 			}
 			proactive_hosts.insert(host, proactive.clone());
@@ -363,12 +434,15 @@ impl HostThrottle {
 			.entry(host.to_owned())
 			.or_insert_with(|| HostThrottleState {
 				proactive_shadow: self.proactive_hosts.get(host).map(|config| {
+					let initial_estimated_limit = config
+						.initial_estimated_limit
+						.unwrap_or(config.max_requests_per_second);
 					tracing::info!(
 						host,
 						old_safe_rate = 0.0,
 						new_safe_rate = config.initial_requests_per_second,
 						old_estimated_limit = 0.0,
-						new_estimated_limit = config.max_requests_per_second,
+						new_estimated_limit = initial_estimated_limit,
 						old_burst = 0,
 						new_burst = config.burst,
 						confidence = 0.0,
@@ -381,11 +455,12 @@ impl HostThrottle {
 					);
 					ProactiveShadowState {
 						rate_per_second: config.initial_requests_per_second,
-						estimated_limit: config.max_requests_per_second,
+						estimated_limit: initial_estimated_limit,
 						learned_burst: config.burst,
 						tokens: f64::from(config.burst),
 						last_refill: now,
 						stable_since: now,
+						last_any_429: now,
 						cooldown_until: now,
 						last_increase: now,
 						last_burst_adjustment: now,
@@ -396,6 +471,9 @@ impl HostThrottle {
 						burst_bucket_started: now,
 						burst_bucket_count: 0,
 						burst_samples: VecDeque::with_capacity(300),
+						recovery_sample_count: 0,
+						recovery_rejected: 0,
+						recovery_constrained_2xx: 0,
 					}
 				}),
 				tokens: self.burst,
@@ -506,6 +584,14 @@ impl HostThrottle {
 			decisions as f64 / available_requests
 		};
 		let has_load_evidence = constrained > 0 || utilization >= PROACTIVE_SHADOW_MIN_UTILIZATION;
+		shadow.recovery_sample_count = shadow.recovery_sample_count.saturating_add(decisions);
+		shadow.recovery_rejected = shadow
+			.recovery_rejected
+			.saturating_add(window.shadow_rejected);
+		shadow.recovery_constrained_2xx = shadow
+			.recovery_constrained_2xx
+			.saturating_add(window.shadow_waited_2xx)
+			.saturating_add(window.shadow_rejected_2xx);
 		if has_load_evidence {
 			shadow.qualified_sample_count = shadow
 				.qualified_sample_count
@@ -524,25 +610,62 @@ impl HostThrottle {
 		let old_burst = shadow.learned_burst;
 		let mut reason = "stable_increase";
 		let adjustment_interval = Duration::from_secs(config.increase_interval_secs);
+		let reject_ratio = if shadow.recovery_sample_count == 0 {
+			0.0
+		} else {
+			shadow.recovery_rejected as f64 / shadow.recovery_sample_count as f64
+		};
+		let has_reject_pressure = shadow.recovery_sample_count >= config.recovery_min_samples
+			&& reject_ratio > config.target_reject_ratio
+			&& shadow.recovery_constrained_2xx > 0;
+		let mut observed_burst_target = shadow.learned_burst;
 
-		if shadow.burst_samples.len() >= 10
-			&& now.duration_since(shadow.last_burst_adjustment) >= adjustment_interval
-		{
+		if shadow.burst_samples.len() >= 10 {
 			let mut samples: Vec<u32> = shadow.burst_samples.iter().copied().collect();
 			samples.sort_unstable();
 			let index = ((samples.len() - 1) * 95) / 100;
 			let max_burst = u32::try_from(queue_capacity).unwrap_or(u32::MAX).max(1);
-			let target = ((f64::from(samples[index]) * 1.25).ceil() as u32).clamp(1, max_burst);
-			if shadow.rate_limit_episodes == 0 && target >= shadow.learned_burst.saturating_add(2) {
-				shadow.learned_burst = target;
-				reason = "observed_burst";
+			observed_burst_target =
+				((f64::from(samples[index]) * 1.25).ceil() as u32).clamp(1, max_burst);
+			if has_reject_pressure
+				&& now.duration_since(shadow.last_any_429)
+					>= Duration::from_secs(config.burst_recovery_quiet_period_secs)
+				&& now.duration_since(shadow.last_burst_adjustment) >= adjustment_interval
+				&& observed_burst_target > shadow.learned_burst
+			{
+				shadow.learned_burst = shadow
+					.learned_burst
+					.saturating_add(config.burst_increase_step)
+					.min(observed_burst_target)
+					.min(max_burst);
+				shadow.last_burst_adjustment = now;
+				shadow.recovery_sample_count = 0;
+				shadow.recovery_rejected = 0;
+				shadow.recovery_constrained_2xx = 0;
+				reason = "reject_pressure_burst_probe";
 			} else if shadow.burst_samples.len() >= 60
-				&& target.saturating_add(2) < shadow.learned_burst
+				&& now.duration_since(shadow.last_burst_adjustment) >= adjustment_interval
+				&& observed_burst_target.saturating_add(2) < shadow.learned_burst
 			{
 				shadow.learned_burst = shadow.learned_burst.saturating_sub(1).max(1);
+				shadow.last_burst_adjustment = now;
 				reason = "observed_burst";
 			}
-			shadow.last_burst_adjustment = now;
+		}
+
+		if has_reject_pressure
+			&& shadow.recovery_sample_count >= config.recovery_min_samples
+			&& observed_burst_target <= shadow.learned_burst
+			&& now.duration_since(shadow.last_any_429)
+				>= Duration::from_secs(config.rate_recovery_quiet_period_secs)
+		{
+			shadow.estimated_limit = (shadow.estimated_limit
+				+ config.estimated_limit_increase_step)
+				.min(config.max_requests_per_second);
+			shadow.recovery_sample_count = 0;
+			shadow.recovery_rejected = 0;
+			shadow.recovery_constrained_2xx = 0;
+			reason = "reject_pressure_rate_probe";
 		}
 
 		if window.shadow_passed_2xx > 0
@@ -630,19 +753,39 @@ impl HostThrottle {
 		incident_cooldown: Duration,
 		decision: Option<ProactiveShadowDecision>,
 	) {
-		if config.mode != ProactiveThrottleMode::Shadow
-			|| decision != Some(ProactiveShadowDecision::Pass)
-		{
+		if config.mode != ProactiveThrottleMode::Shadow || decision.is_none() {
 			return;
 		}
 		if status.is_success() {
-			state.window.shadow_passed_2xx = state.window.shadow_passed_2xx.saturating_add(1);
+			match decision {
+				Some(ProactiveShadowDecision::Pass) => {
+					state.window.shadow_passed_2xx =
+						state.window.shadow_passed_2xx.saturating_add(1);
+				}
+				Some(ProactiveShadowDecision::Wait) => {
+					state.window.shadow_waited_2xx =
+						state.window.shadow_waited_2xx.saturating_add(1);
+				}
+				Some(ProactiveShadowDecision::Reject) => {
+					state.window.shadow_rejected_2xx =
+						state.window.shadow_rejected_2xx.saturating_add(1);
+				}
+				None => {}
+			}
 		}
 		let Some(shadow) = &mut state.proactive_shadow else {
 			return;
 		};
 		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			shadow.last_any_429 = now;
 			shadow.stable_since = now;
+			shadow.recovery_sample_count = 0;
+			shadow.recovery_rejected = 0;
+			shadow.recovery_constrained_2xx = 0;
+			shadow.burst_samples.clear();
+			if decision != Some(ProactiveShadowDecision::Pass) {
+				return;
+			}
 			if now >= shadow.cooldown_until {
 				let old_rate = shadow.rate_per_second;
 				let old_estimated_limit = shadow.estimated_limit;
@@ -734,7 +877,9 @@ impl HostThrottle {
 				shadow_passed: window.shadow_passed,
 				shadow_passed_2xx: window.shadow_passed_2xx,
 				shadow_waited: window.shadow_waited,
+				shadow_waited_2xx: window.shadow_waited_2xx,
 				shadow_rejected: window.shadow_rejected,
+				shadow_rejected_2xx: window.shadow_rejected_2xx,
 				shadow_wait_ms: window.shadow_wait_ms,
 				shadow_queue_peak: window.shadow_queue_peak,
 				shadow_rate_per_second: shadow.map_or(0.0, |shadow| shadow.rate_per_second),
@@ -1703,10 +1848,10 @@ fn record_resource_metrics(
 }
 
 const DURATION_HISTOGRAM_BOUNDARIES: &[f64] = &[
-	0.0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01, 0.02, 0.03,
-	0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7,
-	0.8, 0.9, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
-	12.5, 15.0, 20.0, 25.0, 35.0, 50.0, 75.0, 100.0, 150.0, 250.0,
+	0.0, 0.001, 0.002, 0.003, 0.004, 0.005, 0.006, 0.007, 0.008, 0.009, 0.01, 0.02, 0.03, 0.04,
+	0.05, 0.06, 0.07, 0.08, 0.09, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+	1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.5, 15.0, 20.0, 25.0, 35.0,
+	50.0, 75.0, 100.0, 150.0, 250.0,
 ];
 
 fn duration_histogram(meter: &opentelemetry::metrics::Meter, name: &'static str) -> Histogram<f64> {
@@ -2901,7 +3046,9 @@ fn main() {
 								shadow_passed = observation.shadow_passed,
 								shadow_passed_2xx = observation.shadow_passed_2xx,
 								shadow_waited = observation.shadow_waited,
+								shadow_waited_2xx = observation.shadow_waited_2xx,
 								shadow_rejected = observation.shadow_rejected,
+								shadow_rejected_2xx = observation.shadow_rejected_2xx,
 								shadow_wait_ms = observation.shadow_wait_ms,
 								shadow_queue_peak = observation.shadow_queue_peak as u64,
 								shadow_rate_per_second = observation.shadow_rate_per_second,
@@ -7167,6 +7314,7 @@ mod network_policy_tests {
 	fn proactive_host_config() -> ProactiveHostConfig {
 		ProactiveHostConfig {
 			initial_requests_per_second: 2.0,
+			initial_estimated_limit: None,
 			min_requests_per_second: 0.5,
 			max_requests_per_second: 2.5,
 			burst: 1,
@@ -7174,6 +7322,12 @@ mod network_policy_tests {
 			increase_step: 0.1,
 			increase_interval_secs: 60,
 			quiet_period_secs: 120,
+			target_reject_ratio: 0.01,
+			burst_recovery_quiet_period_secs: 21_600,
+			rate_recovery_quiet_period_secs: 86_400,
+			recovery_min_samples: 1_000,
+			burst_increase_step: 1,
+			estimated_limit_increase_step: 0.05,
 			mode: ProactiveThrottleMode::Shadow,
 		}
 	}
@@ -7402,6 +7556,9 @@ mod network_policy_tests {
 		runtime.block_on(async {
 			let mut config = throttle_config("media.example");
 			config.queue_capacity = 256;
+			let proactive = config.proactive_hosts.get_mut("media.example").unwrap();
+			proactive.burst_recovery_quiet_period_secs = 1;
+			proactive.recovery_min_samples = 1;
 			let throttle = HostThrottle::new(&config).unwrap();
 			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
 			throttle
@@ -7414,9 +7571,12 @@ mod network_policy_tests {
 				state.window.responses_2xx = 10;
 				state.window.shadow_passed_2xx = 10;
 				state.window.shadow_waited = 8;
+				state.window.shadow_waited_2xx = 8;
 				state.window.shadow_rejected = 2;
+				state.window.shadow_rejected_2xx = 2;
 				let shadow = state.proactive_shadow.as_mut().unwrap();
 				shadow.stable_since = Instant::now() - Duration::from_secs(121);
+				shadow.last_any_429 = Instant::now() - Duration::from_secs(2);
 				shadow.last_increase = Instant::now() - Duration::from_secs(61);
 				shadow.last_burst_adjustment = Instant::now() - Duration::from_secs(61);
 				shadow.qualified_windows_since_increase = 2;
@@ -7427,7 +7587,7 @@ mod network_policy_tests {
 			let states = throttle.states.lock().await;
 			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
 			assert_eq!(shadow.rate_per_second, 2.1);
-			assert_eq!(shadow.learned_burst, 10);
+			assert_eq!(shadow.learned_burst, 2);
 			assert_eq!(shadow.sample_count, 1);
 			assert_eq!(shadow.qualified_sample_count, 10);
 		});
@@ -7508,7 +7668,7 @@ mod network_policy_tests {
 	}
 
 	#[test]
-	fn proactive_shadow_ignores_429_from_rejected_virtual_request() {
+	fn proactive_shadow_rejected_429_freezes_recovery_without_decreasing_rate() {
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
 			.build()
@@ -7528,6 +7688,21 @@ mod network_policy_tests {
 				rejected.shadow_decision,
 				Some(ProactiveShadowDecision::Reject)
 			);
+			{
+				let mut states = throttle.states.lock().await;
+				let shadow = states
+					.get_mut("media.example")
+					.unwrap()
+					.proactive_shadow
+					.as_mut()
+					.unwrap();
+				shadow.stable_since = Instant::now() - Duration::from_secs(1_000);
+				shadow.last_any_429 = Instant::now() - Duration::from_secs(1_000);
+				shadow.recovery_sample_count = 100;
+				shadow.recovery_rejected = 50;
+				shadow.recovery_constrained_2xx = 50;
+				shadow.burst_samples = VecDeque::from(vec![5; 10]);
+			}
 
 			throttle
 				.observe_response_with_shadow(
@@ -7539,14 +7714,14 @@ mod network_policy_tests {
 				)
 				.await;
 			let states = throttle.states.lock().await;
-			assert_eq!(
-				states["media.example"]
-					.proactive_shadow
-					.as_ref()
-					.unwrap()
-					.rate_per_second,
-				2.0
-			);
+			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
+			assert_eq!(shadow.rate_per_second, 2.0);
+			assert_eq!(shadow.recovery_sample_count, 0);
+			assert_eq!(shadow.recovery_rejected, 0);
+			assert_eq!(shadow.recovery_constrained_2xx, 0);
+			assert!(shadow.burst_samples.is_empty());
+			assert!(shadow.stable_since.elapsed() < Duration::from_secs(1));
+			assert!(shadow.last_any_429.elapsed() < Duration::from_secs(1));
 			drop(states);
 
 			throttle
@@ -7567,6 +7742,51 @@ mod network_policy_tests {
 					.rate_per_second,
 				1.0
 			);
+		});
+	}
+
+	#[test]
+	fn proactive_shadow_recovers_estimated_limit_after_burst_is_sufficient() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut config = throttle_config("media.example");
+			let proactive = config.proactive_hosts.get_mut("media.example").unwrap();
+			proactive.initial_estimated_limit = Some(2.0);
+			proactive.burst = 10;
+			proactive.recovery_min_samples = 1;
+			proactive.rate_recovery_quiet_period_secs = 1;
+			let throttle = HostThrottle::new(&config).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle
+				.acquire(&target, Duration::from_secs(2))
+				.await
+				.unwrap();
+
+			{
+				let mut states = throttle.states.lock().await;
+				let state = states.get_mut("media.example").unwrap();
+				state.window.shadow_passed = 1;
+				state.window.shadow_passed_2xx = 1;
+				state.window.shadow_rejected = 2;
+				state.window.shadow_rejected_2xx = 2;
+				let shadow = state.proactive_shadow.as_mut().unwrap();
+				shadow.stable_since = Instant::now() - Duration::from_secs(121);
+				shadow.last_any_429 = Instant::now() - Duration::from_secs(2);
+				shadow.last_increase = Instant::now() - Duration::from_secs(61);
+				shadow.qualified_windows_since_increase = 2;
+				shadow.burst_samples = VecDeque::from(vec![1; 10]);
+			}
+
+			throttle.take_observations().await;
+			let states = throttle.states.lock().await;
+			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
+			assert_eq!(shadow.learned_burst, 10);
+			assert_eq!(shadow.estimated_limit, 2.05);
+			assert_eq!(shadow.rate_per_second, 2.05);
+			assert_eq!(shadow.recovery_sample_count, 0);
 		});
 	}
 
@@ -8052,9 +8272,12 @@ mod network_policy_tests {
 			.proactive_hosts
 			.get("media.misskeyusercontent.com")
 			.unwrap();
-		assert_eq!(proactive.initial_requests_per_second, 2.0);
+		assert_eq!(proactive.initial_requests_per_second, 0.6269500413189002);
+		assert_eq!(proactive.initial_estimated_limit, Some(0.6269500413189002));
 		assert_eq!(proactive.min_requests_per_second, 0.5);
 		assert_eq!(proactive.max_requests_per_second, 8.0);
+		assert_eq!(proactive.burst, 1);
+		assert_eq!(proactive.target_reject_ratio, 0.01);
 		assert_eq!(proactive.mode, ProactiveThrottleMode::Shadow);
 	}
 

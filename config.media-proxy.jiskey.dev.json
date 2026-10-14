@@ -42,14 +42,21 @@
     "observation_interval_ms": 10000,
     "proactive_hosts": {
       "media.misskeyusercontent.com": {
-        "initial_requests_per_second": 2.0,
+      "initial_requests_per_second": 0.6269500413189002,
+      "initial_estimated_limit": 0.6269500413189002,
         "min_requests_per_second": 0.5,
         "max_requests_per_second": 8.0,
-        "burst": 5,
+      "burst": 1,
         "decrease_factor": 0.7,
         "increase_step": 0.1,
         "increase_interval_secs": 60,
         "quiet_period_secs": 120,
+        "target_reject_ratio": 0.01,
+        "burst_recovery_quiet_period_secs": 21600,
+        "rate_recovery_quiet_period_secs": 86400,
+        "recovery_min_samples": 1000,
+        "burst_increase_step": 1,
+        "estimated_limit_increase_step": 0.05,
         "mode": "shadow"
       }
     }
