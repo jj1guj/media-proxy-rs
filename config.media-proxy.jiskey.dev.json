@@ -42,8 +42,8 @@
     "observation_interval_ms": 10000,
     "proactive_hosts": {
       "media.misskeyusercontent.com": {
-      "initial_requests_per_second": 0.6269500413189002,
-      "initial_estimated_limit": 0.6269500413189002,
+      "initial_requests_per_second": 0.5642550371870102,
+      "initial_estimated_limit": 0.5642550371870102,
         "min_requests_per_second": 0.5,
         "max_requests_per_second": 8.0,
       "burst": 1,

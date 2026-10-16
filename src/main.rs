@@ -151,7 +151,8 @@ struct ProactiveShadowState {
 	tokens: f64,
 	last_refill: Instant,
 	stable_since: Instant,
-	last_any_429: Instant,
+	last_burst_blocking_429: Instant,
+	last_rate_blocking_429: Instant,
 	cooldown_until: Instant,
 	last_increase: Instant,
 	last_burst_adjustment: Instant,
@@ -460,7 +461,8 @@ impl HostThrottle {
 						tokens: f64::from(config.burst),
 						last_refill: now,
 						stable_since: now,
-						last_any_429: now,
+						last_burst_blocking_429: now,
+						last_rate_blocking_429: now,
 						cooldown_until: now,
 						last_increase: now,
 						last_burst_adjustment: now,
@@ -628,7 +630,7 @@ impl HostThrottle {
 			observed_burst_target =
 				((f64::from(samples[index]) * 1.25).ceil() as u32).clamp(1, max_burst);
 			if has_reject_pressure
-				&& now.duration_since(shadow.last_any_429)
+				&& now.duration_since(shadow.last_burst_blocking_429)
 					>= Duration::from_secs(config.burst_recovery_quiet_period_secs)
 				&& now.duration_since(shadow.last_burst_adjustment) >= adjustment_interval
 				&& observed_burst_target > shadow.learned_burst
@@ -656,7 +658,7 @@ impl HostThrottle {
 		if has_reject_pressure
 			&& shadow.recovery_sample_count >= config.recovery_min_samples
 			&& observed_burst_target <= shadow.learned_burst
-			&& now.duration_since(shadow.last_any_429)
+			&& now.duration_since(shadow.last_rate_blocking_429)
 				>= Duration::from_secs(config.rate_recovery_quiet_period_secs)
 		{
 			shadow.estimated_limit = (shadow.estimated_limit
@@ -777,15 +779,20 @@ impl HostThrottle {
 			return;
 		};
 		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-			shadow.last_any_429 = now;
+			if decision == Some(ProactiveShadowDecision::Wait) {
+				shadow.last_rate_blocking_429 = now;
+				return;
+			}
+			if decision != Some(ProactiveShadowDecision::Pass) {
+				return;
+			}
+			shadow.last_burst_blocking_429 = now;
+			shadow.last_rate_blocking_429 = now;
 			shadow.stable_since = now;
 			shadow.recovery_sample_count = 0;
 			shadow.recovery_rejected = 0;
 			shadow.recovery_constrained_2xx = 0;
 			shadow.burst_samples.clear();
-			if decision != Some(ProactiveShadowDecision::Pass) {
-				return;
-			}
 			if now >= shadow.cooldown_until {
 				let old_rate = shadow.rate_per_second;
 				let old_estimated_limit = shadow.estimated_limit;
@@ -7576,7 +7583,8 @@ mod network_policy_tests {
 				state.window.shadow_rejected_2xx = 2;
 				let shadow = state.proactive_shadow.as_mut().unwrap();
 				shadow.stable_since = Instant::now() - Duration::from_secs(121);
-				shadow.last_any_429 = Instant::now() - Duration::from_secs(2);
+				shadow.last_burst_blocking_429 = Instant::now() - Duration::from_secs(2);
+				shadow.last_rate_blocking_429 = Instant::now() - Duration::from_secs(2);
 				shadow.last_increase = Instant::now() - Duration::from_secs(61);
 				shadow.last_burst_adjustment = Instant::now() - Duration::from_secs(61);
 				shadow.qualified_windows_since_increase = 2;
@@ -7668,7 +7676,7 @@ mod network_policy_tests {
 	}
 
 	#[test]
-	fn proactive_shadow_rejected_429_freezes_recovery_without_decreasing_rate() {
+	fn proactive_shadow_429_blocks_recovery_by_decision() {
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
 			.build()
@@ -7683,11 +7691,6 @@ mod network_policy_tests {
 				.await
 				.unwrap();
 			assert_eq!(passed.shadow_decision, Some(ProactiveShadowDecision::Pass));
-			let rejected = throttle.acquire(&target, Duration::ZERO).await.unwrap();
-			assert_eq!(
-				rejected.shadow_decision,
-				Some(ProactiveShadowDecision::Reject)
-			);
 			{
 				let mut states = throttle.states.lock().await;
 				let shadow = states
@@ -7697,7 +7700,8 @@ mod network_policy_tests {
 					.as_mut()
 					.unwrap();
 				shadow.stable_since = Instant::now() - Duration::from_secs(1_000);
-				shadow.last_any_429 = Instant::now() - Duration::from_secs(1_000);
+				shadow.last_burst_blocking_429 = Instant::now() - Duration::from_secs(1_000);
+				shadow.last_rate_blocking_429 = Instant::now() - Duration::from_secs(1_000);
 				shadow.recovery_sample_count = 100;
 				shadow.recovery_rejected = 50;
 				shadow.recovery_constrained_2xx = 50;
@@ -7710,18 +7714,37 @@ mod network_policy_tests {
 					reqwest::StatusCode::TOO_MANY_REQUESTS,
 					&headers,
 					false,
-					rejected.shadow_decision,
+					Some(ProactiveShadowDecision::Reject),
 				)
 				.await;
 			let states = throttle.states.lock().await;
 			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
 			assert_eq!(shadow.rate_per_second, 2.0);
-			assert_eq!(shadow.recovery_sample_count, 0);
-			assert_eq!(shadow.recovery_rejected, 0);
-			assert_eq!(shadow.recovery_constrained_2xx, 0);
-			assert!(shadow.burst_samples.is_empty());
-			assert!(shadow.stable_since.elapsed() < Duration::from_secs(1));
-			assert!(shadow.last_any_429.elapsed() < Duration::from_secs(1));
+			assert_eq!(shadow.recovery_sample_count, 100);
+			assert_eq!(shadow.recovery_rejected, 50);
+			assert_eq!(shadow.recovery_constrained_2xx, 50);
+			assert_eq!(shadow.burst_samples.len(), 10);
+			assert!(shadow.stable_since.elapsed() >= Duration::from_secs(1_000));
+			assert!(shadow.last_burst_blocking_429.elapsed() >= Duration::from_secs(1_000));
+			assert!(shadow.last_rate_blocking_429.elapsed() >= Duration::from_secs(1_000));
+			drop(states);
+
+			throttle
+				.observe_response_with_shadow(
+					&target,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					&headers,
+					false,
+					Some(ProactiveShadowDecision::Wait),
+				)
+				.await;
+			let states = throttle.states.lock().await;
+			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
+			assert_eq!(shadow.rate_per_second, 2.0);
+			assert_eq!(shadow.recovery_sample_count, 100);
+			assert_eq!(shadow.burst_samples.len(), 10);
+			assert!(shadow.last_burst_blocking_429.elapsed() >= Duration::from_secs(1_000));
+			assert!(shadow.last_rate_blocking_429.elapsed() < Duration::from_secs(1));
 			drop(states);
 
 			throttle
@@ -7734,14 +7757,13 @@ mod network_policy_tests {
 				)
 				.await;
 			let states = throttle.states.lock().await;
-			assert_eq!(
-				states["media.example"]
-					.proactive_shadow
-					.as_ref()
-					.unwrap()
-					.rate_per_second,
-				1.0
-			);
+			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
+			assert_eq!(shadow.rate_per_second, 1.0);
+			assert_eq!(shadow.recovery_sample_count, 0);
+			assert!(shadow.burst_samples.is_empty());
+			assert!(shadow.stable_since.elapsed() < Duration::from_secs(1));
+			assert!(shadow.last_burst_blocking_429.elapsed() < Duration::from_secs(1));
+			assert!(shadow.last_rate_blocking_429.elapsed() < Duration::from_secs(1));
 		});
 	}
 
@@ -7774,7 +7796,8 @@ mod network_policy_tests {
 				state.window.shadow_rejected_2xx = 2;
 				let shadow = state.proactive_shadow.as_mut().unwrap();
 				shadow.stable_since = Instant::now() - Duration::from_secs(121);
-				shadow.last_any_429 = Instant::now() - Duration::from_secs(2);
+				shadow.last_burst_blocking_429 = Instant::now() - Duration::from_secs(2);
+				shadow.last_rate_blocking_429 = Instant::now() - Duration::from_secs(2);
 				shadow.last_increase = Instant::now() - Duration::from_secs(61);
 				shadow.qualified_windows_since_increase = 2;
 				shadow.burst_samples = VecDeque::from(vec![1; 10]);
@@ -8272,8 +8295,8 @@ mod network_policy_tests {
 			.proactive_hosts
 			.get("media.misskeyusercontent.com")
 			.unwrap();
-		assert_eq!(proactive.initial_requests_per_second, 0.6269500413189002);
-		assert_eq!(proactive.initial_estimated_limit, Some(0.6269500413189002));
+		assert_eq!(proactive.initial_requests_per_second, 0.5642550371870102);
+		assert_eq!(proactive.initial_estimated_limit, Some(0.5642550371870102));
 		assert_eq!(proactive.min_requests_per_second, 0.5);
 		assert_eq!(proactive.max_requests_per_second, 8.0);
 		assert_eq!(proactive.burst, 1);
