@@ -194,6 +194,12 @@ source cacheは要求元URLをキーに200レスポンスの本文を保存し�
 
 実効レート、推定上限、burstが変化した場合は`proactive_learning_adjusted`ログを出力します。`old_safe_rate`、`new_safe_rate`、`old_estimated_limit`、`new_estimated_limit`、`old_burst`、`new_burst`、`confidence`、`sample_count`、`qualified_sample_count`、`qualified_windows_since_increase`、`rate_limit_episodes`、`reason`で変更内容と理由を確認できます。`confidence`は総要求数ではなく、上記の負荷条件を満たした窓で仮想的に即時通過し、実際に2xxとなった`qualified_sample_count`を観測量として計算します。`host_throttle_window`の`shadow_passed`、`shadow_passed_2xx`、`shadow_waited`、`shadow_rejected`は即時通過、即時通過後の2xx、待機後通過、拒否になる仮想判定数です。`shadow_wait_ms`は予測待機時間の合計、`shadow_queue_peak`は仮想最大待機数、`shadow_rate_per_second`と`shadow_tokens`は現在の学習状態です。
 
+回復条件の診断は`proactive_recovery_deferred`ログで確認できます。要求・2xx応答・429応答のある観測窓で、ホストごとに最大60秒に1回出力します。`phase=before_adjustment`は学習値を変更する前の判定です。`burst_blockers`はburst拡張、`rate_limit_blockers`は推定上限の引き上げ、`safe_rate_blockers`は現在レートの回復を妨げる条件をカンマ区切りですべて列挙します。`eligible`はその時点で阻害条件がないことを示し、変更の実行結果は`proactive_learning_adjusted`で確認します。
+
+主な理由は`quiet_period`（Pass側429後の安定期間不足）、`insufficient_recovery_samples`（回復サンプル不足）、`reject_pressure_below_target`（Reject率が目標を超えていない）、`no_constrained_2xx`（Wait/Reject側の2xx根拠なし）、`insufficient_burst_samples`（burstサンプル10個未満）、`burst_429_quiet_period`（burst回復用の無Pass側429期間不足）、`rate_429_quiet_period`（rate回復用の無Pass/Wait側429期間不足）、`burst_recovery_pending`（burst拡張を優先）、`burst_target_reached`（観測burst目標に到達）、`estimated_limit_reached`（現在レートが推定上限に到達）、`max_rate_reached`（設定上限に到達）です。通常のレート回復では`no_passed_2xx`、`no_load_evidence`、`insufficient_qualified_windows`、`increase_interval`も記録し、burst調整の間隔不足は`burst_adjustment_interval`で示します。
+
+ログには現在・必要サンプル数、Reject率と目標、制限対象の2xx数、burst目標、適格窓数、負荷根拠、および`quiet_remaining_secs`・`burst_quiet_remaining_secs`・`rate_quiet_remaining_secs`・`burst_adjustment_remaining_secs`・`increase_remaining_secs`を併記します。複数の阻害条件がある場合は、一つのタイマーが満了しても他の条件を満たすまで回復しません。直前にburst拡張した場合は回復サンプルをリセットするため、同じ窓での推定上限の引き上げは行いません。
+
 上流の404/410は正規化した元URL単位でネガティブキャッシュされ、異なる画像変換からの再取得も抑止します。期限切れエントリは返さず、Rangeリクエストと429を含むその他のステータスは保存しません。ヒットはリクエストログと`media_proxy_cache_requests_total`の`result=negative`、保持件数は定期統計ログの`negative_cache_entries`で確認できます。
 
 ### OTLP基本メトリクス

@@ -247,6 +247,7 @@ struct ProactiveShadowState {
 	recovery_sample_count: u64,
 	recovery_rejected: u64,
 	recovery_constrained_2xx: u64,
+	last_recovery_log: Option<Instant>,
 }
 
 struct HostThrottleState {
@@ -672,6 +673,7 @@ impl HostThrottle {
 						recovery_sample_count: 0,
 						recovery_rejected: 0,
 						recovery_constrained_2xx: 0,
+						last_recovery_log: None,
 					}
 				}),
 				tokens: self.burst,
@@ -752,6 +754,142 @@ impl HostThrottle {
 		shadow.burst_samples.push_back(sample);
 	}
 
+	fn log_proactive_recovery_deferred(
+		host: &str,
+		shadow: &mut ProactiveShadowState,
+		config: &ProactiveHostConfig,
+		window: &HostThrottleWindow,
+		now: Instant,
+		observed_burst_target: u32,
+		has_load_evidence: bool,
+	) {
+		let decisions = window
+			.shadow_passed
+			.saturating_add(window.shadow_waited)
+			.saturating_add(window.shadow_rejected);
+		let has_activity = decisions > 0
+			|| window.shadow_passed_2xx > 0
+			|| window.shadow_waited_2xx > 0
+			|| window.shadow_rejected_2xx > 0
+			|| window.responses_429 > 0;
+		if !has_activity
+			|| shadow
+				.last_recovery_log
+				.is_some_and(|last| now.saturating_duration_since(last) < Duration::from_secs(60))
+		{
+			return;
+		}
+		let quiet_remaining = Duration::from_secs(config.quiet_period_secs)
+			.saturating_sub(now.saturating_duration_since(shadow.stable_since));
+		let burst_quiet_remaining = Duration::from_secs(config.burst_recovery_quiet_period_secs)
+			.saturating_sub(now.saturating_duration_since(shadow.last_burst_blocking_429));
+		let rate_quiet_remaining = Duration::from_secs(config.rate_recovery_quiet_period_secs)
+			.saturating_sub(now.saturating_duration_since(shadow.last_rate_blocking_429));
+		let burst_adjustment_remaining = Duration::from_secs(config.increase_interval_secs)
+			.saturating_sub(now.saturating_duration_since(shadow.last_burst_adjustment));
+		let increase_remaining = Duration::from_secs(config.increase_interval_secs)
+			.saturating_sub(now.saturating_duration_since(shadow.last_increase));
+		let reject_ratio = if shadow.recovery_sample_count == 0 {
+			0.0
+		} else {
+			shadow.recovery_rejected as f64 / shadow.recovery_sample_count as f64
+		};
+		let mut common = Vec::new();
+		if !quiet_remaining.is_zero() {
+			common.push("quiet_period");
+		}
+		if shadow.recovery_sample_count < config.recovery_min_samples {
+			common.push("insufficient_recovery_samples");
+		}
+		if reject_ratio <= config.target_reject_ratio {
+			common.push("reject_pressure_below_target");
+		}
+		if shadow.recovery_constrained_2xx == 0 {
+			common.push("no_constrained_2xx");
+		}
+		let mut burst_blockers = common.clone();
+		if shadow.burst_samples.len() < 10 {
+			burst_blockers.push("insufficient_burst_samples");
+		}
+		if !burst_quiet_remaining.is_zero() {
+			burst_blockers.push("burst_429_quiet_period");
+		}
+		if !burst_adjustment_remaining.is_zero() {
+			burst_blockers.push("burst_adjustment_interval");
+		}
+		if shadow.burst_samples.len() >= 10 && observed_burst_target <= shadow.learned_burst {
+			burst_blockers.push("burst_target_reached");
+		}
+		let mut rate_blockers = common;
+		if observed_burst_target > shadow.learned_burst {
+			rate_blockers.push("burst_recovery_pending");
+		}
+		if !rate_quiet_remaining.is_zero() {
+			rate_blockers.push("rate_429_quiet_period");
+		}
+		if shadow.estimated_limit >= config.max_requests_per_second {
+			rate_blockers.push("max_rate_reached");
+		}
+		let mut safe_rate_blockers = Vec::new();
+		if !quiet_remaining.is_zero() {
+			safe_rate_blockers.push("quiet_period");
+		}
+		if window.shadow_passed_2xx == 0 {
+			safe_rate_blockers.push("no_passed_2xx");
+		}
+		if !has_load_evidence {
+			safe_rate_blockers.push("no_load_evidence");
+		}
+		if shadow.qualified_windows_since_increase < PROACTIVE_SHADOW_REQUIRED_QUALIFIED_WINDOWS {
+			safe_rate_blockers.push("insufficient_qualified_windows");
+		}
+		if !increase_remaining.is_zero() {
+			safe_rate_blockers.push("increase_interval");
+		}
+		if shadow.rate_per_second >= shadow.estimated_limit {
+			safe_rate_blockers.push("estimated_limit_reached");
+		}
+		if shadow.rate_per_second >= config.max_requests_per_second {
+			safe_rate_blockers.push("max_rate_reached");
+		}
+		let reasons = |blockers: Vec<&str>| {
+			if blockers.is_empty() {
+				"eligible".to_owned()
+			} else {
+				blockers.join(",")
+			}
+		};
+		tracing::info!(
+			host,
+			phase = "before_adjustment",
+			burst_blockers = %reasons(burst_blockers),
+			rate_limit_blockers = %reasons(rate_blockers),
+			safe_rate_blockers = %reasons(safe_rate_blockers),
+			safe_rate = shadow.rate_per_second,
+			estimated_limit = shadow.estimated_limit,
+			max_rate = config.max_requests_per_second,
+			learned_burst = shadow.learned_burst,
+			observed_burst_target,
+			recovery_sample_count = shadow.recovery_sample_count,
+			recovery_min_samples = config.recovery_min_samples,
+			reject_ratio,
+			target_reject_ratio = config.target_reject_ratio,
+			constrained_2xx = shadow.recovery_constrained_2xx,
+			burst_sample_count = shadow.burst_samples.len(),
+			qualified_windows = shadow.qualified_windows_since_increase,
+			required_qualified_windows = PROACTIVE_SHADOW_REQUIRED_QUALIFIED_WINDOWS,
+			passed_2xx = window.shadow_passed_2xx,
+			has_load_evidence,
+			quiet_remaining_secs = quiet_remaining.as_secs_f64(),
+			burst_quiet_remaining_secs = burst_quiet_remaining.as_secs_f64(),
+			rate_quiet_remaining_secs = rate_quiet_remaining.as_secs_f64(),
+			burst_adjustment_remaining_secs = burst_adjustment_remaining.as_secs_f64(),
+			increase_remaining_secs = increase_remaining.as_secs_f64(),
+			"proactive_recovery_deferred"
+		);
+		shadow.last_recovery_log = Some(now);
+	}
+
 	fn adapt_proactive_shadow_window(
 		host: &str,
 		state: &mut HostThrottleState,
@@ -800,6 +938,24 @@ impl HostThrottle {
 			}
 		}
 
+		let max_burst = u32::try_from(queue_capacity).unwrap_or(u32::MAX).max(1);
+		let observed_burst_target = if shadow.burst_samples.len() >= 10 {
+			let mut samples: Vec<u32> = shadow.burst_samples.iter().copied().collect();
+			samples.sort_unstable();
+			let index = ((samples.len() - 1) * 95) / 100;
+			((f64::from(samples[index]) * 1.25).ceil() as u32).clamp(1, max_burst)
+		} else {
+			shadow.learned_burst
+		};
+		Self::log_proactive_recovery_deferred(
+			host,
+			shadow,
+			config,
+			window,
+			now,
+			observed_burst_target,
+			has_load_evidence,
+		);
 		if now.duration_since(shadow.stable_since) < Duration::from_secs(config.quiet_period_secs) {
 			return;
 		}
@@ -816,15 +972,7 @@ impl HostThrottle {
 		let has_reject_pressure = shadow.recovery_sample_count >= config.recovery_min_samples
 			&& reject_ratio > config.target_reject_ratio
 			&& shadow.recovery_constrained_2xx > 0;
-		let mut observed_burst_target = shadow.learned_burst;
-
 		if shadow.burst_samples.len() >= 10 {
-			let mut samples: Vec<u32> = shadow.burst_samples.iter().copied().collect();
-			samples.sort_unstable();
-			let index = ((samples.len() - 1) * 95) / 100;
-			let max_burst = u32::try_from(queue_capacity).unwrap_or(u32::MAX).max(1);
-			observed_burst_target =
-				((f64::from(samples[index]) * 1.25).ceil() as u32).clamp(1, max_burst);
 			if has_reject_pressure
 				&& now.duration_since(shadow.last_burst_blocking_429)
 					>= Duration::from_secs(config.burst_recovery_quiet_period_secs)
@@ -7968,6 +8116,158 @@ mod network_policy_tests {
 			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
 			assert_eq!(shadow.rate_per_second, 0.9);
 			assert_eq!(shadow.estimated_limit, 0.9);
+		});
+	}
+
+	#[test]
+	fn proactive_shadow_logs_recovery_blockers_and_limits_frequency() {
+		#[derive(Clone)]
+		struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+		impl std::io::Write for LogWriter {
+			fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+				self.0.lock().unwrap().extend_from_slice(bytes);
+				Ok(bytes.len())
+			}
+			fn flush(&mut self) -> std::io::Result<()> {
+				Ok(())
+			}
+		}
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut config = throttle_config("media.example");
+			config.queue_capacity = 64;
+			let throttle = HostThrottle::new(&config).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle.acquire(&target, Duration::ZERO).await.unwrap();
+			let mut states = throttle.states.lock().await;
+			let state = states.get_mut("media.example").unwrap();
+			let proactive = &config.proactive_hosts["media.example"];
+			let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+			let writer = LogWriter(output.clone());
+			let subscriber = tracing_subscriber::fmt()
+				.without_time()
+				.with_ansi(false)
+				.with_writer(move || writer.clone())
+				.finish();
+			tracing::subscriber::with_default(subscriber, || {
+				let now = Instant::now();
+				let window = HostThrottleWindow {
+					shadow_passed: 1,
+					..HostThrottleWindow::default()
+				};
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&window,
+					now,
+					64,
+					Duration::from_secs(10),
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+				for reason in [
+					"proactive_recovery_deferred",
+					"quiet_period",
+					"insufficient_recovery_samples",
+					"reject_pressure_below_target",
+					"no_constrained_2xx",
+					"insufficient_burst_samples",
+					"burst_429_quiet_period",
+					"rate_429_quiet_period",
+					"no_passed_2xx",
+					"no_load_evidence",
+					"insufficient_qualified_windows",
+					"increase_interval",
+					"rate_quiet_remaining_secs=",
+				] {
+					assert!(text.contains(reason), "missing diagnostic {reason}: {text}");
+				}
+				output.lock().unwrap().clear();
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&window,
+					now + Duration::from_secs(30),
+					64,
+					Duration::from_secs(10),
+				);
+				assert!(output.lock().unwrap().is_empty());
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&HostThrottleWindow::default(),
+					now + Duration::from_secs(60),
+					64,
+					Duration::from_secs(10),
+				);
+				assert!(output.lock().unwrap().is_empty());
+				let shadow = state.proactive_shadow.as_mut().unwrap();
+				assert_eq!(shadow.last_recovery_log, Some(now));
+				shadow.stable_since = now - Duration::from_secs(121);
+				shadow.last_burst_blocking_429 = now - Duration::from_secs(21_601);
+				shadow.last_rate_blocking_429 = now;
+				shadow.last_burst_adjustment = now - Duration::from_secs(61);
+				shadow.last_increase = now - Duration::from_secs(61);
+				shadow.estimated_limit = shadow.rate_per_second;
+				shadow.qualified_windows_since_increase = 3;
+				shadow.recovery_sample_count = 1_000;
+				shadow.recovery_rejected = 100;
+				shadow.recovery_constrained_2xx = 90;
+				shadow.burst_samples = VecDeque::from(vec![5; 10]);
+				let responses = HostThrottleWindow {
+					shadow_passed_2xx: 1,
+					..HostThrottleWindow::default()
+				};
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&responses,
+					now + Duration::from_secs(60),
+					64,
+					Duration::from_secs(10),
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+				assert!(text.contains("burst_blockers=eligible"), "{text}");
+				assert!(
+					text.contains(
+						"rate_limit_blockers=burst_recovery_pending,rate_429_quiet_period"
+					),
+					"{text}"
+				);
+				assert!(text.contains("estimated_limit_reached"), "{text}");
+				assert!(!text.contains("insufficient_recovery_samples"), "{text}");
+				assert_eq!(state.proactive_shadow.as_ref().unwrap().learned_burst, 2);
+				output.lock().unwrap().clear();
+				let shadow = state.proactive_shadow.as_mut().unwrap();
+				shadow.learned_burst = 10;
+				shadow.burst_samples = VecDeque::from(vec![1; 10]);
+				shadow.last_rate_blocking_429 = now - Duration::from_secs(86_400);
+				shadow.recovery_sample_count = 1_000;
+				shadow.recovery_rejected = 100;
+				shadow.recovery_constrained_2xx = 90;
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&responses,
+					now + Duration::from_secs(120),
+					64,
+					Duration::from_secs(10),
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+				assert!(text.contains("burst_target_reached"), "{text}");
+				assert!(text.contains("rate_limit_blockers=eligible"), "{text}");
+				assert_eq!(
+					state.proactive_shadow.as_ref().unwrap().estimated_limit,
+					2.05
+				);
+			});
 		});
 	}
 
