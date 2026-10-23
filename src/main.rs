@@ -122,6 +122,87 @@ struct HostThrottleConfig {
 	observation_interval_ms: u64,
 	#[serde(default)]
 	proactive_hosts: HashMap<String, ProactiveHostConfig>,
+	#[serde(default)]
+	proactive_state_path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProactiveStateFile {
+	version: u32,
+	hosts: HashMap<String, SavedProactiveState>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedProactiveState {
+	rate_per_second: f64,
+	estimated_limit: f64,
+	learned_burst: u32,
+	sample_count: u64,
+	qualified_sample_count: u64,
+	qualified_windows_since_increase: u32,
+	rate_limit_episodes: u64,
+	burst_samples: VecDeque<u32>,
+	recovery_sample_count: u64,
+	recovery_rejected: u64,
+	recovery_constrained_2xx: u64,
+	stable_elapsed: Duration,
+	burst_blocking_429_elapsed: Duration,
+	rate_blocking_429_elapsed: Duration,
+	increase_elapsed: Duration,
+	burst_adjustment_elapsed: Duration,
+	cooldown_remaining: Duration,
+}
+
+impl SavedProactiveState {
+	fn capture(shadow: &ProactiveShadowState, now: Instant) -> Self {
+		Self {
+			rate_per_second: shadow.rate_per_second,
+			estimated_limit: shadow.estimated_limit,
+			learned_burst: shadow.learned_burst,
+			sample_count: shadow.sample_count,
+			qualified_sample_count: shadow.qualified_sample_count,
+			qualified_windows_since_increase: shadow.qualified_windows_since_increase,
+			rate_limit_episodes: shadow.rate_limit_episodes,
+			burst_samples: shadow.burst_samples.clone(),
+			recovery_sample_count: shadow.recovery_sample_count,
+			recovery_rejected: shadow.recovery_rejected,
+			recovery_constrained_2xx: shadow.recovery_constrained_2xx,
+			stable_elapsed: now.saturating_duration_since(shadow.stable_since),
+			burst_blocking_429_elapsed: now
+				.saturating_duration_since(shadow.last_burst_blocking_429),
+			rate_blocking_429_elapsed: now.saturating_duration_since(shadow.last_rate_blocking_429),
+			increase_elapsed: now.saturating_duration_since(shadow.last_increase),
+			burst_adjustment_elapsed: now.saturating_duration_since(shadow.last_burst_adjustment),
+			cooldown_remaining: shadow.cooldown_until.saturating_duration_since(now),
+		}
+	}
+
+	fn restore(self, shadow: &mut ProactiveShadowState, now: Instant) {
+		shadow.rate_per_second = self.rate_per_second;
+		shadow.estimated_limit = self.estimated_limit;
+		shadow.learned_burst = self.learned_burst;
+		shadow.tokens = 0.0;
+		shadow.sample_count = self.sample_count;
+		shadow.qualified_sample_count = self.qualified_sample_count;
+		shadow.qualified_windows_since_increase = self.qualified_windows_since_increase;
+		shadow.rate_limit_episodes = self.rate_limit_episodes;
+		shadow.burst_samples = self.burst_samples;
+		shadow.recovery_sample_count = self.recovery_sample_count;
+		shadow.recovery_rejected = self.recovery_rejected;
+		shadow.recovery_constrained_2xx = self.recovery_constrained_2xx;
+		shadow.stable_since = now.checked_sub(self.stable_elapsed).unwrap_or(now);
+		shadow.last_burst_blocking_429 = now
+			.checked_sub(self.burst_blocking_429_elapsed)
+			.unwrap_or(now);
+		shadow.last_rate_blocking_429 = now
+			.checked_sub(self.rate_blocking_429_elapsed)
+			.unwrap_or(now);
+		shadow.last_increase = now.checked_sub(self.increase_elapsed).unwrap_or(now);
+		shadow.last_burst_adjustment = now
+			.checked_sub(self.burst_adjustment_elapsed)
+			.unwrap_or(now);
+		shadow.cooldown_until = now.checked_add(self.cooldown_remaining).unwrap_or(now);
+	}
 }
 
 #[derive(Default)]
@@ -241,6 +322,8 @@ struct HostThrottle {
 	observation_interval: Duration,
 	proactive_hosts: HashMap<String, ProactiveHostConfig>,
 	states: AsyncMutex<HashMap<String, HostThrottleState>>,
+	proactive_state_path: Option<PathBuf>,
+	persistence_lock: AsyncMutex<()>,
 }
 
 struct HostThrottleObservation {
@@ -290,6 +373,13 @@ impl HostThrottle {
 		}
 		if config.observation_interval_ms == 0 {
 			return Err("host_throttle.observation_interval_ms must be greater than 0".to_owned());
+		}
+		if config
+			.proactive_state_path
+			.as_ref()
+			.is_some_and(|path| path.as_os_str().is_empty())
+		{
+			return Err("host_throttle.proactive_state_path must not be empty".to_owned());
 		}
 		let mut proactive_hosts = HashMap::with_capacity(config.proactive_hosts.len());
 		for (configured_host, proactive) in &config.proactive_hosts {
@@ -383,7 +473,111 @@ impl HostThrottle {
 			.extend(proactive_hosts.keys().cloned());
 		throttle.observation_interval = Duration::from_millis(config.observation_interval_ms);
 		throttle.proactive_hosts = proactive_hosts;
+		throttle.proactive_state_path = config.proactive_state_path.clone();
+		throttle.restore_proactive_states();
 		Ok(throttle)
+	}
+
+	fn restore_proactive_states(&mut self) {
+		let Some(path) = self.proactive_state_path.as_ref() else {
+			return;
+		};
+		let saved = match std::fs::read(path) {
+			Ok(bytes) => serde_json::from_slice::<ProactiveStateFile>(&bytes)
+				.map_err(|error| error.to_string()),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+			Err(error) => Err(error.to_string()),
+		};
+		let saved = match saved {
+			Ok(saved) if saved.version == 1 => saved,
+			Ok(_) => {
+				tracing::warn!(path = %path.display(), "unsupported proactive state version; using configured initial values");
+				return;
+			}
+			Err(error) => {
+				tracing::warn!(path = %path.display(), %error, "failed to load proactive state; using configured initial values");
+				return;
+			}
+		};
+		let now = Instant::now();
+		let mut states = HashMap::new();
+		for (host, saved) in saved.hosts {
+			let Some(config) = self.proactive_hosts.get(&host) else {
+				continue;
+			};
+			if !saved.rate_per_second.is_finite()
+				|| !saved.estimated_limit.is_finite()
+				|| saved.rate_per_second < config.min_requests_per_second
+				|| saved.rate_per_second > saved.estimated_limit
+				|| saved.estimated_limit > config.max_requests_per_second
+				|| saved.learned_burst == 0
+				|| u64::from(saved.learned_burst)
+					> (self.queue_capacity as u64).max(u64::from(config.burst))
+				|| saved.burst_samples.len() > 300
+				|| saved.qualified_sample_count > saved.sample_count
+				|| saved.recovery_rejected > saved.recovery_sample_count
+			{
+				tracing::warn!(
+					host,
+					"invalid or incompatible proactive state; using configured initial values"
+				);
+				continue;
+			}
+			let state = self.state_for_host(&mut states, &host, now);
+			if let Some(shadow) = state.proactive_shadow.as_mut() {
+				saved.restore(shadow, now);
+				tracing::info!(
+					host,
+					safe_rate = shadow.rate_per_second,
+					estimated_limit = shadow.estimated_limit,
+					burst = shadow.learned_burst,
+					sample_count = shadow.sample_count,
+					qualified_sample_count = shadow.qualified_sample_count,
+					rate_limit_episodes = shadow.rate_limit_episodes,
+					"proactive_learning_restored"
+				);
+			}
+		}
+		self.states = AsyncMutex::new(states);
+	}
+
+	async fn persist_proactive_states(&self) -> std::io::Result<()> {
+		let Some(path) = self.proactive_state_path.as_ref() else {
+			return Ok(());
+		};
+		let _persistence = self.persistence_lock.lock().await;
+		let saved = {
+			let states = self.states.lock().await;
+			let now = Instant::now();
+			ProactiveStateFile {
+				version: 1,
+				hosts: states
+					.iter()
+					.filter_map(|(host, state)| {
+						state
+							.proactive_shadow
+							.as_ref()
+							.map(|shadow| (host.clone(), SavedProactiveState::capture(shadow, now)))
+					})
+					.collect(),
+			}
+		};
+		let bytes = serde_json::to_vec(&saved).map_err(std::io::Error::other)?;
+		let parent = path
+			.parent()
+			.filter(|parent| !parent.as_os_str().is_empty())
+			.unwrap_or(Path::new("."));
+		tokio::fs::create_dir_all(parent).await?;
+		let mut temporary = path.as_os_str().to_os_string();
+		temporary.push(".tmp");
+		let temporary = PathBuf::from(temporary);
+		let mut file = tokio::fs::File::create(&temporary).await?;
+		tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+		file.sync_all().await?;
+		drop(file);
+		tokio::fs::rename(&temporary, path).await?;
+		tokio::fs::File::open(parent).await?.sync_all().await?;
+		Ok(())
 	}
 
 	fn with_limits(
@@ -406,6 +600,8 @@ impl HostThrottle {
 			),
 			proactive_hosts: HashMap::new(),
 			states: AsyncMutex::new(HashMap::new()),
+			proactive_state_path: None,
+			persistence_lock: AsyncMutex::new(()),
 		}
 	}
 
@@ -892,6 +1088,10 @@ impl HostThrottle {
 				shadow_rate_per_second: shadow.map_or(0.0, |shadow| shadow.rate_per_second),
 				shadow_tokens: shadow.map_or(0.0, |shadow| shadow.tokens),
 			});
+		}
+		drop(states);
+		if let Err(error) = self.persist_proactive_states().await {
+			tracing::warn!(%error, "failed to persist proactive learning state");
 		}
 		observations
 	}
@@ -3024,6 +3224,7 @@ fn main() {
 		source_cache,
 	);
 	let source_cache_for_shutdown = arg_tup.13.clone();
+	let host_throttle_for_shutdown = arg_tup.11.clone();
 	rt.block_on(async {
 		if let Some(throttle) = arg_tup.11.clone() {
 			if let Some(interval_duration) = throttle.observation_interval() {
@@ -3376,6 +3577,9 @@ fn main() {
 			}
 		}
 	});
+	if let Some(throttle) = &host_throttle_for_shutdown {
+		rt.block_on(throttle.take_observations());
+	}
 	if let Some(source_cache) = &source_cache_for_shutdown {
 		if let Err(error) = rt.block_on(source_cache.close()) {
 			tracing::warn!(%error, "source cacheのcloseに失敗");
@@ -7349,7 +7553,217 @@ mod network_policy_tests {
 			observation_hosts: vec![],
 			observation_interval_ms: 10_000,
 			proactive_hosts: HashMap::from([(host.to_owned(), proactive_host_config())]),
+			proactive_state_path: None,
 		}
+	}
+
+	#[test]
+	fn proactive_shadow_persistence_round_trip() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let directory = std::env::temp_dir().join(format!(
+				"media-proxy-learning-{}-{}",
+				std::process::id(),
+				SystemTime::now()
+					.duration_since(SystemTime::UNIX_EPOCH)
+					.unwrap()
+					.as_nanos()
+			));
+			let path = directory.join("learning.json");
+			let mut config = throttle_config("media.example");
+			config.queue_capacity = 64;
+			config.proactive_state_path = Some(path.clone());
+			let throttle = HostThrottle::new(&config).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle.acquire(&target, Duration::ZERO).await.unwrap();
+			{
+				let mut states = throttle.states.lock().await;
+				let shadow = states
+					.get_mut("media.example")
+					.unwrap()
+					.proactive_shadow
+					.as_mut()
+					.unwrap();
+				let now = Instant::now();
+				shadow.rate_per_second = 0.5;
+				shadow.estimated_limit = 0.75;
+				shadow.learned_burst = 12;
+				shadow.sample_count = 50_000;
+				shadow.qualified_sample_count = 9_000;
+				shadow.qualified_windows_since_increase = 2;
+				shadow.rate_limit_episodes = 6;
+				shadow.recovery_sample_count = 500;
+				shadow.recovery_rejected = 100;
+				shadow.recovery_constrained_2xx = 90;
+				shadow.burst_samples = VecDeque::from(vec![5; 20]);
+				shadow.stable_since = now - Duration::from_secs(600);
+				shadow.last_burst_blocking_429 = now - Duration::from_secs(3_600);
+				shadow.last_rate_blocking_429 = now - Duration::from_secs(300);
+				shadow.cooldown_until = now + Duration::from_secs(30);
+			}
+			throttle.persist_proactive_states().await.unwrap();
+			let saved: ProactiveStateFile =
+				serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+			let expected = &saved.hosts["media.example"];
+			let restored = HostThrottle::new(&config).unwrap();
+			{
+				let states = restored.states.lock().await;
+				let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
+				assert_eq!(shadow.rate_per_second, 0.5);
+				assert_eq!(shadow.estimated_limit, 0.75);
+				assert_eq!(shadow.learned_burst, 12);
+				assert_eq!(shadow.tokens, 0.0);
+				assert_eq!(shadow.sample_count, 50_000);
+				assert_eq!(shadow.qualified_sample_count, 9_000);
+				assert_eq!(shadow.qualified_windows_since_increase, 2);
+				assert_eq!(shadow.rate_limit_episodes, 6);
+				assert_eq!(shadow.recovery_sample_count, 500);
+				assert_eq!(shadow.recovery_rejected, 100);
+				assert_eq!(shadow.recovery_constrained_2xx, 90);
+				assert_eq!(shadow.burst_samples, VecDeque::from(vec![5; 20]));
+				assert_eq!(
+					shadow
+						.last_refill
+						.duration_since(shadow.last_burst_blocking_429),
+					expected.burst_blocking_429_elapsed
+				);
+				assert_eq!(
+					shadow
+						.last_refill
+						.duration_since(shadow.last_rate_blocking_429),
+					expected.rate_blocking_429_elapsed
+				);
+				assert_eq!(
+					shadow.last_refill.duration_since(shadow.stable_since),
+					expected.stable_elapsed
+				);
+				assert_eq!(
+					shadow.cooldown_until.duration_since(shadow.last_refill),
+					expected.cooldown_remaining
+				);
+			}
+			restored.take_observations().await;
+			let replacement: ProactiveStateFile =
+				serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+			assert_eq!(replacement.hosts["media.example"].learned_burst, 12);
+			assert!(!directory.join("learning.json.tmp").exists());
+			std::fs::remove_dir_all(directory).unwrap();
+		});
+	}
+
+	#[test]
+	fn proactive_shadow_persistence_rejects_invalid_files_and_hosts() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let directory = std::env::temp_dir().join(format!(
+				"media-proxy-invalid-learning-{}-{}",
+				std::process::id(),
+				SystemTime::now()
+					.duration_since(SystemTime::UNIX_EPOCH)
+					.unwrap()
+					.as_nanos()
+			));
+			std::fs::create_dir_all(&directory).unwrap();
+			let path = directory.join("learning.json");
+			let mut config = throttle_config("media.example");
+			config.proactive_state_path = Some(path.clone());
+			for bytes in [
+				b"broken JSON".as_slice(),
+				br#"{"version":2,"hosts":{}}"#.as_slice(),
+			] {
+				std::fs::write(&path, bytes).unwrap();
+				let throttle = HostThrottle::new(&config).unwrap();
+				assert!(throttle.states.lock().await.is_empty());
+			}
+			std::fs::remove_file(&path).unwrap();
+			let throttle = HostThrottle::new(&config).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle.acquire(&target, Duration::ZERO).await.unwrap();
+			throttle.persist_proactive_states().await.unwrap();
+			let mut saved: ProactiveStateFile =
+				serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+			saved
+				.hosts
+				.get_mut("media.example")
+				.unwrap()
+				.rate_per_second = 0.0;
+			std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+			let restored = HostThrottle::new(&config).unwrap();
+			assert!(restored.states.lock().await.is_empty());
+			saved
+				.hosts
+				.get_mut("media.example")
+				.unwrap()
+				.rate_per_second = 2.0;
+			saved
+				.hosts
+				.get_mut("media.example")
+				.unwrap()
+				.estimated_limit = 8.0;
+			std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+			let mut tighter_config = config.clone();
+			tighter_config
+				.proactive_hosts
+				.get_mut("media.example")
+				.unwrap()
+				.max_requests_per_second = 4.0;
+			let restored = HostThrottle::new(&tighter_config).unwrap();
+			assert!(restored.states.lock().await.is_empty());
+			let saved_host = saved.hosts.remove("media.example").unwrap();
+			saved.hosts.insert("removed.example".to_owned(), saved_host);
+			std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+			let restored = HostThrottle::new(&config).unwrap();
+			assert!(restored.states.lock().await.is_empty());
+			std::fs::remove_dir_all(directory).unwrap();
+		});
+	}
+
+	#[test]
+	fn proactive_shadow_persistence_write_failure_preserves_state() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let directory = std::env::temp_dir().join(format!(
+				"media-proxy-unwritable-learning-{}-{}",
+				std::process::id(),
+				SystemTime::now()
+					.duration_since(SystemTime::UNIX_EPOCH)
+					.unwrap()
+					.as_nanos()
+			));
+			std::fs::create_dir_all(&directory).unwrap();
+			let path = directory.join("learning.json");
+			let mut config = throttle_config("media.example");
+			config.proactive_state_path = Some(path.clone());
+			let throttle = HostThrottle::new(&config).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle.acquire(&target, Duration::ZERO).await.unwrap();
+			throttle.persist_proactive_states().await.unwrap();
+			let previous = std::fs::read(&path).unwrap();
+			std::fs::create_dir(directory.join("learning.json.tmp")).unwrap();
+			assert!(throttle.persist_proactive_states().await.is_err());
+			assert_eq!(std::fs::read(&path).unwrap(), previous);
+			let observations = throttle.take_observations().await;
+			assert_eq!(observations.len(), 1);
+			let states = throttle.states.lock().await;
+			assert_eq!(
+				states["media.example"]
+					.proactive_shadow
+					.as_ref()
+					.unwrap()
+					.rate_per_second,
+				2.0
+			);
+			std::fs::remove_dir_all(directory).unwrap();
+		});
 	}
 
 	#[test]
@@ -7366,6 +7780,9 @@ mod network_policy_tests {
 			.unwrap()
 			.min_requests_per_second = 3.0;
 		assert!(HostThrottle::new(&invalid_rate).is_err());
+		let mut invalid_path = throttle_config("media.example");
+		invalid_path.proactive_state_path = Some(PathBuf::new());
+		assert!(HostThrottle::new(&invalid_path).is_err());
 	}
 
 	#[test]

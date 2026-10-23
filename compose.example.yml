@@ -8,6 +8,7 @@ services:
     volumes:
       - ./config/:/config:Z
       - source-cache:/var/cache/media-proxy/source
+      - proactive-state:/var/lib/media-proxy
     ports:
       - "80:12766"
     depends_on:
@@ -20,9 +21,10 @@ services:
     image: media-proxy-rs-server
     pull_policy: never
     user: "0:0"
-    entrypoint: ["chown", "852:852", "/var/cache/media-proxy/source"]
+    entrypoint: ["chown", "852:852", "/var/cache/media-proxy/source", "/var/lib/media-proxy"]
     volumes:
       - source-cache:/var/cache/media-proxy/source
+      - proactive-state:/var/lib/media-proxy
 
   alloy:
     image: grafana/alloy:v1.12.2
@@ -45,3 +47,4 @@ services:
 volumes:
   alloy-data:
   source-cache:
+  proactive-state:

@@ -15,7 +15,7 @@ avif-decoder = ["dep:avif-decoder_dep", "dep:mp4parse", "dep:dav1d"]
 [dependencies]
 tokio-stream = "0.1"
 axum = { version = "^0.8", features = ["http2"] }
-tokio = { version = "1.53", features = ["rt-multi-thread", "signal"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "signal", "fs", "io-util"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 futures = "0.3"
 futures-util = { version = "0.3", default-features = false, features = [

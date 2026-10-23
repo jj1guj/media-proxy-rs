@@ -40,6 +40,7 @@
     "queue_capacity": 256,
     "observation_hosts": ["media.misskeyusercontent.com"],
     "observation_interval_ms": 10000,
+    "proactive_state_path": "/var/lib/media-proxy/proactive-state.json",
     "proactive_hosts": {
       "media.misskeyusercontent.com": {
       "initial_requests_per_second": 0.5642550371870102,
