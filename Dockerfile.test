@@ -11,9 +11,10 @@
 FROM rust:latest
 RUN rustup component add clippy
 RUN apt-get update && apt-get install -y \
-  build-essential clang pkg-config nasm cmake git meson ninja-build \
-    && rm -rf /var/lib/apt/lists/*
-COPY crossfiles/build-imagemagick.sh /tmp/crossfiles/build-imagemagick.sh
-RUN IMAGEMAGICK_PREFIX=/opt/imagemagick bash /tmp/crossfiles/build-imagemagick.sh
-ENV IMAGEMAGICK_PREFIX=/opt/imagemagick
+  build-essential clang pkg-config nasm cmake git meson ninja-build libexpat1-dev libglib2.0-dev python3 \
+  && rm -rf /var/lib/apt/lists/*
+COPY crossfiles/build-libvips.sh /tmp/crossfiles/build-libvips.sh
+RUN LIBVIPS_PREFIX=/opt/libvips bash /tmp/crossfiles/build-libvips.sh
+ENV LIBVIPS_PREFIX=/opt/libvips
+ENV LD_LIBRARY_PATH=/opt/libvips/lib
 WORKDIR /app

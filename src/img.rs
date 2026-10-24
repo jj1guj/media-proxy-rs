@@ -1098,8 +1098,8 @@ impl RequestContext {
 		let mut encoder = None;
 		let mut available_frames: u32 = 0;
 		let mut err = None;
+		let mut timestamp: i32 = 0;
 		{
-			let mut timestamp = 0;
 			const FRAMES_LIMIT: u32 = ANIMATION_FRAMES_LIMIT as u32;
 			let mut frame_index: u32 = 0;
 			for frame in frames {
@@ -1113,6 +1113,8 @@ impl RequestContext {
 				}
 				frame_index += 1;
 				if let Ok(frame) = frame {
+					// libwebpのタイムスタンプはフレームの表示開始時刻
+					let start = timestamp;
 					timestamp += std::time::Duration::from(frame.delay()).as_millis() as i32;
 					let img = image::DynamicImage::ImageRgba8(frame.into_buffer());
 					let img = match self.resize(img) {
@@ -1136,7 +1138,7 @@ impl RequestContext {
 							encoder
 						});
 					}
-					let aframe = image_to_frame(&img, timestamp);
+					let aframe = image_to_frame(&img, start);
 					if let Ok(aframe) = aframe {
 						if let Some(encoder) = encoder.as_mut() {
 							let res = encoder.add_frame(aframe);
@@ -1161,7 +1163,8 @@ impl RequestContext {
 			headers.append("X-Proxy-Error", "NoAvailableFrames".parse().unwrap());
 			return (axum::http::StatusCode::BAD_GATEWAY, headers).into_response();
 		};
-		let buf = encoder.unwrap().encode();
+		let mut buf = encoder.unwrap().encode();
+		set_last_anmf_duration(&mut buf, timestamp.max(0) as u32);
 		self.record_anim(available_frames, self.src_bytes.len(), buf.len());
 		tracing::debug!(
 			frames = available_frames as u64,
@@ -1436,6 +1439,33 @@ fn jpegxr_img(
 	}
 }
 
+/// webpクレートは終端タイムスタンプを渡せず最終フレームが平均尺になるため、総尺から逆算して書き換える。
+fn set_last_anmf_duration(buf: &mut [u8], total_ms: u32) {
+	if buf.len() < 12 || &buf[0..4] != b"RIFF" || &buf[8..12] != b"WEBP" {
+		return;
+	}
+	let read24 = |b: &[u8]| u32::from_le_bytes([b[0], b[1], b[2], 0]);
+	let mut pos = 12;
+	let mut last: Option<usize> = None;
+	let mut sum_before_last: u32 = 0;
+	while pos + 8 <= buf.len() {
+		let size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+		let payload = pos + 8;
+		if &buf[pos..pos + 4] == b"ANMF" && payload + 16 <= buf.len() {
+			if let Some(prev) = last {
+				sum_before_last = sum_before_last.saturating_add(read24(&buf[prev..prev + 3]));
+			}
+			last = Some(payload + 12);
+		}
+		pos = payload.saturating_add(size).saturating_add(size & 1);
+	}
+	if let Some(off) = last {
+		if total_ms > sum_before_last {
+			let d = (total_ms - sum_before_last).min(0xFF_FFFF);
+			buf[off..off + 3].copy_from_slice(&d.to_le_bytes()[..3]);
+		}
+	}
+}
 pub fn image_to_frame(
 	image: &'_ DynamicImage,
 	timestamp: i32,
@@ -1584,6 +1614,38 @@ mod tests {
 		ico
 	}
 
+	fn anmf_durations(buf: &[u8]) -> Vec<u32> {
+		let mut v = vec![];
+		let mut pos = 12;
+		while pos + 8 <= buf.len() {
+			let size = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap()) as usize;
+			if &buf[pos..pos + 4] == b"ANMF" {
+				let d = pos + 8 + 12;
+				v.push(u32::from_le_bytes([buf[d], buf[d + 1], buf[d + 2], 0]));
+			}
+			pos += 8 + size + (size & 1);
+		}
+		v
+	}
+	#[test]
+	fn anim_webp_keeps_per_frame_durations() {
+		let conf = webp::WebPConfig::new().unwrap();
+		let colors = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+		let imgs: Vec<DynamicImage> = colors
+			.iter()
+			.map(|c| DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(4, 4, image::Rgba(*c))))
+			.collect();
+		let delays: [u32; 3] = [100, 800, 700];
+		let mut enc = webp::AnimEncoder::new(4, 4, &conf);
+		let mut ts = 0;
+		for (img, d) in imgs.iter().zip(delays) {
+			enc.add_frame(image_to_frame(img, ts as i32).unwrap()).unwrap();
+			ts += d;
+		}
+		let mut buf = enc.encode();
+		set_last_anmf_duration(&mut buf, ts);
+		assert_eq!(anmf_durations(&buf), delays);
+	}
 	#[test]
 	fn ico_with_non_rgba_png_uses_embedded_png_fallback() {
 		let ico = build_ico_with_grayscale_png();
