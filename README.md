@@ -194,6 +194,12 @@ Pass側429のエピソード開始時は仮想レートとburstへ`decrease_fact
 
 burstの目標は直近300個の有効な1秒要求数のp95に25%の余裕を加えた値です。回復サンプルが`recovery_min_samples`以上、Reject率が`target_reject_ratio`超、Wait/Reject側2xxの根拠あり、かつPass側429なしで`burst_recovery_quiet_period_secs`が経過すると、目標まで`burst_increase_step`ずつ拡張します。需要低下による縮小とPass側429による縮小も行います。burstが目標を満たしてもReject圧力が残り、Pass側429なしで`rate_recovery_quiet_period_secs`（既定24時間）が経過し、Wait側の短期停止中でなければ、推定上限を`estimated_limit_increase_step`ずつ引き上げます。
 
+推定上限の探索は小幅な段階探索とし、引き上げた上限にsafe rateが到達してから、`rate_probe_observation_secs`（既定3600秒）以上かつ新規shadow判定が`rate_probe_min_samples`（既定1000件）以上となるまで、次の上限引き上げを行いません。両設定は省略でき、指定時は正整数が必要です。観測サンプルは到達後のPass・Wait・Reject判定の合計で、引き上げ前のサンプルは含めません。burst調整による回復サンプルのリセットとは独立して数えます。初回探索にはこの観測待ちはありません。推定上限までの通常レート回復やburst調整の条件は変更しません。
+
+到達待ち・観測中の状態は保存し、停止中の時間は観測時間に加算しません。旧形式の保存データに観測状態がない場合は初回探索として扱います。Pass側429では従来どおり減速し、観測状態を破棄して24時間の回復停止へ戻ります。発生時のレートと探索上限は既存の`upstream_429`理由の変更ログに残ります。
+
+診断ログの`rate_limit_blockers`には`rate_probe_target_pending`（safe rateの探索上限到達待ち）、`rate_probe_observation_period`（到達後の観測時間不足）、`insufficient_rate_probe_samples`（新規判定数不足）を追加します。`rate_probe_active`・`rate_probe_target_pending`・`rate_probe_remaining_secs`・`rate_probe_new_samples`・`rate_probe_min_samples`・`rate_probe_observation_secs`で状態と必要条件を確認できます。
+
 Wait側429はPass側の24時間時計をリセットしません。各ホスト設定の`wait_429`で、Wait側応答だけを対象とする短期判定を設定します。既定値は`window_secs=300`、`min_samples=20`、`max_ratio=0.05`、`consecutive_threshold=3`、`pause_secs=300`です。Wait側429を受信した時点で、直近の観測窓の応答数が20件以上かつ429率が5%以上、またはWait側応答の429が3連続なら、推定上限の回復を5分停止します。窓は1秒単位のバケットで集計します。停止条件を満たす後続のWait側429で期限を延長しますが、非429応答では延長しません。Wait側の非429応答、または観測窓全体にWait応答がなくなった場合に連続数をリセットします。burst回復と、既存の推定上限までの通常レート回復はこの短期停止の対象外です。Reject側429は回復時計に影響させません。
 
 `wait_429`は省略・部分指定ができ、省略したフィールドは既定値を使います。`window_secs`は1〜3600秒、`pause_secs`は1〜86400秒、サンプル数と連続数は正整数、`max_ratio`は0超1以下です。閾値は初期値であり、Wait側の実測値に合わせて調整できます。短期窓・連続数・停止残時間も保存し、再起動で停止を解除しません。旧形式の保存ファイルは読み込み可能で、旧来のPass/Wait共通時計に代えて保存済みのPass側429時計を引き継ぎます。

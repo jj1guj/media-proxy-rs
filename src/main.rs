@@ -75,6 +75,10 @@ fn default_proactive_estimated_limit_increase_step() -> f64 {
 	0.05
 }
 
+fn default_proactive_rate_probe_observation_secs() -> u64 {
+	3_600
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProactiveThrottleMode {
@@ -206,6 +210,10 @@ struct ProactiveHostConfig {
 	burst_increase_step: u32,
 	#[serde(default = "default_proactive_estimated_limit_increase_step")]
 	estimated_limit_increase_step: f64,
+	#[serde(default = "default_proactive_rate_probe_observation_secs")]
+	rate_probe_observation_secs: u64,
+	#[serde(default = "default_proactive_recovery_min_samples")]
+	rate_probe_min_samples: u64,
 	#[serde(default)]
 	wait_429: Wait429Config,
 	mode: ProactiveThrottleMode,
@@ -236,6 +244,12 @@ struct ProactiveStateFile {
 }
 
 #[derive(Serialize, Deserialize)]
+struct SavedRateProbeObservation {
+	elapsed: Option<Duration>,
+	initial_sample_count: u64,
+}
+
+#[derive(Serialize, Deserialize)]
 struct SavedProactiveState {
 	rate_per_second: f64,
 	estimated_limit: f64,
@@ -256,6 +270,8 @@ struct SavedProactiveState {
 	cooldown_remaining: Duration,
 	#[serde(default)]
 	wait_429: Option<SavedWait429State>,
+	#[serde(default)]
+	rate_probe: Option<SavedRateProbeObservation>,
 }
 
 impl SavedProactiveState {
@@ -279,6 +295,15 @@ impl SavedProactiveState {
 			increase_elapsed: now.saturating_duration_since(shadow.last_increase),
 			burst_adjustment_elapsed: now.saturating_duration_since(shadow.last_burst_adjustment),
 			cooldown_remaining: shadow.cooldown_until.saturating_duration_since(now),
+			rate_probe: shadow
+				.rate_probe
+				.as_ref()
+				.map(|probe| SavedRateProbeObservation {
+					elapsed: probe
+						.started
+						.map(|started| now.saturating_duration_since(started)),
+					initial_sample_count: probe.initial_sample_count,
+				}),
 			wait_429: Some(SavedWait429State {
 				buckets: shadow
 					.wait_429
@@ -323,6 +348,10 @@ impl SavedProactiveState {
 			.checked_sub(self.burst_adjustment_elapsed)
 			.unwrap_or(now);
 		shadow.cooldown_until = now.checked_add(self.cooldown_remaining).unwrap_or(now);
+		shadow.rate_probe = self.rate_probe.map(|probe| RateProbeObservation {
+			started: probe.elapsed.and_then(|elapsed| now.checked_sub(elapsed)),
+			initial_sample_count: probe.initial_sample_count,
+		});
 		if let Some(saved) = self.wait_429 {
 			shadow.wait_429.buckets = saved
 				.buckets
@@ -379,6 +408,22 @@ struct HostThrottleWindow {
 	shadow_rejected_429: u64,
 }
 
+struct RateProbeObservation {
+	started: Option<Instant>,
+	initial_sample_count: u64,
+}
+
+impl RateProbeObservation {
+	fn ready(&self, now: Instant, sample_count: u64, config: &ProactiveHostConfig) -> bool {
+		self.started.is_some_and(|started| {
+			now.saturating_duration_since(started)
+				>= Duration::from_secs(config.rate_probe_observation_secs)
+				&& sample_count.saturating_sub(self.initial_sample_count)
+					>= config.rate_probe_min_samples
+		})
+	}
+}
+
 struct ProactiveShadowState {
 	rate_per_second: f64,
 	estimated_limit: f64,
@@ -403,6 +448,7 @@ struct ProactiveShadowState {
 	recovery_constrained_2xx: u64,
 	last_recovery_log: Option<Instant>,
 	wait_429: Wait429State,
+	rate_probe: Option<RateProbeObservation>,
 }
 
 struct HostThrottleState {
@@ -610,6 +656,8 @@ impl HostThrottle {
 				|| proactive.burst_increase_step == 0
 				|| !proactive.estimated_limit_increase_step.is_finite()
 				|| proactive.estimated_limit_increase_step <= 0.0
+				|| proactive.rate_probe_observation_secs == 0
+				|| proactive.rate_probe_min_samples == 0
 			{
 				return Err(format!(
 					"host_throttle.proactive_hosts.{host} recovery settings must be greater than 0"
@@ -691,6 +739,10 @@ impl HostThrottle {
 				|| saved.burst_samples.len() > 300
 				|| saved.qualified_sample_count > saved.sample_count
 				|| saved.recovery_rejected > saved.recovery_sample_count
+				|| saved
+					.rate_probe
+					.as_ref()
+					.is_some_and(|probe| probe.initial_sample_count > saved.sample_count)
 				|| saved.wait_429.as_ref().is_some_and(|wait| {
 					wait.buckets.len() > 3_601
 						|| wait
@@ -860,6 +912,7 @@ impl HostThrottle {
 						recovery_constrained_2xx: 0,
 						last_recovery_log: None,
 						wait_429: Wait429State::default(),
+						rate_probe: None,
 					}
 				}),
 				tokens: self.burst,
@@ -1019,6 +1072,38 @@ impl HostThrottle {
 		if !shadow.wait_429.pause_remaining(now).is_zero() {
 			rate_blockers.push("wait_429_short_term_pause");
 		}
+		let (probe_pending, probe_remaining, probe_samples) =
+			shadow
+				.rate_probe
+				.as_ref()
+				.map_or((false, Duration::ZERO, 0), |probe| {
+					let elapsed = probe.started.map_or(Duration::ZERO, |started| {
+						now.saturating_duration_since(started)
+					});
+					let samples = if probe.started.is_some() {
+						shadow
+							.sample_count
+							.saturating_sub(probe.initial_sample_count)
+					} else {
+						0
+					};
+					(
+						probe.started.is_none(),
+						Duration::from_secs(config.rate_probe_observation_secs)
+							.saturating_sub(elapsed),
+						samples,
+					)
+				});
+		if probe_pending {
+			rate_blockers.push("rate_probe_target_pending");
+		} else if shadow.rate_probe.is_some() {
+			if !probe_remaining.is_zero() {
+				rate_blockers.push("rate_probe_observation_period");
+			}
+			if probe_samples < config.rate_probe_min_samples {
+				rate_blockers.push("insufficient_rate_probe_samples");
+			}
+		}
 		if shadow.estimated_limit >= config.max_requests_per_second {
 			rate_blockers.push("max_rate_reached");
 		}
@@ -1088,6 +1173,12 @@ impl HostThrottle {
 			wait_429_max_ratio = config.wait_429.max_ratio,
 			wait_429_consecutive_threshold = config.wait_429.consecutive_threshold,
 			wait_429_pause_secs = config.wait_429.pause_secs,
+			rate_probe_active = shadow.rate_probe.is_some(),
+			rate_probe_target_pending = probe_pending,
+			rate_probe_remaining_secs = probe_remaining.as_secs_f64(),
+			rate_probe_new_samples = probe_samples,
+			rate_probe_min_samples = config.rate_probe_min_samples,
+			rate_probe_observation_secs = config.rate_probe_observation_secs,
 			"proactive_recovery_deferred"
 		);
 		shadow.last_recovery_log = Some(now);
@@ -1208,10 +1299,19 @@ impl HostThrottle {
 			&& now.duration_since(shadow.last_rate_blocking_429)
 				>= Duration::from_secs(config.rate_recovery_quiet_period_secs)
 			&& shadow.wait_429.pause_remaining(now).is_zero()
+			&& shadow
+				.rate_probe
+				.as_ref()
+				.is_none_or(|probe| probe.ready(now, shadow.sample_count, config))
+			&& shadow.estimated_limit < config.max_requests_per_second
 		{
 			shadow.estimated_limit = (shadow.estimated_limit
 				+ config.estimated_limit_increase_step)
 				.min(config.max_requests_per_second);
+			shadow.rate_probe = Some(RateProbeObservation {
+				started: None,
+				initial_sample_count: shadow.sample_count,
+			});
 			shadow.recovery_sample_count = 0;
 			shadow.recovery_rejected = 0;
 			shadow.recovery_constrained_2xx = 0;
@@ -1232,6 +1332,12 @@ impl HostThrottle {
 		}
 
 		shadow.tokens = shadow.tokens.min(f64::from(shadow.learned_burst));
+		if let Some(probe) = shadow.rate_probe.as_mut() {
+			if probe.started.is_none() && shadow.rate_per_second >= shadow.estimated_limit {
+				probe.started = Some(now);
+				probe.initial_sample_count = shadow.sample_count;
+			}
+		}
 		Self::log_proactive_adjustment(
 			host,
 			shadow,
@@ -1355,6 +1461,7 @@ impl HostThrottle {
 			}
 			shadow.last_burst_blocking_429 = now;
 			shadow.last_rate_blocking_429 = now;
+			shadow.rate_probe = None;
 			shadow.stable_since = now;
 			shadow.recovery_sample_count = 0;
 			shadow.recovery_rejected = 0;
@@ -7925,6 +8032,8 @@ mod network_policy_tests {
 			recovery_min_samples: 1_000,
 			burst_increase_step: 1,
 			estimated_limit_increase_step: 0.05,
+			rate_probe_observation_secs: 3_600,
+			rate_probe_min_samples: 1_000,
 			wait_429: Wait429Config::default(),
 			mode: ProactiveThrottleMode::Shadow,
 		}
@@ -7979,6 +8088,10 @@ mod network_policy_tests {
 				shadow.estimated_limit = 0.75;
 				shadow.learned_burst = 12;
 				shadow.sample_count = 50_000;
+				shadow.rate_probe = Some(RateProbeObservation {
+					started: Some(now - Duration::from_secs(300)),
+					initial_sample_count: 49_500,
+				});
 				shadow.qualified_sample_count = 9_000;
 				shadow.qualified_windows_since_increase = 2;
 				shadow.rate_limit_episodes = 6;
@@ -8004,6 +8117,17 @@ mod network_policy_tests {
 				assert_eq!(shadow.learned_burst, 12);
 				assert_eq!(shadow.tokens, 0.0);
 				assert_eq!(shadow.sample_count, 50_000);
+				let probe = shadow.rate_probe.as_ref().unwrap();
+				assert_eq!(probe.initial_sample_count, 49_500);
+				assert_eq!(
+					shadow.last_refill.duration_since(probe.started.unwrap()),
+					expected.rate_probe.as_ref().unwrap().elapsed.unwrap()
+				);
+				assert!(!probe.ready(
+					shadow.last_refill,
+					shadow.sample_count,
+					&config.proactive_hosts["media.example"]
+				));
 				assert_eq!(shadow.qualified_sample_count, 9_000);
 				assert_eq!(shadow.qualified_windows_since_increase, 2);
 				assert_eq!(shadow.rate_limit_episodes, 6);
@@ -8037,6 +8161,19 @@ mod network_policy_tests {
 				serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
 			assert_eq!(replacement.hosts["media.example"].learned_burst, 12);
 			assert!(!directory.join("learning.json.tmp").exists());
+			let mut legacy = serde_json::to_value(&replacement).unwrap();
+			legacy["hosts"]["media.example"]
+				.as_object_mut()
+				.unwrap()
+				.remove("rate_probe");
+			std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+			let legacy_restored = HostThrottle::new(&config).unwrap();
+			assert!(legacy_restored.states.lock().await["media.example"]
+				.proactive_shadow
+				.as_ref()
+				.unwrap()
+				.rate_probe
+				.is_none());
 			std::fs::remove_dir_all(directory).unwrap();
 		});
 	}
@@ -8151,6 +8288,29 @@ mod network_policy_tests {
 			);
 			std::fs::remove_dir_all(directory).unwrap();
 		});
+	}
+
+	#[test]
+	fn proactive_shadow_rate_probe_configuration_defaults_and_validation() {
+		let mut legacy = serde_json::to_value(proactive_host_config()).unwrap();
+		legacy
+			.as_object_mut()
+			.unwrap()
+			.remove("rate_probe_observation_secs");
+		legacy
+			.as_object_mut()
+			.unwrap()
+			.remove("rate_probe_min_samples");
+		let restored: ProactiveHostConfig = serde_json::from_value(legacy).unwrap();
+		assert_eq!(restored.rate_probe_observation_secs, 3_600);
+		assert_eq!(restored.rate_probe_min_samples, 1_000);
+		for (seconds, samples) in [(0, 1_000), (3_600, 0)] {
+			let mut config = throttle_config("media.example");
+			let proactive = config.proactive_hosts.get_mut("media.example").unwrap();
+			proactive.rate_probe_observation_secs = seconds;
+			proactive.rate_probe_min_samples = samples;
+			assert!(HostThrottle::new(&config).is_err());
+		}
 	}
 
 	#[test]
@@ -8535,6 +8695,41 @@ mod network_policy_tests {
 					state.proactive_shadow.as_ref().unwrap().estimated_limit,
 					2.05
 				);
+				output.lock().unwrap().clear();
+				HostThrottle::log_proactive_recovery_deferred(
+					"media.example",
+					state.proactive_shadow.as_mut().unwrap(),
+					proactive,
+					&responses,
+					now + Duration::from_secs(360),
+					2,
+					true,
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+				assert!(text.contains("rate_probe_target_pending"), "{text}");
+				output.lock().unwrap().clear();
+				state
+					.proactive_shadow
+					.as_mut()
+					.unwrap()
+					.rate_probe
+					.as_mut()
+					.unwrap()
+					.started = Some(now + Duration::from_secs(300));
+				HostThrottle::log_proactive_recovery_deferred(
+					"media.example",
+					state.proactive_shadow.as_mut().unwrap(),
+					proactive,
+					&responses,
+					now + Duration::from_secs(420),
+					2,
+					true,
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+				assert!(text.contains("rate_probe_observation_period"), "{text}");
+				assert!(text.contains("insufficient_rate_probe_samples"), "{text}");
+				assert!(text.contains("rate_probe_remaining_secs=3480"), "{text}");
+				assert!(text.contains("rate_probe_new_samples=0"), "{text}");
 			});
 		});
 	}
@@ -8887,6 +9082,7 @@ mod network_policy_tests {
 				passed_clock
 			);
 			state.proactive_shadow.as_mut().unwrap().estimated_limit = 2.0;
+			state.proactive_shadow.as_mut().unwrap().rate_probe = None;
 			for _ in 0..2 {
 				HostThrottle::observe_proactive_shadow_response(
 					"media.example",
@@ -9191,12 +9387,102 @@ mod network_policy_tests {
 			}
 
 			throttle.take_observations().await;
-			let states = throttle.states.lock().await;
-			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
+			let mut states = throttle.states.lock().await;
+			let state = states.get_mut("media.example").unwrap();
+			let shadow = state.proactive_shadow.as_ref().unwrap();
 			assert_eq!(shadow.learned_burst, 10);
 			assert_eq!(shadow.estimated_limit, 2.05);
 			assert_eq!(shadow.rate_per_second, 2.05);
 			assert_eq!(shadow.recovery_sample_count, 0);
+			let proactive = &config.proactive_hosts["media.example"];
+			let probe = shadow.rate_probe.as_ref().unwrap();
+			let started = probe.started.unwrap();
+			let baseline = probe.initial_sample_count;
+			assert!(!probe.ready(
+				started + Duration::from_secs(3_599),
+				baseline + 1_000,
+				proactive
+			));
+			let window = HostThrottleWindow {
+				shadow_passed: 1,
+				shadow_passed_2xx: 1,
+				shadow_rejected: 2,
+				shadow_rejected_2xx: 2,
+				..HostThrottleWindow::default()
+			};
+			for (samples, expected) in [(999, 2.05), (1_000, 2.10)] {
+				state.proactive_shadow.as_mut().unwrap().sample_count = baseline + samples;
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&window,
+					started + Duration::from_secs(3_600),
+					64,
+					Duration::from_secs(10),
+				);
+				assert!(
+					(state.proactive_shadow.as_ref().unwrap().estimated_limit - expected).abs()
+						< 1e-10
+				);
+			}
+			let shadow = state.proactive_shadow.as_mut().unwrap();
+			assert!(shadow.rate_probe.as_ref().unwrap().started.is_none());
+			let pending: SavedProactiveState = serde_json::from_value(
+				serde_json::to_value(SavedProactiveState::capture(
+					shadow,
+					started + Duration::from_secs(3_600),
+				))
+				.unwrap(),
+			)
+			.unwrap();
+			pending.restore(
+				shadow,
+				started + Duration::from_secs(3_601),
+				&proactive.wait_429,
+			);
+			assert!(shadow.rate_probe.as_ref().unwrap().started.is_none());
+			assert!(!shadow.rate_probe.as_ref().unwrap().ready(
+				started + Duration::from_secs(10_000),
+				baseline + 10_000,
+				proactive
+			));
+			HostThrottle::adapt_proactive_shadow_window(
+				"media.example",
+				state,
+				proactive,
+				&window,
+				started + Duration::from_secs(3_602),
+				64,
+				Duration::from_secs(10),
+			);
+			assert_eq!(
+				state
+					.proactive_shadow
+					.as_ref()
+					.unwrap()
+					.rate_probe
+					.as_ref()
+					.unwrap()
+					.started,
+				Some(started + Duration::from_secs(3_602))
+			);
+			HostThrottle::observe_proactive_shadow_response(
+				"media.example",
+				state,
+				proactive,
+				reqwest::StatusCode::TOO_MANY_REQUESTS,
+				started + Duration::from_secs(3_603),
+				Duration::from_secs(5),
+				Some(ProactiveShadowDecision::Pass),
+			);
+			let shadow = state.proactive_shadow.as_ref().unwrap();
+			assert!(shadow.rate_probe.is_none());
+			assert!(shadow.estimated_limit < 2.10);
+			assert_eq!(
+				shadow.last_rate_blocking_429,
+				started + Duration::from_secs(3_603)
+			);
 		});
 	}
 
