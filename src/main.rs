@@ -79,6 +79,10 @@ fn default_proactive_rate_probe_observation_secs() -> u64 {
 	3_600
 }
 
+fn default_proactive_burst_decrease_observation_secs() -> u64 {
+	1_800
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ProactiveThrottleMode {
@@ -208,6 +212,8 @@ struct ProactiveHostConfig {
 	recovery_min_samples: u64,
 	#[serde(default = "default_proactive_burst_increase_step")]
 	burst_increase_step: u32,
+	#[serde(default = "default_proactive_burst_decrease_observation_secs")]
+	burst_decrease_observation_secs: u64,
 	#[serde(default = "default_proactive_estimated_limit_increase_step")]
 	estimated_limit_increase_step: f64,
 	#[serde(default = "default_proactive_rate_probe_observation_secs")]
@@ -272,6 +278,8 @@ struct SavedProactiveState {
 	wait_429: Option<SavedWait429State>,
 	#[serde(default)]
 	rate_probe: Option<SavedRateProbeObservation>,
+	#[serde(default)]
+	burst_low_target_elapsed: Option<Duration>,
 }
 
 impl SavedProactiveState {
@@ -295,6 +303,9 @@ impl SavedProactiveState {
 			increase_elapsed: now.saturating_duration_since(shadow.last_increase),
 			burst_adjustment_elapsed: now.saturating_duration_since(shadow.last_burst_adjustment),
 			cooldown_remaining: shadow.cooldown_until.saturating_duration_since(now),
+			burst_low_target_elapsed: shadow
+				.burst_low_target_since
+				.map(|since| now.saturating_duration_since(since)),
 			rate_probe: shadow
 				.rate_probe
 				.as_ref()
@@ -348,6 +359,9 @@ impl SavedProactiveState {
 			.checked_sub(self.burst_adjustment_elapsed)
 			.unwrap_or(now);
 		shadow.cooldown_until = now.checked_add(self.cooldown_remaining).unwrap_or(now);
+		shadow.burst_low_target_since = self
+			.burst_low_target_elapsed
+			.and_then(|elapsed| now.checked_sub(elapsed));
 		shadow.rate_probe = self.rate_probe.map(|probe| RateProbeObservation {
 			started: probe.elapsed.and_then(|elapsed| now.checked_sub(elapsed)),
 			initial_sample_count: probe.initial_sample_count,
@@ -449,6 +463,7 @@ struct ProactiveShadowState {
 	last_recovery_log: Option<Instant>,
 	wait_429: Wait429State,
 	rate_probe: Option<RateProbeObservation>,
+	burst_low_target_since: Option<Instant>,
 }
 
 struct HostThrottleState {
@@ -654,6 +669,7 @@ impl HostThrottle {
 				|| proactive.rate_recovery_quiet_period_secs == 0
 				|| proactive.recovery_min_samples == 0
 				|| proactive.burst_increase_step == 0
+				|| proactive.burst_decrease_observation_secs == 0
 				|| !proactive.estimated_limit_increase_step.is_finite()
 				|| proactive.estimated_limit_increase_step <= 0.0
 				|| proactive.rate_probe_observation_secs == 0
@@ -913,6 +929,7 @@ impl HostThrottle {
 						last_recovery_log: None,
 						wait_429: Wait429State::default(),
 						rate_probe: None,
+						burst_low_target_since: None,
 					}
 				}),
 				tokens: self.burst,
@@ -1063,6 +1080,33 @@ impl HostThrottle {
 			burst_blockers.push("burst_target_reached");
 		}
 		let mut rate_blockers = common;
+		let mut decrease_blockers = Vec::new();
+		if !quiet_remaining.is_zero() {
+			decrease_blockers.push("quiet_period");
+		}
+		if shadow.burst_samples.len() < 60 {
+			decrease_blockers.push("insufficient_burst_samples");
+		}
+		if observed_burst_target.saturating_add(2) >= shadow.learned_burst {
+			decrease_blockers.push("burst_target_not_low");
+		}
+		if !burst_adjustment_remaining.is_zero() {
+			decrease_blockers.push("burst_adjustment_interval");
+		}
+		let decrease_remaining = if shadow.burst_samples.len() >= 60
+			&& observed_burst_target.saturating_add(2) < shadow.learned_burst
+		{
+			Duration::from_secs(config.burst_decrease_observation_secs).saturating_sub(
+				shadow
+					.burst_low_target_since
+					.map_or(Duration::ZERO, |since| now.saturating_duration_since(since)),
+			)
+		} else {
+			Duration::ZERO
+		};
+		if !decrease_remaining.is_zero() {
+			decrease_blockers.push("burst_decrease_observation_period");
+		}
 		if observed_burst_target > shadow.learned_burst {
 			rate_blockers.push("burst_recovery_pending");
 		}
@@ -1141,6 +1185,10 @@ impl HostThrottle {
 			host,
 			phase = "before_adjustment",
 			burst_blockers = %reasons(burst_blockers),
+			burst_decrease_blockers = %reasons(decrease_blockers),
+			burst_decrease_pending = shadow.burst_low_target_since.is_some(),
+			burst_decrease_remaining_secs = decrease_remaining.as_secs_f64(),
+			burst_decrease_observation_secs = config.burst_decrease_observation_secs,
 			rate_limit_blockers = %reasons(rate_blockers),
 			safe_rate_blockers = %reasons(safe_rate_blockers),
 			safe_rate = shadow.rate_per_second,
@@ -1241,6 +1289,13 @@ impl HostThrottle {
 		} else {
 			shadow.learned_burst
 		};
+		if shadow.burst_samples.len() >= 60
+			&& observed_burst_target.saturating_add(2) < shadow.learned_burst
+		{
+			shadow.burst_low_target_since.get_or_insert(now);
+		} else {
+			shadow.burst_low_target_since = None;
+		}
 		Self::log_proactive_recovery_deferred(
 			host,
 			shadow,
@@ -1279,6 +1334,7 @@ impl HostThrottle {
 					.min(observed_burst_target)
 					.min(max_burst);
 				shadow.last_burst_adjustment = now;
+				shadow.burst_low_target_since = None;
 				shadow.recovery_sample_count = 0;
 				shadow.recovery_rejected = 0;
 				shadow.recovery_constrained_2xx = 0;
@@ -1286,9 +1342,13 @@ impl HostThrottle {
 			} else if shadow.burst_samples.len() >= 60
 				&& now.duration_since(shadow.last_burst_adjustment) >= adjustment_interval
 				&& observed_burst_target.saturating_add(2) < shadow.learned_burst
-			{
+				&& shadow.burst_low_target_since.is_some_and(|since| {
+					now.saturating_duration_since(since)
+						>= Duration::from_secs(config.burst_decrease_observation_secs)
+				}) {
 				shadow.learned_burst = shadow.learned_burst.saturating_sub(1).max(1);
 				shadow.last_burst_adjustment = now;
+				shadow.burst_low_target_since = None;
 				reason = "observed_burst";
 			}
 		}
@@ -1462,6 +1522,7 @@ impl HostThrottle {
 			shadow.last_burst_blocking_429 = now;
 			shadow.last_rate_blocking_429 = now;
 			shadow.rate_probe = None;
+			shadow.burst_low_target_since = None;
 			shadow.stable_since = now;
 			shadow.recovery_sample_count = 0;
 			shadow.recovery_rejected = 0;
@@ -8031,6 +8092,7 @@ mod network_policy_tests {
 			rate_recovery_quiet_period_secs: 86_400,
 			recovery_min_samples: 1_000,
 			burst_increase_step: 1,
+			burst_decrease_observation_secs: 1_800,
 			estimated_limit_increase_step: 0.05,
 			rate_probe_observation_secs: 3_600,
 			rate_probe_min_samples: 1_000,
@@ -8103,6 +8165,7 @@ mod network_policy_tests {
 				shadow.last_burst_blocking_429 = now - Duration::from_secs(3_600);
 				shadow.last_rate_blocking_429 = now - Duration::from_secs(300);
 				shadow.cooldown_until = now + Duration::from_secs(30);
+				shadow.burst_low_target_since = Some(now - Duration::from_secs(300));
 			}
 			throttle.persist_proactive_states().await.unwrap();
 			let saved: ProactiveStateFile =
@@ -8155,6 +8218,12 @@ mod network_policy_tests {
 					shadow.cooldown_until.duration_since(shadow.last_refill),
 					expected.cooldown_remaining
 				);
+				assert_eq!(
+					shadow
+						.last_refill
+						.duration_since(shadow.burst_low_target_since.unwrap()),
+					expected.burst_low_target_elapsed.unwrap()
+				);
 			}
 			restored.take_observations().await;
 			let replacement: ProactiveStateFile =
@@ -8166,8 +8235,18 @@ mod network_policy_tests {
 				.as_object_mut()
 				.unwrap()
 				.remove("rate_probe");
+			legacy["hosts"]["media.example"]
+				.as_object_mut()
+				.unwrap()
+				.remove("burst_low_target_elapsed");
 			std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
 			let legacy_restored = HostThrottle::new(&config).unwrap();
+			assert!(legacy_restored.states.lock().await["media.example"]
+				.proactive_shadow
+				.as_ref()
+				.unwrap()
+				.burst_low_target_since
+				.is_none());
 			assert!(legacy_restored.states.lock().await["media.example"]
 				.proactive_shadow
 				.as_ref()
@@ -8730,8 +8809,139 @@ mod network_policy_tests {
 				assert!(text.contains("insufficient_rate_probe_samples"), "{text}");
 				assert!(text.contains("rate_probe_remaining_secs=3480"), "{text}");
 				assert!(text.contains("rate_probe_new_samples=0"), "{text}");
+				output.lock().unwrap().clear();
+				let shadow = state.proactive_shadow.as_mut().unwrap();
+				shadow.learned_burst = 10;
+				shadow.burst_samples = VecDeque::from(vec![1; 60]);
+				shadow.burst_low_target_since = Some(now + Duration::from_secs(300));
+				HostThrottle::log_proactive_recovery_deferred(
+					"media.example",
+					shadow,
+					proactive,
+					&responses,
+					now + Duration::from_secs(480),
+					2,
+					true,
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+				assert!(
+					text.contains("burst_decrease_blockers=burst_decrease_observation_period"),
+					"{text}"
+				);
+				assert!(
+					text.contains("burst_decrease_remaining_secs=1620"),
+					"{text}"
+				);
+				output.lock().unwrap().clear();
+				HostThrottle::log_proactive_recovery_deferred(
+					"media.example",
+					shadow,
+					proactive,
+					&responses,
+					now + Duration::from_secs(2_100),
+					2,
+					true,
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+				assert!(text.contains("burst_decrease_blockers=eligible"), "{text}");
 			});
 		});
+	}
+
+	#[test]
+	fn proactive_shadow_burst_decrease_requires_sustained_low_target() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut config = throttle_config("media.example");
+			config.queue_capacity = 64;
+			config
+				.proactive_hosts
+				.get_mut("media.example")
+				.unwrap()
+				.burst = 10;
+			let throttle = HostThrottle::new(&config).unwrap();
+			let proactive = &config.proactive_hosts["media.example"];
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle.acquire(&target, Duration::ZERO).await.unwrap();
+			let mut states = throttle.states.lock().await;
+			let state = states.get_mut("media.example").unwrap();
+			let now = Instant::now();
+			let shadow = state.proactive_shadow.as_mut().unwrap();
+			shadow.stable_since = now - Duration::from_secs(121);
+			shadow.last_burst_adjustment = now - Duration::from_secs(61);
+			shadow.burst_bucket_count = 0;
+			let window = HostThrottleWindow {
+				shadow_passed: 1,
+				..HostThrottleWindow::default()
+			};
+			for (seconds, sample, count, burst, since) in [
+				(0, 1, 59, 10, None),
+				(1, 1, 60, 10, Some(1)),
+				(1_800, 1, 60, 10, Some(1)),
+				(1_801, 8, 60, 10, None),
+				(1_802, 1, 60, 10, Some(1_802)),
+				(3_601, 1, 60, 10, Some(1_802)),
+				(3_602, 1, 60, 9, None),
+				(3_662, 1, 60, 9, Some(3_662)),
+				(5_462, 1, 60, 8, None),
+			] {
+				state.proactive_shadow.as_mut().unwrap().burst_samples =
+					VecDeque::from(vec![sample; count]);
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&window,
+					now + Duration::from_secs(seconds),
+					64,
+					Duration::from_secs(10),
+				);
+				let shadow = state.proactive_shadow.as_ref().unwrap();
+				assert_eq!(shadow.learned_burst, burst, "at {seconds}s");
+				assert_eq!(
+					shadow.burst_low_target_since,
+					since.map(|seconds| now + Duration::from_secs(seconds))
+				);
+			}
+			state
+				.proactive_shadow
+				.as_mut()
+				.unwrap()
+				.burst_low_target_since = Some(now + Duration::from_secs(5_462));
+			HostThrottle::observe_proactive_shadow_response(
+				"media.example",
+				state,
+				proactive,
+				reqwest::StatusCode::TOO_MANY_REQUESTS,
+				now + Duration::from_secs(5_463),
+				Duration::from_secs(5),
+				Some(ProactiveShadowDecision::Pass),
+			);
+			let shadow = state.proactive_shadow.as_ref().unwrap();
+			assert_eq!(shadow.learned_burst, 4);
+			assert!(shadow.burst_low_target_since.is_none());
+		});
+	}
+
+	#[test]
+	fn proactive_shadow_burst_decrease_configuration_defaults_and_validation() {
+		let mut legacy = serde_json::to_value(proactive_host_config()).unwrap();
+		legacy
+			.as_object_mut()
+			.unwrap()
+			.remove("burst_decrease_observation_secs");
+		let restored: ProactiveHostConfig = serde_json::from_value(legacy).unwrap();
+		assert_eq!(restored.burst_decrease_observation_secs, 1_800);
+		let mut config = throttle_config("media.example");
+		config
+			.proactive_hosts
+			.get_mut("media.example")
+			.unwrap()
+			.burst_decrease_observation_secs = 0;
+		assert!(HostThrottle::new(&config).is_err());
 	}
 
 	#[test]
@@ -8769,6 +8979,7 @@ mod network_policy_tests {
 				shadow.last_burst_adjustment = Instant::now() - Duration::from_secs(61);
 				shadow.qualified_windows_since_increase = 2;
 				shadow.burst_samples = VecDeque::from(vec![8; 10]);
+				shadow.burst_low_target_since = Some(Instant::now() - Duration::from_secs(600));
 			}
 
 			throttle.take_observations().await;
@@ -8776,6 +8987,7 @@ mod network_policy_tests {
 			let shadow = states["media.example"].proactive_shadow.as_ref().unwrap();
 			assert_eq!(shadow.rate_per_second, 2.1);
 			assert_eq!(shadow.learned_burst, 2);
+			assert!(shadow.burst_low_target_since.is_none());
 			assert_eq!(shadow.sample_count, 1);
 			assert_eq!(shadow.qualified_sample_count, 10);
 		});
