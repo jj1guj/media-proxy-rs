@@ -58,6 +58,13 @@
         "recovery_min_samples": 1000,
         "burst_increase_step": 1,
         "estimated_limit_increase_step": 0.05,
+        "wait_429": {
+          "window_secs": 300,
+          "min_samples": 20,
+          "max_ratio": 0.05,
+          "consecutive_threshold": 3,
+          "pause_secs": 300
+        },
         "mode": "shadow"
       }
     }

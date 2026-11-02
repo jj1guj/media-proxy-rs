@@ -82,6 +82,107 @@ enum ProactiveThrottleMode {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct Wait429Config {
+	window_secs: u64,
+	min_samples: u64,
+	max_ratio: f64,
+	consecutive_threshold: u64,
+	pause_secs: u64,
+}
+
+impl Default for Wait429Config {
+	fn default() -> Self {
+		Self {
+			window_secs: 300,
+			min_samples: 20,
+			max_ratio: 0.05,
+			consecutive_threshold: 3,
+			pause_secs: 300,
+		}
+	}
+}
+
+struct WaitResponseBucket {
+	started: Instant,
+	responses: u64,
+	rate_limited: u64,
+}
+
+#[derive(Default)]
+struct Wait429State {
+	buckets: VecDeque<WaitResponseBucket>,
+	consecutive: u64,
+	paused_until: Option<Instant>,
+}
+
+impl Wait429State {
+	fn counts(&self, now: Instant, config: &Wait429Config) -> (u64, u64) {
+		self.buckets
+			.iter()
+			.filter(|bucket| {
+				now.saturating_duration_since(bucket.started)
+					< Duration::from_secs(config.window_secs)
+			})
+			.fold((0_u64, 0_u64), |(responses, rate_limited), bucket| {
+				(
+					responses.saturating_add(bucket.responses),
+					rate_limited.saturating_add(bucket.rate_limited),
+				)
+			})
+	}
+
+	fn observe(&mut self, status: reqwest::StatusCode, now: Instant, config: &Wait429Config) {
+		while self.buckets.front().is_some_and(|bucket| {
+			now.saturating_duration_since(bucket.started) >= Duration::from_secs(config.window_secs)
+		}) {
+			self.buckets.pop_front();
+		}
+		if self.buckets.is_empty() {
+			self.consecutive = 0;
+		}
+		let rate_limited = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+		if self.buckets.back().is_none_or(|bucket| {
+			now.saturating_duration_since(bucket.started) >= Duration::from_secs(1)
+		}) {
+			self.buckets.push_back(WaitResponseBucket {
+				started: now,
+				responses: 0,
+				rate_limited: 0,
+			});
+		}
+		let bucket = self.buckets.back_mut().unwrap();
+		bucket.responses = bucket.responses.saturating_add(1);
+		bucket.rate_limited = bucket.rate_limited.saturating_add(u64::from(rate_limited));
+		self.consecutive = if rate_limited {
+			self.consecutive.saturating_add(1)
+		} else {
+			0
+		};
+		let (responses, limited) = self.counts(now, config);
+		if rate_limited
+			&& ((responses >= config.min_samples
+				&& limited as f64 / responses as f64 >= config.max_ratio)
+				|| self.consecutive >= config.consecutive_threshold)
+		{
+			self.paused_until = Some(now + Duration::from_secs(config.pause_secs));
+		}
+	}
+
+	fn pause_remaining(&self, now: Instant) -> Duration {
+		self.paused_until
+			.map_or(Duration::ZERO, |until| until.saturating_duration_since(now))
+	}
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct SavedWait429State {
+	buckets: VecDeque<(Duration, u64, u64)>,
+	consecutive: u64,
+	pause_remaining: Duration,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ProactiveHostConfig {
 	initial_requests_per_second: f64,
 	#[serde(default)]
@@ -105,6 +206,8 @@ struct ProactiveHostConfig {
 	burst_increase_step: u32,
 	#[serde(default = "default_proactive_estimated_limit_increase_step")]
 	estimated_limit_increase_step: f64,
+	#[serde(default)]
+	wait_429: Wait429Config,
 	mode: ProactiveThrottleMode,
 }
 
@@ -151,6 +254,8 @@ struct SavedProactiveState {
 	increase_elapsed: Duration,
 	burst_adjustment_elapsed: Duration,
 	cooldown_remaining: Duration,
+	#[serde(default)]
+	wait_429: Option<SavedWait429State>,
 }
 
 impl SavedProactiveState {
@@ -174,10 +279,26 @@ impl SavedProactiveState {
 			increase_elapsed: now.saturating_duration_since(shadow.last_increase),
 			burst_adjustment_elapsed: now.saturating_duration_since(shadow.last_burst_adjustment),
 			cooldown_remaining: shadow.cooldown_until.saturating_duration_since(now),
+			wait_429: Some(SavedWait429State {
+				buckets: shadow
+					.wait_429
+					.buckets
+					.iter()
+					.map(|bucket| {
+						(
+							now.saturating_duration_since(bucket.started),
+							bucket.responses,
+							bucket.rate_limited,
+						)
+					})
+					.collect(),
+				consecutive: shadow.wait_429.consecutive,
+				pause_remaining: shadow.wait_429.pause_remaining(now),
+			}),
 		}
 	}
 
-	fn restore(self, shadow: &mut ProactiveShadowState, now: Instant) {
+	fn restore(self, shadow: &mut ProactiveShadowState, now: Instant, wait_config: &Wait429Config) {
 		shadow.rate_per_second = self.rate_per_second;
 		shadow.estimated_limit = self.estimated_limit;
 		shadow.learned_burst = self.learned_burst;
@@ -202,6 +323,33 @@ impl SavedProactiveState {
 			.checked_sub(self.burst_adjustment_elapsed)
 			.unwrap_or(now);
 		shadow.cooldown_until = now.checked_add(self.cooldown_remaining).unwrap_or(now);
+		if let Some(saved) = self.wait_429 {
+			shadow.wait_429.buckets = saved
+				.buckets
+				.into_iter()
+				.filter(|(age, _, _)| *age < Duration::from_secs(wait_config.window_secs))
+				.filter_map(|(age, responses, rate_limited)| {
+					now.checked_sub(age).map(|started| WaitResponseBucket {
+						started,
+						responses,
+						rate_limited,
+					})
+				})
+				.collect();
+			shadow.wait_429.consecutive = if shadow.wait_429.buckets.is_empty() {
+				0
+			} else {
+				saved.consecutive
+			};
+			shadow.wait_429.paused_until = now.checked_add(
+				saved
+					.pause_remaining
+					.min(Duration::from_secs(wait_config.pause_secs)),
+			);
+		} else {
+			shadow.last_rate_blocking_429 = shadow.last_burst_blocking_429;
+			shadow.wait_429 = Wait429State::default();
+		}
 	}
 }
 
@@ -223,6 +371,12 @@ struct HostThrottleWindow {
 	shadow_rejected_2xx: u64,
 	shadow_wait_ms: u64,
 	shadow_queue_peak: usize,
+	shadow_passed_responses: u64,
+	shadow_waited_responses: u64,
+	shadow_rejected_responses: u64,
+	shadow_passed_429: u64,
+	shadow_waited_429: u64,
+	shadow_rejected_429: u64,
 }
 
 struct ProactiveShadowState {
@@ -248,6 +402,7 @@ struct ProactiveShadowState {
 	recovery_rejected: u64,
 	recovery_constrained_2xx: u64,
 	last_recovery_log: Option<Instant>,
+	wait_429: Wait429State,
 }
 
 struct HostThrottleState {
@@ -353,6 +508,12 @@ struct HostThrottleObservation {
 	shadow_queue_peak: usize,
 	shadow_rate_per_second: f64,
 	shadow_tokens: f64,
+	shadow_passed_responses: u64,
+	shadow_waited_responses: u64,
+	shadow_rejected_responses: u64,
+	shadow_passed_429: u64,
+	shadow_waited_429: u64,
+	shadow_rejected_429: u64,
 }
 
 impl HostThrottle {
@@ -454,6 +615,19 @@ impl HostThrottle {
 					"host_throttle.proactive_hosts.{host} recovery settings must be greater than 0"
 				));
 			}
+			let wait = &proactive.wait_429;
+			if wait.window_secs == 0
+				|| wait.window_secs > 3_600
+				|| wait.min_samples == 0
+				|| !wait.max_ratio.is_finite()
+				|| wait.max_ratio <= 0.0
+				|| wait.max_ratio > 1.0
+				|| wait.consecutive_threshold == 0
+				|| wait.pause_secs == 0
+				|| wait.pause_secs > 86_400
+			{
+				return Err(format!("host_throttle.proactive_hosts.{host}.wait_429 requires window_secs in 1..=3600, positive sample and consecutive thresholds, max_ratio in (0, 1], and pause_secs in 1..=86400"));
+			}
 			proactive_hosts.insert(host, proactive.clone());
 		}
 		let mut throttle = Self::with_limits(
@@ -517,7 +691,18 @@ impl HostThrottle {
 				|| saved.burst_samples.len() > 300
 				|| saved.qualified_sample_count > saved.sample_count
 				|| saved.recovery_rejected > saved.recovery_sample_count
-			{
+				|| saved.wait_429.as_ref().is_some_and(|wait| {
+					wait.buckets.len() > 3_601
+						|| wait
+							.buckets
+							.iter()
+							.any(|(_, responses, limited)| limited > responses)
+						|| wait
+							.buckets
+							.iter()
+							.zip(wait.buckets.iter().skip(1))
+							.any(|(older, newer)| older.0 < newer.0)
+				}) {
 				tracing::warn!(
 					host,
 					"invalid or incompatible proactive state; using configured initial values"
@@ -526,7 +711,7 @@ impl HostThrottle {
 			}
 			let state = self.state_for_host(&mut states, &host, now);
 			if let Some(shadow) = state.proactive_shadow.as_mut() {
-				saved.restore(shadow, now);
+				saved.restore(shadow, now, &config.wait_429);
 				tracing::info!(
 					host,
 					safe_rate = shadow.rate_per_second,
@@ -674,6 +859,7 @@ impl HostThrottle {
 						recovery_rejected: 0,
 						recovery_constrained_2xx: 0,
 						last_recovery_log: None,
+						wait_429: Wait429State::default(),
 					}
 				}),
 				tokens: self.burst,
@@ -768,6 +954,9 @@ impl HostThrottle {
 			.saturating_add(window.shadow_waited)
 			.saturating_add(window.shadow_rejected);
 		let has_activity = decisions > 0
+			|| window.shadow_passed_responses > 0
+			|| window.shadow_waited_responses > 0
+			|| window.shadow_rejected_responses > 0
 			|| window.shadow_passed_2xx > 0
 			|| window.shadow_waited_2xx > 0
 			|| window.shadow_rejected_2xx > 0
@@ -827,6 +1016,9 @@ impl HostThrottle {
 		if !rate_quiet_remaining.is_zero() {
 			rate_blockers.push("rate_429_quiet_period");
 		}
+		if !shadow.wait_429.pause_remaining(now).is_zero() {
+			rate_blockers.push("wait_429_short_term_pause");
+		}
 		if shadow.estimated_limit >= config.max_requests_per_second {
 			rate_blockers.push("max_rate_reached");
 		}
@@ -859,6 +1051,7 @@ impl HostThrottle {
 				blockers.join(",")
 			}
 		};
+		let (wait_responses, wait_429_responses) = shadow.wait_429.counts(now, &config.wait_429);
 		tracing::info!(
 			host,
 			phase = "before_adjustment",
@@ -885,6 +1078,16 @@ impl HostThrottle {
 			rate_quiet_remaining_secs = rate_quiet_remaining.as_secs_f64(),
 			burst_adjustment_remaining_secs = burst_adjustment_remaining.as_secs_f64(),
 			increase_remaining_secs = increase_remaining.as_secs_f64(),
+			wait_response_count = wait_responses,
+			wait_429_count = wait_429_responses,
+			wait_429_ratio = if wait_responses == 0 { 0.0 } else { wait_429_responses as f64 / wait_responses as f64 },
+			wait_429_consecutive = if wait_responses == 0 { 0 } else { shadow.wait_429.consecutive },
+			wait_429_pause_remaining_secs = shadow.wait_429.pause_remaining(now).as_secs_f64(),
+			wait_429_window_secs = config.wait_429.window_secs,
+			wait_429_min_samples = config.wait_429.min_samples,
+			wait_429_max_ratio = config.wait_429.max_ratio,
+			wait_429_consecutive_threshold = config.wait_429.consecutive_threshold,
+			wait_429_pause_secs = config.wait_429.pause_secs,
 			"proactive_recovery_deferred"
 		);
 		shadow.last_recovery_log = Some(now);
@@ -1004,6 +1207,7 @@ impl HostThrottle {
 			&& observed_burst_target <= shadow.learned_burst
 			&& now.duration_since(shadow.last_rate_blocking_429)
 				>= Duration::from_secs(config.rate_recovery_quiet_period_secs)
+			&& shadow.wait_429.pause_remaining(now).is_zero()
 		{
 			shadow.estimated_limit = (shadow.estimated_limit
 				+ config.estimated_limit_increase_step)
@@ -1102,6 +1306,25 @@ impl HostThrottle {
 		if config.mode != ProactiveThrottleMode::Shadow || decision.is_none() {
 			return;
 		}
+		let (responses, rate_limited) = match decision {
+			Some(ProactiveShadowDecision::Pass) => (
+				&mut state.window.shadow_passed_responses,
+				&mut state.window.shadow_passed_429,
+			),
+			Some(ProactiveShadowDecision::Wait) => (
+				&mut state.window.shadow_waited_responses,
+				&mut state.window.shadow_waited_429,
+			),
+			Some(ProactiveShadowDecision::Reject) => (
+				&mut state.window.shadow_rejected_responses,
+				&mut state.window.shadow_rejected_429,
+			),
+			None => return,
+		};
+		*responses = responses.saturating_add(1);
+		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+			*rate_limited = rate_limited.saturating_add(1);
+		}
 		if status.is_success() {
 			match decision {
 				Some(ProactiveShadowDecision::Pass) => {
@@ -1122,11 +1345,11 @@ impl HostThrottle {
 		let Some(shadow) = &mut state.proactive_shadow else {
 			return;
 		};
+		if decision == Some(ProactiveShadowDecision::Wait) {
+			shadow.wait_429.observe(status, now, &config.wait_429);
+			return;
+		}
 		if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-			if decision == Some(ProactiveShadowDecision::Wait) {
-				shadow.last_rate_blocking_429 = now;
-				return;
-			}
 			if decision != Some(ProactiveShadowDecision::Pass) {
 				return;
 			}
@@ -1191,6 +1414,9 @@ impl HostThrottle {
 			}
 			let queue_depth = self.queue_capacity - state.queue_slots.available_permits();
 			let has_activity = window.sends > 0
+				|| window.shadow_passed_responses > 0
+				|| window.shadow_waited_responses > 0
+				|| window.shadow_rejected_responses > 0
 				|| window.responses_2xx > 0
 				|| window.responses_429 > 0
 				|| window.responses_other > 0
@@ -1235,6 +1461,12 @@ impl HostThrottle {
 				shadow_queue_peak: window.shadow_queue_peak,
 				shadow_rate_per_second: shadow.map_or(0.0, |shadow| shadow.rate_per_second),
 				shadow_tokens: shadow.map_or(0.0, |shadow| shadow.tokens),
+				shadow_passed_responses: window.shadow_passed_responses,
+				shadow_waited_responses: window.shadow_waited_responses,
+				shadow_rejected_responses: window.shadow_rejected_responses,
+				shadow_passed_429: window.shadow_passed_429,
+				shadow_waited_429: window.shadow_waited_429,
+				shadow_rejected_429: window.shadow_rejected_429,
 			});
 		}
 		drop(states);
@@ -3401,6 +3633,12 @@ fn main() {
 								proactive_shadow = observation.shadow_enabled,
 								shadow_passed = observation.shadow_passed,
 								shadow_passed_2xx = observation.shadow_passed_2xx,
+								shadow_passed_responses = observation.shadow_passed_responses,
+								shadow_waited_responses = observation.shadow_waited_responses,
+								shadow_rejected_responses = observation.shadow_rejected_responses,
+								shadow_passed_429 = observation.shadow_passed_429,
+								shadow_waited_429 = observation.shadow_waited_429,
+								shadow_rejected_429 = observation.shadow_rejected_429,
 								shadow_waited = observation.shadow_waited,
 								shadow_waited_2xx = observation.shadow_waited_2xx,
 								shadow_rejected = observation.shadow_rejected,
@@ -7687,6 +7925,7 @@ mod network_policy_tests {
 			recovery_min_samples: 1_000,
 			burst_increase_step: 1,
 			estimated_limit_increase_step: 0.05,
+			wait_429: Wait429Config::default(),
 			mode: ProactiveThrottleMode::Shadow,
 		}
 	}
@@ -8251,6 +8490,13 @@ mod network_policy_tests {
 				shadow.recovery_sample_count = 1_000;
 				shadow.recovery_rejected = 100;
 				shadow.recovery_constrained_2xx = 90;
+				for _ in 0..3 {
+					shadow.wait_429.observe(
+						reqwest::StatusCode::TOO_MANY_REQUESTS,
+						now,
+						&proactive.wait_429,
+					);
+				}
 				HostThrottle::adapt_proactive_shadow_window(
 					"media.example",
 					state,
@@ -8262,6 +8508,28 @@ mod network_policy_tests {
 				);
 				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
 				assert!(text.contains("burst_target_reached"), "{text}");
+				assert!(
+					text.contains("rate_limit_blockers=wait_429_short_term_pause"),
+					"{text}"
+				);
+				assert!(text.contains("wait_response_count=3"), "{text}");
+				assert!(text.contains("wait_429_count=3"), "{text}");
+				assert!(text.contains("wait_429_pause_remaining_secs=180"), "{text}");
+				assert_eq!(
+					state.proactive_shadow.as_ref().unwrap().estimated_limit,
+					2.0
+				);
+				output.lock().unwrap().clear();
+				HostThrottle::adapt_proactive_shadow_window(
+					"media.example",
+					state,
+					proactive,
+					&responses,
+					now + Duration::from_secs(300),
+					64,
+					Duration::from_secs(10),
+				);
+				let text = String::from_utf8(output.lock().unwrap().clone()).unwrap();
 				assert!(text.contains("rate_limit_blockers=eligible"), "{text}");
 				assert_eq!(
 					state.proactive_shadow.as_ref().unwrap().estimated_limit,
@@ -8393,6 +8661,401 @@ mod network_policy_tests {
 	}
 
 	#[test]
+	fn proactive_shadow_wait_429_configuration_defaults_and_validation() {
+		let partial: Wait429Config =
+			serde_json::from_value(serde_json::json!({"max_ratio": 0.1})).unwrap();
+		assert_eq!(partial.window_secs, 300);
+		assert_eq!(partial.max_ratio, 0.1);
+		let mut legacy = serde_json::to_value(proactive_host_config()).unwrap();
+		legacy.as_object_mut().unwrap().remove("wait_429");
+		let legacy: ProactiveHostConfig = serde_json::from_value(legacy).unwrap();
+		assert_eq!(legacy.wait_429.pause_secs, 300);
+		let invalid = [
+			Wait429Config {
+				window_secs: 0,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				window_secs: 3_601,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				min_samples: 0,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				max_ratio: 0.0,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				max_ratio: f64::NAN,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				max_ratio: 1.01,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				consecutive_threshold: 0,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				pause_secs: 0,
+				..Wait429Config::default()
+			},
+			Wait429Config {
+				pause_secs: 86_401,
+				..Wait429Config::default()
+			},
+		];
+		for wait in invalid {
+			let mut config = throttle_config("media.example");
+			config
+				.proactive_hosts
+				.get_mut("media.example")
+				.unwrap()
+				.wait_429 = wait;
+			assert!(HostThrottle::new(&config).is_err());
+		}
+	}
+
+	#[test]
+	fn proactive_shadow_wait_429_ratio_requires_samples_and_expires() {
+		let now = Instant::now();
+		let config = Wait429Config::default();
+		let mut low_ratio = Wait429State::default();
+		for _ in 0..100 {
+			low_ratio.observe(reqwest::StatusCode::OK, now, &config);
+		}
+		low_ratio.observe(reqwest::StatusCode::TOO_MANY_REQUESTS, now, &config);
+		assert_eq!(low_ratio.counts(now, &config), (101, 1));
+		assert!(low_ratio.pause_remaining(now).is_zero());
+		let mut sparse = Wait429State::default();
+		for status in [
+			reqwest::StatusCode::TOO_MANY_REQUESTS,
+			reqwest::StatusCode::OK,
+			reqwest::StatusCode::TOO_MANY_REQUESTS,
+		] {
+			sparse.observe(status, now, &config);
+		}
+		assert!(sparse.pause_remaining(now).is_zero());
+		let mut high_ratio = Wait429State::default();
+		for _ in 0..19 {
+			high_ratio.observe(reqwest::StatusCode::OK, now, &config);
+		}
+		high_ratio.observe(reqwest::StatusCode::TOO_MANY_REQUESTS, now, &config);
+		assert_eq!(high_ratio.counts(now, &config), (20, 1));
+		assert_eq!(high_ratio.pause_remaining(now), Duration::from_secs(300));
+		high_ratio.observe(
+			reqwest::StatusCode::TOO_MANY_REQUESTS,
+			now + Duration::from_secs(1),
+			&config,
+		);
+		assert_eq!(
+			high_ratio.paused_until,
+			Some(now + Duration::from_secs(301))
+		);
+		high_ratio.observe(
+			reqwest::StatusCode::OK,
+			now + Duration::from_secs(2),
+			&config,
+		);
+		assert_eq!(
+			high_ratio.paused_until,
+			Some(now + Duration::from_secs(301))
+		);
+		assert_eq!(
+			high_ratio.counts(now + Duration::from_secs(300), &config),
+			(2, 1)
+		);
+		assert!(high_ratio
+			.pause_remaining(now + Duration::from_secs(301))
+			.is_zero());
+		assert_eq!(
+			high_ratio.counts(now + Duration::from_secs(302), &config),
+			(0, 0)
+		);
+	}
+
+	#[test]
+	fn proactive_shadow_wait_429_consecutive_resets_on_response_and_idle() {
+		let now = Instant::now();
+		let config = Wait429Config {
+			min_samples: 100,
+			..Wait429Config::default()
+		};
+		let mut state = Wait429State::default();
+		for (offset, status) in [
+			(0, reqwest::StatusCode::TOO_MANY_REQUESTS),
+			(1, reqwest::StatusCode::TOO_MANY_REQUESTS),
+			(2, reqwest::StatusCode::OK),
+			(3, reqwest::StatusCode::TOO_MANY_REQUESTS),
+			(4, reqwest::StatusCode::TOO_MANY_REQUESTS),
+		] {
+			state.observe(status, now + Duration::from_secs(offset), &config);
+		}
+		assert_eq!(state.consecutive, 2);
+		assert!(state
+			.pause_remaining(now + Duration::from_secs(4))
+			.is_zero());
+		state.observe(
+			reqwest::StatusCode::TOO_MANY_REQUESTS,
+			now + Duration::from_secs(5),
+			&config,
+		);
+		assert_eq!(
+			state.pause_remaining(now + Duration::from_secs(5)),
+			Duration::from_secs(300)
+		);
+		state.observe(
+			reqwest::StatusCode::TOO_MANY_REQUESTS,
+			now + Duration::from_secs(306),
+			&config,
+		);
+		assert_eq!(state.consecutive, 1);
+		assert_eq!(
+			state.counts(now + Duration::from_secs(306), &config),
+			(1, 1)
+		);
+		assert!(state
+			.pause_remaining(now + Duration::from_secs(306))
+			.is_zero());
+	}
+
+	#[test]
+	fn proactive_shadow_wait_429_pauses_only_short_term_rate_recovery() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut config = throttle_config("media.example");
+			config.queue_capacity = 64;
+			let proactive = config.proactive_hosts.get_mut("media.example").unwrap();
+			proactive.burst = 10;
+			proactive.initial_estimated_limit = Some(2.0);
+			proactive.recovery_min_samples = 1;
+			let throttle = HostThrottle::new(&config).unwrap();
+			let proactive = &config.proactive_hosts["media.example"];
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle.acquire(&target, Duration::ZERO).await.unwrap();
+			let mut states = throttle.states.lock().await;
+			let state = states.get_mut("media.example").unwrap();
+			let now = Instant::now();
+			let shadow = state.proactive_shadow.as_mut().unwrap();
+			shadow.stable_since = now - Duration::from_secs(121);
+			shadow.last_burst_blocking_429 = now - Duration::from_secs(86_401);
+			shadow.last_rate_blocking_429 = now - Duration::from_secs(86_401);
+			shadow.last_increase = now - Duration::from_secs(61);
+			shadow.burst_samples = VecDeque::from(vec![1; 10]);
+			let passed_clock = shadow.last_rate_blocking_429;
+			let window = HostThrottleWindow {
+				shadow_passed: 1,
+				shadow_passed_2xx: 1,
+				shadow_rejected: 2,
+				shadow_rejected_2xx: 2,
+				..HostThrottleWindow::default()
+			};
+			HostThrottle::observe_proactive_shadow_response(
+				"media.example",
+				state,
+				proactive,
+				reqwest::StatusCode::TOO_MANY_REQUESTS,
+				now,
+				Duration::from_secs(5),
+				Some(ProactiveShadowDecision::Wait),
+			);
+			HostThrottle::adapt_proactive_shadow_window(
+				"media.example",
+				state,
+				proactive,
+				&window,
+				now,
+				64,
+				Duration::from_secs(10),
+			);
+			assert_eq!(
+				state.proactive_shadow.as_ref().unwrap().estimated_limit,
+				2.05
+			);
+			assert_eq!(
+				state
+					.proactive_shadow
+					.as_ref()
+					.unwrap()
+					.last_rate_blocking_429,
+				passed_clock
+			);
+			state.proactive_shadow.as_mut().unwrap().estimated_limit = 2.0;
+			for _ in 0..2 {
+				HostThrottle::observe_proactive_shadow_response(
+					"media.example",
+					state,
+					proactive,
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					now,
+					Duration::from_secs(5),
+					Some(ProactiveShadowDecision::Wait),
+				);
+			}
+			HostThrottle::adapt_proactive_shadow_window(
+				"media.example",
+				state,
+				proactive,
+				&window,
+				now,
+				64,
+				Duration::from_secs(10),
+			);
+			assert_eq!(
+				state.proactive_shadow.as_ref().unwrap().estimated_limit,
+				2.0
+			);
+			HostThrottle::adapt_proactive_shadow_window(
+				"media.example",
+				state,
+				proactive,
+				&window,
+				now + Duration::from_secs(299),
+				64,
+				Duration::from_secs(10),
+			);
+			assert_eq!(
+				state.proactive_shadow.as_ref().unwrap().estimated_limit,
+				2.0
+			);
+			HostThrottle::adapt_proactive_shadow_window(
+				"media.example",
+				state,
+				proactive,
+				&window,
+				now + Duration::from_secs(300),
+				64,
+				Duration::from_secs(10),
+			);
+			assert_eq!(
+				state.proactive_shadow.as_ref().unwrap().estimated_limit,
+				2.05
+			);
+			let pass_incident = now + Duration::from_secs(301);
+			HostThrottle::observe_proactive_shadow_response(
+				"media.example",
+				state,
+				proactive,
+				reqwest::StatusCode::TOO_MANY_REQUESTS,
+				pass_incident,
+				Duration::from_secs(5),
+				Some(ProactiveShadowDecision::Pass),
+			);
+			let limit = state.proactive_shadow.as_ref().unwrap().estimated_limit;
+			assert_eq!(
+				state
+					.proactive_shadow
+					.as_ref()
+					.unwrap()
+					.last_rate_blocking_429,
+				pass_incident
+			);
+			HostThrottle::adapt_proactive_shadow_window(
+				"media.example",
+				state,
+				proactive,
+				&window,
+				pass_incident + Duration::from_secs(86_399),
+				64,
+				Duration::from_secs(10),
+			);
+			assert_eq!(
+				state.proactive_shadow.as_ref().unwrap().estimated_limit,
+				limit
+			);
+			HostThrottle::adapt_proactive_shadow_window(
+				"media.example",
+				state,
+				proactive,
+				&window,
+				pass_incident + Duration::from_secs(86_400),
+				64,
+				Duration::from_secs(10),
+			);
+			assert!(state.proactive_shadow.as_ref().unwrap().estimated_limit > limit);
+			assert_eq!(state.window.shadow_waited_responses, 3);
+			assert_eq!(state.window.shadow_waited_429, 3);
+			assert_eq!(state.window.shadow_passed_responses, 1);
+			assert_eq!(state.window.shadow_passed_429, 1);
+		});
+	}
+
+	#[test]
+	fn proactive_shadow_wait_429_state_survives_restore_and_migrates_legacy_clock() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let config = throttle_config("media.example");
+			let proactive = &config.proactive_hosts["media.example"];
+			let throttle = HostThrottle::new(&config).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			throttle.acquire(&target, Duration::ZERO).await.unwrap();
+			let mut states = throttle.states.lock().await;
+			let shadow = states
+				.get_mut("media.example")
+				.unwrap()
+				.proactive_shadow
+				.as_mut()
+				.unwrap();
+			let now = Instant::now();
+			shadow.last_burst_blocking_429 = now - Duration::from_secs(86_401);
+			shadow.last_rate_blocking_429 = now - Duration::from_secs(10);
+			for _ in 0..3 {
+				shadow.wait_429.observe(
+					reqwest::StatusCode::TOO_MANY_REQUESTS,
+					now,
+					&proactive.wait_429,
+				);
+			}
+			let bytes = serde_json::to_vec(&SavedProactiveState::capture(shadow, now)).unwrap();
+			let saved: SavedProactiveState = serde_json::from_slice(&bytes).unwrap();
+			let restarted = now + Duration::from_secs(3_600);
+			saved.restore(shadow, restarted, &proactive.wait_429);
+			assert_eq!(
+				shadow.wait_429.counts(restarted, &proactive.wait_429),
+				(3, 3)
+			);
+			assert_eq!(shadow.wait_429.consecutive, 3);
+			assert_eq!(
+				shadow.wait_429.pause_remaining(restarted),
+				Duration::from_secs(300)
+			);
+			let saved: SavedProactiveState = serde_json::from_slice(&bytes).unwrap();
+			let shorter = Wait429Config {
+				pause_secs: 60,
+				..Wait429Config::default()
+			};
+			saved.restore(shadow, restarted, &shorter);
+			assert_eq!(
+				shadow.wait_429.pause_remaining(restarted),
+				Duration::from_secs(60)
+			);
+			let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+			legacy.as_object_mut().unwrap().remove("wait_429");
+			let saved: SavedProactiveState = serde_json::from_value(legacy).unwrap();
+			shadow.wait_429 = Wait429State::default();
+			saved.restore(shadow, restarted, &proactive.wait_429);
+			assert_eq!(
+				shadow.last_rate_blocking_429,
+				shadow.last_burst_blocking_429
+			);
+			assert_eq!(
+				restarted.duration_since(shadow.last_rate_blocking_429),
+				Duration::from_secs(86_401)
+			);
+			assert!(shadow.wait_429.pause_remaining(restarted).is_zero());
+		});
+	}
+
+	#[test]
 	fn proactive_shadow_429_blocks_recovery_by_decision() {
 		let runtime = tokio::runtime::Builder::new_current_thread()
 			.enable_time()
@@ -8461,7 +9124,14 @@ mod network_policy_tests {
 			assert_eq!(shadow.recovery_sample_count, 100);
 			assert_eq!(shadow.burst_samples.len(), 10);
 			assert!(shadow.last_burst_blocking_429.elapsed() >= Duration::from_secs(1_000));
-			assert!(shadow.last_rate_blocking_429.elapsed() < Duration::from_secs(1));
+			assert!(shadow.last_rate_blocking_429.elapsed() >= Duration::from_secs(1_000));
+			assert_eq!(
+				shadow
+					.wait_429
+					.counts(Instant::now(), &Wait429Config::default()),
+				(1, 1)
+			);
+			assert!(shadow.wait_429.pause_remaining(Instant::now()).is_zero());
 			drop(states);
 
 			throttle
