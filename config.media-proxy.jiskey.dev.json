@@ -59,8 +59,8 @@
         "burst_increase_step": 1,
         "burst_decrease_observation_secs": 1800,
         "estimated_limit_increase_step": 0.05,
-        "rate_probe_observation_secs": 3600,
-        "rate_probe_min_samples": 1000,
+        "rate_probe_observation_secs": 21600,
+        "rate_probe_min_samples": 5000,
         "wait_429": {
           "window_secs": 300,
           "min_samples": 20,
