@@ -68,7 +68,7 @@
           "consecutive_threshold": 3,
           "pause_secs": 300
         },
-        "mode": "shadow"
+        "mode": "wait_only"
       }
     }
   },

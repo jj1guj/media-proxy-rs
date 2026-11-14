@@ -87,6 +87,7 @@ fn default_proactive_burst_decrease_observation_secs() -> u64 {
 #[serde(rename_all = "snake_case")]
 enum ProactiveThrottleMode {
 	Shadow,
+	WaitOnly,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -559,6 +560,7 @@ struct HostThrottleObservation {
 	cooldown_remaining_ms: u64,
 	recovering: bool,
 	shadow_enabled: bool,
+	proactive_wait_only: bool,
 	shadow_passed: u64,
 	shadow_passed_2xx: u64,
 	shadow_waited: u64,
@@ -1415,7 +1417,10 @@ impl HostThrottle {
 		max_wait: Duration,
 		queue_capacity: usize,
 	) -> Option<ProactiveShadowDecision> {
-		if config.mode != ProactiveThrottleMode::Shadow {
+		if !matches!(
+			config.mode,
+			ProactiveThrottleMode::Shadow | ProactiveThrottleMode::WaitOnly
+		) {
 			return None;
 		}
 		let (Some(shadow), window) = (&mut state.proactive_shadow, &mut state.window) else {
@@ -1469,7 +1474,11 @@ impl HostThrottle {
 		incident_cooldown: Duration,
 		decision: Option<ProactiveShadowDecision>,
 	) {
-		if config.mode != ProactiveThrottleMode::Shadow || decision.is_none() {
+		if !matches!(
+			config.mode,
+			ProactiveThrottleMode::Shadow | ProactiveThrottleMode::WaitOnly
+		) || decision.is_none()
+		{
 			return;
 		}
 		let (responses, rate_limited) = match decision {
@@ -1600,6 +1609,10 @@ impl HostThrottle {
 				continue;
 			}
 			let shadow = state.proactive_shadow.as_ref();
+			let proactive_wait_only = self
+				.proactive_hosts
+				.get(host)
+				.is_some_and(|config| config.mode == ProactiveThrottleMode::WaitOnly);
 			observations.push(HostThrottleObservation {
 				host: host.clone(),
 				sends: window.sends,
@@ -1619,6 +1632,7 @@ impl HostThrottle {
 					.as_millis() as u64,
 				recovering: state.recovering,
 				shadow_enabled: shadow.is_some(),
+				proactive_wait_only,
 				shadow_passed: window.shadow_passed,
 				shadow_passed_2xx: window.shadow_passed_2xx,
 				shadow_waited: window.shadow_waited,
@@ -1778,11 +1792,12 @@ impl HostThrottle {
 		let started = Instant::now();
 		let max_wait = wait_limit.min(wait_budget);
 		let proactive_config = self.proactive_hosts.get(&host).cloned();
-		let (gate, queue_slots, retry_after, shadow_decision) = {
+		let (gate, queue_slots, retry_after, shadow_decision, proactive_wait) = {
 			let mut states = self.states.lock().await;
 			let now = Instant::now();
 			let state = self.state_for_host(&mut states, &host, now);
 			state.last_seen = now;
+			let shadow_wait_before = state.window.shadow_wait_ms;
 			let shadow_decision = if let Some(decision) = inherited_shadow_decision {
 				decision
 			} else if let Some(config) = &proactive_config {
@@ -1796,7 +1811,22 @@ impl HostThrottle {
 			} else {
 				None
 			};
-			if !state.recovering {
+			let proactive_wait = if inherited_shadow_decision.is_none()
+				&& proactive_config
+					.as_ref()
+					.is_some_and(|config| config.mode == ProactiveThrottleMode::WaitOnly)
+				&& shadow_decision == Some(ProactiveShadowDecision::Wait)
+			{
+				Duration::from_millis(
+					state
+						.window
+						.shadow_wait_ms
+						.saturating_sub(shadow_wait_before),
+				)
+			} else {
+				Duration::ZERO
+			};
+			if !state.recovering && proactive_wait.is_zero() {
 				state.window.sends = state.window.sends.saturating_add(1);
 				return Ok(HostThrottlePermit {
 					waited: Duration::ZERO,
@@ -1811,8 +1841,50 @@ impl HostThrottle {
 				state.queue_slots.clone(),
 				state.cooldown_until.saturating_duration_since(now),
 				shadow_decision,
+				proactive_wait,
 			)
 		};
+		if !proactive_wait.is_zero() {
+			let remaining = wait_budget
+				.saturating_sub(started.elapsed())
+				.min(wait_limit.saturating_sub(started.elapsed()));
+			let sleep_for = proactive_wait.min(remaining);
+			let proactive_waited = if sleep_for.is_zero() {
+				Duration::ZERO
+			} else {
+				let wait_started = Instant::now();
+				tokio::time::sleep(sleep_for).await;
+				wait_started.elapsed()
+			};
+			let result = Box::pin(self.acquire_with_limit(
+				url,
+				wait_budget.saturating_sub(started.elapsed()),
+				wait_limit.saturating_sub(started.elapsed()),
+				Some(shadow_decision),
+			))
+			.await;
+			if !proactive_waited.is_zero() {
+				if let Some(state) = self.states.lock().await.get_mut(&host) {
+					state.window.wait_ms = state
+						.window
+						.wait_ms
+						.saturating_add(proactive_waited.as_millis() as u64);
+					if result.as_ref().map_or(true, |permit| !permit.throttled) {
+						state.window.throttled = state.window.throttled.saturating_add(1);
+					}
+				}
+			}
+			return result
+				.map(|mut permit| {
+					permit.waited = permit.waited.saturating_add(proactive_waited);
+					permit.throttled |= !proactive_waited.is_zero();
+					permit
+				})
+				.map_err(|mut rejection| {
+					rejection.waited = rejection.waited.saturating_add(proactive_waited);
+					rejection
+				});
+		}
 		let queue_slots_for_depth = queue_slots.clone();
 		let _queue_slot = match queue_slots.try_acquire_owned() {
 			Ok(slot) => slot,
@@ -3799,6 +3871,7 @@ fn main() {
 								cooldown_remaining_ms = observation.cooldown_remaining_ms,
 								recovering = observation.recovering,
 								proactive_shadow = observation.shadow_enabled,
+								proactive_wait_only = observation.proactive_wait_only,
 								shadow_passed = observation.shadow_passed,
 								shadow_passed_2xx = observation.shadow_passed_2xx,
 								shadow_passed_responses = observation.shadow_passed_responses,
@@ -10172,6 +10245,122 @@ mod network_policy_tests {
 	}
 
 	#[test]
+	fn proactive_wait_only_waits_and_fails_open_on_reject() {
+		let runtime = tokio::runtime::Builder::new_current_thread()
+			.enable_time()
+			.build()
+			.unwrap();
+		runtime.block_on(async {
+			let mut config = throttle_config("media.example");
+			config.queue_capacity = 1;
+			let proactive = config.proactive_hosts.get_mut("media.example").unwrap();
+			proactive.mode = ProactiveThrottleMode::WaitOnly;
+			proactive.initial_requests_per_second = 8.0;
+			proactive.initial_estimated_limit = Some(8.0);
+			proactive.max_requests_per_second = 8.0;
+			let throttle = HostThrottle::new(&config).unwrap();
+			let target = reqwest::Url::parse("https://media.example/image.webp").unwrap();
+			let first = throttle
+				.acquire(&target, Duration::from_secs(2))
+				.await
+				.unwrap();
+			assert_eq!(first.shadow_decision, Some(ProactiveShadowDecision::Pass));
+			{
+				let mut states = throttle.states.lock().await;
+				let shadow = states
+					.get_mut("media.example")
+					.unwrap()
+					.proactive_shadow
+					.as_mut()
+					.unwrap();
+				shadow.tokens = 0.0;
+				shadow.last_refill = Instant::now();
+			}
+			let started = Instant::now();
+			let waited = throttle
+				.acquire(&target, Duration::from_secs(2))
+				.await
+				.unwrap();
+			assert_eq!(waited.shadow_decision, Some(ProactiveShadowDecision::Wait));
+			assert!(started.elapsed() >= Duration::from_millis(100));
+			assert!(waited.waited >= Duration::from_millis(100));
+			assert!(waited.throttled);
+			throttle
+				.observe_response_with_shadow(
+					&target,
+					reqwest::StatusCode::OK,
+					&reqwest::header::HeaderMap::new(),
+					waited.throttled,
+					waited.shadow_decision,
+				)
+				.await;
+			{
+				let mut states = throttle.states.lock().await;
+				let shadow = states
+					.get_mut("media.example")
+					.unwrap()
+					.proactive_shadow
+					.as_mut()
+					.unwrap();
+				shadow.tokens = -100.0;
+				shadow.last_refill = Instant::now();
+			}
+			let started = Instant::now();
+			let rejected = throttle
+				.acquire(&target, Duration::from_secs(2))
+				.await
+				.unwrap();
+			assert_eq!(
+				rejected.shadow_decision,
+				Some(ProactiveShadowDecision::Reject)
+			);
+			assert!(started.elapsed() < Duration::from_millis(100));
+			assert!(rejected.waited.is_zero());
+			assert!(!rejected.throttled);
+			throttle
+				.observe_response_with_shadow(
+					&target,
+					reqwest::StatusCode::OK,
+					&reqwest::header::HeaderMap::new(),
+					rejected.throttled,
+					rejected.shadow_decision,
+				)
+				.await;
+			let states = throttle.states.lock().await;
+			let state = &states["media.example"];
+			assert_eq!(state.window.sends, 3);
+			assert_eq!(state.window.throttled, 1);
+			assert_eq!(state.window.shadow_passed, 1);
+			assert_eq!(state.window.shadow_waited, 1);
+			assert_eq!(state.window.shadow_rejected, 1);
+			assert_eq!(state.window.shadow_rejected_2xx, 1);
+			drop(states);
+			{
+				let mut states = throttle.states.lock().await;
+				let shadow = states
+					.get_mut("media.example")
+					.unwrap()
+					.proactive_shadow
+					.as_mut()
+					.unwrap();
+				shadow.tokens = 0.0;
+				shadow.last_refill = Instant::now();
+			}
+			let started = Instant::now();
+			let deadline_fallback = throttle
+				.acquire(&target, Duration::from_millis(20))
+				.await
+				.unwrap();
+			assert_eq!(
+				deadline_fallback.shadow_decision,
+				Some(ProactiveShadowDecision::Reject)
+			);
+			assert!(started.elapsed() < Duration::from_millis(100));
+			assert!(!deadline_fallback.throttled);
+		});
+	}
+
+	#[test]
 	fn operational_config_enables_proactive_shadow_host() {
 		let config: ConfigFile =
 			serde_json::from_str(include_str!("../config.media-proxy.jiskey.dev.json")).unwrap();
@@ -10186,7 +10375,7 @@ mod network_policy_tests {
 		assert_eq!(proactive.max_requests_per_second, 8.0);
 		assert_eq!(proactive.burst, 1);
 		assert_eq!(proactive.target_reject_ratio, 0.01);
-		assert_eq!(proactive.mode, ProactiveThrottleMode::Shadow);
+		assert_eq!(proactive.mode, ProactiveThrottleMode::WaitOnly);
 	}
 
 	fn test_dns_cache(timeout: Duration) -> DnsCache {
